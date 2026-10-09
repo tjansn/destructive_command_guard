@@ -7969,9 +7969,9 @@ pub(crate) fn range_is_quoted_interpreter_source(
     };
     if statements.next().is_some()
         || statement.kind().as_ref() != "redirected_statement"
-        || !statement
+        || statement
             .field("body")
-            .is_some_and(|body| body.kind().as_ref() == "command")
+            .is_none_or(|body| body.kind().as_ref() != "command")
         || statement
             .children()
             .filter(ast_grep_core::Node::is_named)

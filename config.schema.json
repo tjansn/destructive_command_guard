@@ -74,6 +74,7 @@
       "$ref": "#/$defs/HeredocConfig",
       "default": {
         "enabled": null,
+        "scan_script_files": null,
         "timeout_ms": null,
         "max_body_bytes": null,
         "max_body_lines": null,
@@ -558,6 +559,14 @@
       "properties": {
         "enabled": {
           "description": "Enable heredoc/inline-script scanning.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "scan_script_files": {
+          "description": "Inspect referenced local script files before execution, including\nliteral shell helper calls. Incomplete inspection blocks execution.\nOpt-in so library callers and offline repository scans retain their\nexisting behavior; enable in the user config for every agent hook.",
           "type": [
             "boolean",
             "null"

@@ -311,12 +311,12 @@ EOF";
     #[test]
     fn issue_544_javascript_string_literal_forms_remain_inert() {
         for body in [
-            r#"const s = 'run `git branch -d x` later'; console.log(s);"#,
+            r"const s = 'run `git branch -d x` later'; console.log(s);",
             r#"const s = "He said \"run `git branch -d x` later\""; console.log(s);"#,
-            r#"const s = `run \`git branch -d x\` later`; console.log(s);"#,
+            r"const s = `run \`git branch -d x\` later`; console.log(s);",
             "const s = `run \\`git branch -d x\\` later\nThis is documentation.`;\nconsole.log(s);",
             r#""run `git branch -d x` later"; console.log('documented');"#,
-            r#"const fs = require('fs'); const source = fs.readFileSync('README.md', 'utf8'); const edited = source.replace('After merging.', 'After merging, run `git branch -d x`.'); fs.writeFileSync('README.md', edited);"#,
+            r"const fs = require('fs'); const source = fs.readFileSync('README.md', 'utf8'); const edited = source.replace('After merging.', 'After merging, run `git branch -d x`.'); fs.writeFileSync('README.md', edited);",
         ] {
             let command = format!("node - <<'JS'\n{body}\nJS");
             let (decision, rule) = hook_decision(&command);
@@ -390,7 +390,7 @@ EOF";
             ),
             (
                 "node",
-                r#"const s = `run \`git branch -d x\` later ${require('child_process').execSync('git reset --hard')}`; console.log(s);"#,
+                r"const s = `run \`git branch -d x\` later ${require('child_process').execSync('git reset --hard')}`; console.log(s);",
             ),
         ] {
             for command in [

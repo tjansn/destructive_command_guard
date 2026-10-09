@@ -87,6 +87,7 @@ pub mod rebase_recovery;
 pub mod redaction;
 pub mod sarif;
 pub mod scan;
+mod script_files;
 pub mod session;
 pub mod simulate;
 pub mod stats;

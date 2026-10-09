@@ -360,6 +360,10 @@ impl ScanEvalContext {
         let compiled_overrides = config.overrides.compile();
         let allowlists = crate::load_default_allowlists();
         let mut heredoc_settings = config.heredoc_settings();
+        // Repository scanning reports source locations, not execution cwds.
+        // File-following belongs to the pre-execution evaluator, where the
+        // harness supplies the directory the command will actually use.
+        heredoc_settings.scan_script_files = false;
         // Scan mode raises the extraction timeout floor — see the constant.
         if heredoc_settings.limits.timeout_ms < SCAN_HEREDOC_MIN_TIMEOUT_MS {
             heredoc_settings.limits.timeout_ms = SCAN_HEREDOC_MIN_TIMEOUT_MS;

@@ -5201,6 +5201,13 @@ fn test_command(
     };
     let start = Instant::now();
     let evaluate = |command: &str, allowlists: &crate::allowlist::LayeredAllowlist| {
+        let inspection_cwd = if heredoc_settings.scan_script_files {
+            project_path.as_deref().and_then(|base| {
+                crate::rebase_recovery::resolve_effective_cwd(base, command, dialect.into())
+            })
+        } else {
+            project_path.clone()
+        };
         evaluate_command_with_pack_order_deadline_at_path_in_dialect(
             command,
             &enabled_keywords,
@@ -5209,8 +5216,8 @@ fn test_command(
             &compiled_overrides,
             allowlists,
             &heredoc_settings,
-            None,                    // allow_once_audit
-            project_path.as_deref(), // project_path scopes path-aware allowlist entries (#186)
+            None,                      // allow_once_audit
+            inspection_cwd.as_deref(), // same effective cwd as the hook (#387)
             evaluation_deadline.as_ref(),
             dialect.into(),
         )
@@ -6824,6 +6831,7 @@ fn show_config(config: &Config, sources: &[ConfigSourceOutcome]) {
     let heredoc = config.heredoc_settings();
     println!("Heredoc scanning:");
     println!("  Enabled: {}", heredoc.enabled);
+    println!("  Inspect script files: {}", heredoc.scan_script_files);
     println!("  Timeout (ms): {}", heredoc.limits.timeout_ms);
     println!("  Max body bytes: {}", heredoc.limits.max_body_bytes);
     println!("  Max body lines: {}", heredoc.limits.max_body_lines);
@@ -6968,6 +6976,7 @@ fn show_config_json(config: &Config, sources: &[ConfigSourceOutcome]) {
         },
         "heredoc": {
             "enabled": heredoc.enabled,
+            "scan_script_files": heredoc.scan_script_files,
             "timeout_ms": heredoc.limits.timeout_ms,
             "max_body_bytes": heredoc.limits.max_body_bytes,
             "max_body_lines": heredoc.limits.max_body_lines,

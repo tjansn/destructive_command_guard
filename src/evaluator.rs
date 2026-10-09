@@ -13808,6 +13808,83 @@ fn evaluate_command_in_single_dialect_view(
     };
     let command: &str = dcg_masked.as_ref();
 
+    // File-backed programs are opaque to keyword quick rejection. Inspect
+    // them before any clean allow, and carry remote/namespace provenance so
+    // a local namesake can never authorize an SSH/container script.
+    if heredoc_settings.scan_script_files
+        && let Some(result) = crate::script_files::evaluate(
+            command,
+            project_path,
+            shell_dialect,
+            NonlocalFilesystemScope::active(),
+            deadline,
+            |source, cwd, language| {
+                let mut settings = heredoc_settings.clone();
+                // Reentrant inspection shares one file/byte/depth budget.
+                // Keep inspection on for helpers reached through an inline
+                // launcher or a remote execution envelope.
+                settings.enabled = true;
+                settings.fallback_on_parse_error = false;
+                settings.fallback_on_timeout = false;
+                if language != crate::heredoc::ScriptLanguage::Bash {
+                    // File contents already have a proven language. Pass the
+                    // complete source directly to the shared AST/sink path;
+                    // serializing it into shell quotes can lose source bytes.
+                    let context = HeredocEvaluationContext {
+                        allowlists,
+                        heredoc_settings: &settings,
+                        project_path: Some(cwd),
+                        deadline,
+                        enabled_keywords,
+                        ordered_packs,
+                        keyword_index,
+                        compiled_overrides,
+                        allow_once_audit: None,
+                        shell_dialect: ShellDialect::Posix,
+                        nested_command_depth: nested_command_depth + 1,
+                        inherited_automated_stdin,
+                    };
+                    let content = crate::heredoc::ExtractedContent {
+                        content: source.to_string(),
+                        language,
+                        delimiter: None,
+                        byte_range: 0..0,
+                        content_range: None,
+                        quoted: true,
+                        heredoc_type: None,
+                        target_command: None,
+                    };
+                    return evaluate_extracted_heredoc(
+                        "",
+                        context,
+                        &mut None,
+                        ExtractionResult::Extracted(vec![content]),
+                    )
+                    .unwrap_or_else(EvaluationResult::allowed);
+                }
+                let source_cwd =
+                    crate::rebase_recovery::resolve_effective_cwd(cwd, source, ShellDialect::Posix);
+                evaluate_command_with_pack_order_deadline_at_path_inner(
+                    source,
+                    enabled_keywords,
+                    ordered_packs,
+                    keyword_index,
+                    compiled_overrides,
+                    allowlists,
+                    &settings,
+                    None,
+                    source_cwd.as_deref(),
+                    deadline,
+                    ShellDialect::Posix,
+                    nested_command_depth + 1,
+                    inherited_automated_stdin,
+                )
+            },
+        )
+    {
+        return result;
+    }
+
     // A standalone PowerShell string or script-block literal is an expression
     // value, not an invocation. This distinction is especially important for
     // `pwsh -Command` launched by POSIX/Cmd: `{ ... }` is parsed and printed as
@@ -14155,15 +14232,18 @@ fn evaluate_command_in_single_dialect_view(
         return blocked;
     }
 
-    if heredoc_settings.enabled {
+    if heredoc_settings.enabled || heredoc_settings.scan_script_files {
         if remaining_below(deadline, &crate::perf::HEREDOC_TRIGGER) {
             return EvaluationResult::indeterminate_due_to_budget();
         }
 
-        if check_triggers(command) == TriggerResult::Triggered {
+        if heredoc_settings.scan_script_files || check_triggers(command) == TriggerResult::Triggered
+        {
             let sanitized = sanitize_for_pattern_matching(command);
             let sanitized_str = sanitized.as_ref();
-            let should_scan = if matches!(sanitized, std::borrow::Cow::Owned(_)) {
+            let should_scan = if heredoc_settings.scan_script_files {
+                true
+            } else if matches!(sanitized, std::borrow::Cow::Owned(_)) {
                 check_triggers(sanitized_str) == TriggerResult::Triggered
             } else {
                 true
@@ -30155,6 +30235,16 @@ fn evaluate_heredoc(
         Err(decided) => return Some(*decided),
     };
 
+    evaluate_extracted_heredoc(command, context, first_allowlist_hit, extraction)
+}
+
+#[allow(clippy::too_many_lines)]
+fn evaluate_extracted_heredoc(
+    command: &str,
+    context: HeredocEvaluationContext<'_>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+    extraction: ExtractionResult,
+) -> Option<EvaluationResult> {
     let (contents, fallback_needed) = match extraction {
         ExtractionResult::Extracted(contents) => (contents, false),
         ExtractionResult::NoContent => return None,
@@ -30425,7 +30515,7 @@ fn evaluate_heredoc(
                 |index| index.has_any_keyword(&content.content),
             );
 
-            if body_has_keywords {
+            if body_has_keywords || context.heredoc_settings.scan_script_files {
                 // A payload arriving on `psql`'s stdin is PostgreSQL, and the
                 // denial should say so (#428). The two SQL packs carry a
                 // byte-identical `truncate-table`, so with both enabled
@@ -46244,6 +46334,7 @@ mod tests {
         ) -> crate::config::HeredocSettings {
             crate::config::HeredocSettings {
                 enabled: true,
+                scan_script_files: false,
                 fallback_on_parse_error,
                 fallback_on_timeout,
                 limits: crate::heredoc::ExtractionLimits::default(),
@@ -46257,6 +46348,7 @@ mod tests {
         ) -> crate::config::HeredocSettings {
             crate::config::HeredocSettings {
                 enabled: true,
+                scan_script_files: false,
                 fallback_on_parse_error: true,
                 fallback_on_timeout: true,
                 limits,

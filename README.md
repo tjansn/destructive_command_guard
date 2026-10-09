@@ -1,5 +1,10 @@
 # dcg (Destructive Command Guard)
 
+**Tom's fork (`0.15.3+tom.1`):** adds bounded script-file inspection to the
+shared pre-execution evaluator. See [setup, coverage and limits](docs/script-file-inspection.md).
+The upstream release installers below do not install this fork; build this
+checkout with Cargo and keep `general.update_pin = true`.
+
 <div align="center">
   <img src="illustration.webp" alt="Destructive Command Guard - Protecting your code from accidental destruction">
 </div>

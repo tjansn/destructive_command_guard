@@ -831,15 +831,18 @@ impl ConfigLayer {
 
         let heredoc = heredoc.and_then(|heredoc| {
             let enabled = (heredoc.enabled == Some(true)).then_some(true);
+            let scan_script_files = (heredoc.scan_script_files == Some(true)).then_some(true);
             let fallback_on_parse_error =
                 (heredoc.fallback_on_parse_error == Some(false)).then_some(false);
             let fallback_on_timeout = (heredoc.fallback_on_timeout == Some(false)).then_some(false);
 
             (enabled.is_some()
+                || scan_script_files.is_some()
                 || fallback_on_parse_error.is_some()
                 || fallback_on_timeout.is_some())
             .then(|| HeredocConfig {
                 enabled,
+                scan_script_files,
                 fallback_on_parse_error,
                 fallback_on_timeout,
                 // Limits and language filters can reduce analysis coverage;
@@ -1168,6 +1171,12 @@ pub struct HeredocConfig {
     /// Enable heredoc/inline-script scanning.
     pub enabled: Option<bool>,
 
+    /// Inspect referenced local script files before execution, including
+    /// literal shell helper calls. Incomplete inspection blocks execution.
+    /// Opt-in so library callers and offline repository scans retain their
+    /// existing behavior; enable in the user config for every agent hook.
+    pub scan_script_files: Option<bool>,
+
     /// Timeout budget for Tier 2 extraction (milliseconds).
     pub timeout_ms: Option<u64>,
 
@@ -1212,6 +1221,7 @@ pub struct HeredocConfig {
 #[derive(Debug, Clone)]
 pub struct HeredocSettings {
     pub enabled: bool,
+    pub scan_script_files: bool,
     pub limits: crate::heredoc::ExtractionLimits,
     pub allowed_languages: Option<Vec<crate::heredoc::ScriptLanguage>>,
     pub fallback_on_parse_error: bool,
@@ -1224,6 +1234,7 @@ impl Default for HeredocSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            scan_script_files: false,
             limits: crate::heredoc::ExtractionLimits::default(),
             allowed_languages: None,
             fallback_on_parse_error: true,
@@ -1640,6 +1651,7 @@ impl HeredocConfig {
 
         HeredocSettings {
             enabled: self.enabled.unwrap_or(true),
+            scan_script_files: self.scan_script_files.unwrap_or(false),
             limits,
             allowed_languages,
             fallback_on_parse_error: self.fallback_on_parse_error.unwrap_or(true),
@@ -4553,6 +4565,9 @@ impl Config {
         if heredoc.enabled.is_some() {
             self.heredoc.enabled = heredoc.enabled;
         }
+        if heredoc.scan_script_files.is_some() {
+            self.heredoc.scan_script_files = heredoc.scan_script_files;
+        }
         if heredoc.timeout_ms.is_some() {
             self.heredoc.timeout_ms = heredoc.timeout_ms;
         }
@@ -6172,6 +6187,7 @@ allowlist = ["git reset --hard"]
 
 [heredoc]
 enabled = false
+scan_script_files = false
 timeout_ms = 0
 languages = ["bash"]
 fallback_on_parse_error = true
@@ -6186,6 +6202,25 @@ fallback_on_timeout = true
         assert!(restricted.policy.is_none());
         assert!(restricted.overrides.is_none());
         assert!(restricted.heredoc.is_none());
+    }
+
+    #[test]
+    fn untrusted_project_policy_can_only_enable_script_file_inspection() {
+        let mut config = Config::default();
+        config.heredoc.scan_script_files = Some(true);
+        let weaken: ConfigLayer = toml::from_str("[heredoc]\nscan_script_files = false\n").unwrap();
+        config.merge_layer(weaken.into_restricted_project_policy());
+        assert!(config.heredoc_settings().scan_script_files);
+
+        let harden: ConfigLayer = toml::from_str("[heredoc]\nscan_script_files = true\n").unwrap();
+        assert_eq!(
+            harden
+                .into_restricted_project_policy()
+                .heredoc
+                .unwrap()
+                .scan_script_files,
+            Some(true)
+        );
     }
 
     #[test]
