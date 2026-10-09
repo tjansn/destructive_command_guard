@@ -93,6 +93,23 @@ pub struct ReviewSnapshot {
     incomplete: bool,
 }
 
+/// Separate display fields prevent command/source text from posing as an
+/// agent, folder or action heading. Full evidence remains available in details.
+#[derive(Clone, serde::Serialize)]
+pub struct ReviewDescription {
+    agent: String,
+    host: Option<String>,
+    project: String,
+    repository: Option<String>,
+    cwd: String,
+    title: String,
+    effect: String,
+    warning: Option<String>,
+    command: String,
+    targets: Vec<String>,
+    text: String,
+}
+
 impl ReviewSnapshot {
     fn unchanged(&self) -> bool {
         self.scripts.iter().all(|item| {
@@ -109,7 +126,7 @@ impl ReviewSnapshot {
         cwd: &Path,
         info: &PatternMatch,
         agent: &str,
-    ) -> Option<String> {
+    ) -> Option<ReviewDescription> {
         if self.incomplete {
             return None;
         }
@@ -132,9 +149,36 @@ impl ReviewSnapshot {
         }
         targets.sort();
         targets.dedup();
+        let repository = repository_root(cwd);
+        let project = repository
+            .as_deref()
+            .unwrap_or(cwd)
+            .file_name()
+            .map_or_else(
+                || "/".to_owned(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+        let agent = agent_label(agent);
+        let host = host_label(
+            std::env::var_os("ORCA_WORKTREE_ID").is_some()
+                || std::env::var_os("ORCA_TERMINAL_ID").is_some()
+                || std::env::var_os("ORCA_CODEX_HOME").is_some()
+                || std::env::var_os("CODEX_HOME").is_some_and(|path| {
+                    Path::new(&path)
+                        .components()
+                        .any(|component| component.as_os_str() == "codex-runtime-home")
+                }),
+            std::env::var_os("CMUX_WORKSPACE_ID").is_some()
+                || std::env::var_os("CMUX_SURFACE_ID").is_some(),
+        );
         let mut text = format!(
-            "Agent: {}\n\nWas kann passieren?\n{effect}\n\nArbeitsordner:\n{}\n\nGenauer Aufruf:\n{}\n\nAuslöser der Rückfrage:\n{}\nRegel: {}:{}\n",
-            visible(agent),
+            "Agent: {agent}\nOberfläche: {}\nProjekt: {}\nRepository: {}\n\nWas kann passieren?\n{effect}\n\nArbeitsordner:\n{}\n\nGenauer Aufruf:\n{}\n\nAuslöser der Rückfrage:\n{}\nRegel: {}:{}\n",
+            host.as_deref().unwrap_or("Terminal / direkt"),
+            visible_inline(&project),
+            repository.as_ref().map_or_else(
+                || "Kein Git-Repository erkannt".to_owned(),
+                |path| visible_inline(&path.display().to_string())
+            ),
             visible(&cwd.display().to_string()),
             visible(command),
             visible(&info.reason),
@@ -143,9 +187,9 @@ impl ReviewSnapshot {
         );
         if !targets.is_empty() {
             text.push_str("\nBetroffene Ziele:\n");
-            for target in targets {
+            for target in &targets {
                 text.push_str("  • ");
-                text.push_str(&visible(&target));
+                text.push_str(&visible(target));
                 text.push('\n');
             }
         }
@@ -168,12 +212,29 @@ impl ReviewSnapshot {
             }
         }
         text.push_str("\nDie Freigabe gilt einmal für den gesamten Aufruf oben, einschließlich weiterer Skriptschritte. Es wird keine dauerhafte Ausnahme angelegt. Bei unklaren Zielen ablehnen.");
-        (text.len() <= MAX_REVIEW_TEXT).then_some(text)
+        (text.len() <= MAX_REVIEW_TEXT).then(|| ReviewDescription {
+            agent,
+            host,
+            project: visible_inline(&project),
+            repository: repository.map(|path| visible_inline(&path.display().to_string())),
+            cwd: visible_inline(&cwd.display().to_string()),
+            title: action_title(pack, pattern).to_owned(),
+            effect: effect.to_owned(),
+            warning: (command.contains("ssh ") || command.contains("scp ")).then(|| {
+                "Kann auf einem anderen Rechner wirken. Host und Ziel im Aufruf prüfen.".to_owned()
+            }),
+            command: visible(command),
+            targets: targets
+                .iter()
+                .map(|target| visible_inline(target))
+                .collect(),
+            text,
+        })
     }
 
-    /// Show a local modal dialog, then recheck every captured source byte and
-    /// cwd identity. An explicit button AND fresh Touch ID are required.
-    pub fn request(&self, description: &str, cwd: &Path) -> bool {
+    /// Show the context first, begin embedded Touch ID without a consent click,
+    /// then recheck every captured source byte and cwd identity.
+    pub fn request(&self, description: &ReviewDescription, cwd: &Path) -> bool {
         let Some(_lock) = review_lock() else {
             return false;
         };
@@ -182,23 +243,63 @@ impl ReviewSnapshot {
 
     fn request_with(
         &self,
-        description: &str,
+        description: &ReviewDescription,
         cwd: &Path,
-        dialog: impl FnOnce(&str, &str) -> bool,
+        dialog: impl FnOnce(&ReviewDescription, &str) -> bool,
     ) -> bool {
         let Some(before) = directory_identity(cwd) else {
             return false;
         };
-        if !self.unchanged() || description.len() > MAX_REVIEW_TEXT {
+        if !self.unchanged() || description.text.len() > MAX_REVIEW_TEXT {
             return false;
         }
         let nonce = format!("{:032x}", rand::random::<u128>());
-        let text = format!(
-            "{description}\n\nZum Erlauben „Einmal freigeben“ wählen und mit Touch ID bestätigen. Ohne Antwort bleibt der Vorgang nach {DIALOG_SECONDS} Sekunden gestoppt."
-        );
-        dialog(&text, &nonce)
+        dialog(description, &nonce)
             && self.unchanged()
             && directory_identity(cwd).as_ref() == Some(&before)
+    }
+}
+
+fn repository_root(cwd: &Path) -> Option<PathBuf> {
+    cwd.ancestors()
+        .find(|path| {
+            fs::symlink_metadata(path.join(".git"))
+                .is_ok_and(|metadata| metadata.is_file() || metadata.is_dir())
+        })
+        .map(Path::to_path_buf)
+}
+
+fn agent_label(agent: &str) -> String {
+    match agent {
+        "codex" | "codex-cli" => "Codex".to_owned(),
+        "claude" | "claude-code" => "Claude Code".to_owned(),
+        "pi" => "Pi".to_owned(),
+        "unknown" => "Unbekannter Agent".to_owned(),
+        other => visible_inline(other),
+    }
+}
+
+fn host_label(orca: bool, cmux: bool) -> Option<String> {
+    match (orca, cmux) {
+        (true, true) => Some("Orca · cmux".to_owned()),
+        (true, false) => Some("Orca".to_owned()),
+        (false, true) => Some("cmux".to_owned()),
+        (false, false) => None,
+    }
+}
+
+fn action_title(pack: &str, pattern: &str) -> &'static str {
+    match pack {
+        "core.filesystem" if pattern.contains("truncate") || pattern.contains("redirect") => {
+            "Dateien überschreiben?"
+        }
+        "core.filesystem" => "Dateien endgültig löschen?",
+        "core.git" if pattern.contains("reset-hard") => "Änderungen verwerfen?",
+        "core.git" if pattern.contains("clean") => "Nicht erfasste Dateien löschen?",
+        "core.git" if pattern.contains("branch") => "Git-Branches verändern?",
+        "core.git" => "Gespeicherte Arbeit verändern?",
+        other if other.starts_with("system.disk") => "Datenträger verändern?",
+        _ => "Daten verändern oder löschen?",
     }
 }
 
@@ -329,6 +430,10 @@ fn visible(text: &str) -> String {
             vec![ch]
         }
     }).collect()
+}
+
+fn visible_inline(text: &str) -> String {
+    visible(text).replace('\n', "\\n").replace('\t', "\\t")
 }
 
 fn read_regular_source(path: &Path) -> Option<Vec<u8>> {
@@ -469,7 +574,7 @@ fn approved_reply(success: bool, output: &str, nonce: &str) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn native_dialog(text: &str, nonce: &str) -> bool {
+fn native_dialog(description: &ReviewDescription, nonce: &str) -> bool {
     let Some(base) = crate::config::user_config_dir() else {
         return false;
     };
@@ -479,9 +584,14 @@ fn native_dialog(text: &str, nonce: &str) -> bool {
         );
         return false;
     };
-    let Ok(payload) = serde_json::to_vec(&serde_json::json!({"text": text, "nonce": nonce})) else {
+    let Ok(payload) =
+        serde_json::to_vec(&serde_json::json!({"description": description, "nonce": nonce}))
+    else {
         return false;
     };
+    if payload.len() > 32_768 {
+        return false;
+    }
     let Ok(mut child) = Command::new(helper)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -536,7 +646,7 @@ fn native_dialog(text: &str, nonce: &str) -> bool {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn native_dialog(_: &str, _: &str) -> bool {
+fn native_dialog(_: &ReviewDescription, _: &str) -> bool {
     false
 }
 
@@ -567,10 +677,13 @@ mod tests {
         let text = snapshot
             .description("rm -rf './old files'", &cwd, &match_info("rm-rf"), "Codex")
             .unwrap();
-        assert!(text.contains("kein Papierkorb"));
-        assert!(text.contains(&cwd.join("./old files").display().to_string()));
-        assert!(text.contains("rm -rf './old files'"));
-        assert!(text.contains("keine dauerhafte Ausnahme"));
+        assert!(text.text.contains("kein Papierkorb"));
+        assert!(
+            text.text
+                .contains(&cwd.join("./old files").display().to_string())
+        );
+        assert_eq!(text.command, "rm -rf './old files'");
+        assert!(text.text.contains("keine dauerhafte Ausnahme"));
     }
 
     #[test]
@@ -599,13 +712,16 @@ mod tests {
         let cwd = root.path().canonicalize().unwrap();
         let capture = ReviewCapture::start();
         let snapshot = capture.snapshot();
-        assert!(snapshot.request_with("fixture", &cwd, |text, nonce| {
+        let description = snapshot
+            .description("rm -rf old", &cwd, &match_info("rm-rf"), "Codex")
+            .unwrap();
+        assert!(snapshot.request_with(&description, &cwd, |text, nonce| {
             assert_eq!(nonce.len(), 32);
-            assert!(!text.contains(nonce));
-            assert!(text.contains("Touch ID"));
+            assert!(!text.text.contains(nonce));
+            assert_eq!(text.agent, "Codex");
             true
         }));
-        assert!(!snapshot.request_with("fixture", &cwd, |_, _| false));
+        assert!(!snapshot.request_with(&description, &cwd, |_, _| false));
         assert_eq!(fs::read_dir(cwd).unwrap().count(), 0);
     }
 
@@ -648,10 +764,20 @@ mod tests {
     #[test]
     #[ignore = "manual macOS dialog; no candidate command is executed"]
     fn native_dialog_manual_preview() {
-        let approved = native_dialog(
-            "DIES IST EIN HARMLOSER DIALOGTEST.\n\nEs wird kein Befehl ausgeführt und nichts gelöscht.\n\nBeispiel: Ein alter Ordner samt Inhalt würde dauerhaft gelöscht, ohne Papierkorb.\nZiel: /Beispiel/alter-Ordner\n\nZum Testen „Einmal freigeben“ wählen und danach mit dem Finger bestätigen. Du kannst auch ablehnen.",
-            "00000000000000000000000000000001",
-        );
+        let capture = ReviewCapture::start();
+        let cwd = std::env::current_dir().unwrap();
+        let mut description = capture
+            .snapshot()
+            .description(
+                "rm -rf /Beispiel/alter-Ordner",
+                &cwd,
+                &match_info("rm-rf"),
+                "Codex",
+            )
+            .unwrap();
+        description.title = "Harmloser Dialogtest".to_owned();
+        description.effect = "Es wird kein Befehl ausgeführt und nichts gelöscht. Finger auflegen testet nur diesen Dialog.".to_owned();
+        let approved = native_dialog(&description, "00000000000000000000000000000001");
         eprintln!("Manual preview approved: {approved}");
     }
 
@@ -779,9 +905,83 @@ mod tests {
         let capture = ReviewCapture::start();
         record_script(&path, "git reset --hard HEAD", &cwd, ScriptLanguage::Bash);
         let snapshot = capture.snapshot();
-        assert!(!snapshot.request_with("fixture", &cwd, |_, _| {
+        let description = snapshot
+            .description("bash script.sh", &cwd, &match_info("rm-rf"), "Codex")
+            .unwrap();
+        assert!(!snapshot.request_with(&description, &cwd, |_, _| {
             fs::write(&path, "git clean -fd").unwrap();
             true
         }));
+    }
+
+    #[test]
+    fn context_finds_nested_repo_and_linked_worktree_without_running_git() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().canonicalize().unwrap();
+        let cwd = repo.join("src/nested");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir(repo.join(".git")).unwrap();
+        let capture = ReviewCapture::start();
+        let description = capture
+            .snapshot()
+            .description("rm -rf old", &cwd, &match_info("rm-rf"), "pi")
+            .unwrap();
+        assert_eq!(description.agent, "Pi");
+        assert_eq!(description.repository, Some(repo.display().to_string()));
+        assert_eq!(description.cwd, cwd.display().to_string());
+        let worktree = repo.join("linked");
+        fs::create_dir(&worktree).unwrap();
+        fs::write(
+            worktree.join(".git"),
+            "gitdir: /elsewhere/worktrees/linked\n",
+        )
+        .unwrap();
+        assert_eq!(repository_root(&worktree), Some(worktree));
+    }
+
+    #[test]
+    fn absent_repo_and_inline_control_characters_are_unambiguous() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().canonicalize().unwrap();
+        let capture = ReviewCapture::start();
+        let description = capture
+            .snapshot()
+            .description(
+                "rm -rf old",
+                &cwd,
+                &match_info("rm-rf"),
+                "fake\nCodex\u{202e}",
+            )
+            .unwrap();
+        assert!(description.repository.is_none());
+        assert_eq!(description.agent, "fake\\nCodex\\u{202e}");
+        assert_eq!(agent_label("claude-code"), "Claude Code");
+        assert_eq!(host_label(true, true).as_deref(), Some("Orca · cmux"));
+        assert_eq!(host_label(false, true).as_deref(), Some("cmux"));
+        assert_eq!(host_label(false, false), None);
+    }
+
+    #[test]
+    fn remote_action_warning_stays_visible_in_compact_summary() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().canonicalize().unwrap();
+        let capture = ReviewCapture::start();
+        let description = capture
+            .snapshot()
+            .description(
+                "ssh example.test 'rm -rf old'",
+                &cwd,
+                &match_info("rm-rf"),
+                "Codex",
+            )
+            .unwrap();
+        assert!(
+            description
+                .warning
+                .as_deref()
+                .unwrap()
+                .contains("anderen Rechner")
+        );
+        assert!(description.text.contains("entfernten Rechner"));
     }
 }

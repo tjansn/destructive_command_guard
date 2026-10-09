@@ -9,7 +9,7 @@ There is no LLM, cloud request, executable script invocation or filename cache.
 
 Build the pinned Rust toolchain's checkout with `cargo build --release --locked`.
 On macOS, Apple's Command Line Tools (including Swift) are required at build
-time for the embedded native Touch ID dialog; the installed binary requires
+time for the embedded native Touch ID dialog (macOS 26 SDK or newer); the installed binary requires
 no compiler and downloads no helper code at runtime. The native helper targets
 macOS 12 or later and is built for the selected Rust target architecture.
 Install `target/release/dcg` at the executable path already used by your hooks.
@@ -61,15 +61,28 @@ Claude hook self-repair preserves an existing `--desktop-review` option and its
 host timeout, including when repairing a stale executable path. It never copies
 arbitrary arguments from the previous hook command.
 
-After a verified rule-based denial, the hook waits for a local native macOS
-dialog. It shows a German explanation of the possible effects, literal deletion
-targets/search roots and Git names, execution directory, exact command, rule and the complete contents of
-small inspected scripts. The content area scrolls. The user selects
-**Einmal freigeben**, then confirms through macOS **Touch ID**. A fresh
+After a verified rule-based denial, the hook waits for a compact local native
+macOS window. The detected agent, Orca/cmux context when available, project name
+and execution directory appear above the German explanation of the action and
+its consequences. The nearest `.git` directory or worktree marker identifies
+the repository without executing Git. A folder is shown when none is found.
+The exact command is previewed; **Details und Skripte** expands the complete
+command, all literal targets/search roots and Git names, rule and the full
+contents of small inspected scripts. Nothing is discarded from those details.
+On macOS 26 or newer the surface uses native **Liquid Glass**; older supported
+systems use a native translucent material. System appearance and accessibility
+preferences remain in control of the material.
+
+macOS **Touch ID** is embedded directly in this window through
+[LAAuthenticationView](https://developer.apple.com/documentation/localauthenticationembeddedui/laauthenticationview).
+Authentication starts once the populated window is visible, key and active.
+There is no preliminary approval click or second authentication alert: read
+the action, then put a finger on Touch ID to approve this request. A fresh
 LocalAuthentication context requires biometrics, verifies that the device uses
 Touch ID, disables reuse of a previous unlock and offers no code/password
 fallback. Fingerprint data remains with macOS; DCG receives only success or
-failure. The default button is **Ablehnen**. Closing, failed authentication,
+failure. **Ablehnen** and Escape cancel. Closing, switching to another app/window
+while authentication is pending, failed authentication,
 unavailable/locked-out Touch ID, no response after 120 seconds,
 a busy dialog, backend failure or changed script bytes leaves the denial in
 place. The process watchdog terminates a stuck dialog after 125 seconds.
@@ -109,6 +122,10 @@ Run `cargo test --lib desktop_review::tests` for automated checks. The ignored
 Touch ID authentication without ever executing a candidate command. Automated
 tests exercise invalid helper input, altered/symlinked cache entries and bound
 success replies; they do not simulate a successful fingerprint.
+Context tests cover nested repositories, linked worktrees, ordinary folders and
+visible escaping of control characters in identity labels. Agent/host labels
+are contextual information from the invoking integration/environment, not an
+attestation of an agent's identity against other processes in the same account.
 
 Codex's per-tool `tool_input.workdir` takes precedence over the session cwd.
 Malformed or relative overrides fail closed for file inspection and scoped
