@@ -348,6 +348,77 @@ fn claude_and_codex_hook_protocols_deny_file_backed_commands() {
 }
 
 #[test]
+fn desktop_review_keeps_safe_unverified_and_multi_entry_protocols_closed() {
+    let fixture = Fixture::new();
+    for (candidate, batch, expected) in [
+        ("printf safe", false, "allow"),
+        ("bash missing.sh", false, "deny"),
+        ("git reset --hard HEAD", true, "deny"),
+    ] {
+        let mut input = json!({
+            "turn_id": "desktop-review-regression",
+            "tool_name": "Bash", "tool_input": {"command": candidate},
+            "cwd": fixture.root, "dcg_explicit_verdict": true,
+        });
+        if batch {
+            input["toolCalls"] = json!([
+                {"name": "Bash", "args": {"command": "git clean -fd"}}
+            ]);
+        }
+        let mut child = fixture
+            .command()
+            .arg("--desktop-review")
+            .spawn()
+            .expect("start hook");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(input.to_string().as_bytes())
+            .expect("payload");
+        let output = child.wait_with_output().expect("hook output");
+        let verdict: Value = serde_json::from_slice(&output.stdout).expect("single valid verdict");
+        if expected == "allow" {
+            assert_eq!(verdict["dcg_verdict"], "allow");
+        } else {
+            assert_eq!(verdict["hookSpecificOutput"]["permissionDecision"], "deny");
+        }
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("Warte auf"),
+            "unexpected dialog: {candidate}"
+        );
+    }
+}
+
+#[test]
+fn codex_workdir_override_cannot_use_a_safe_session_namesake() {
+    let fixture = Fixture::new();
+    fixture.write("same.sh", "printf harmless\n");
+    fixture.write("other/same.sh", "git reset --hard HEAD\n");
+    for workdir in [
+        json!(fixture.root.join("other")),
+        json!(42),
+        json!("relative"),
+    ] {
+        let input = json!({
+            "turn_id": "execution-directory-regression", "tool_name": "Bash",
+            "tool_input": {"command": "bash same.sh", "workdir": workdir},
+            "cwd": fixture.root,
+        });
+        let mut child = fixture.command().spawn().expect("start hook");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(input.to_string().as_bytes())
+            .expect("payload");
+        let output = child.wait_with_output().expect("hook output");
+        let verdict: Value = serde_json::from_slice(&output.stdout).expect("valid verdict");
+        assert_eq!(verdict["hookSpecificOutput"]["permissionDecision"], "deny");
+    }
+}
+
+#[test]
 fn inspection_is_opt_in_for_existing_installations() {
     let fixture = Fixture::new();
     std::fs::write(&fixture.config, "[heredoc]\nscan_script_files = false\n").expect("opt out");

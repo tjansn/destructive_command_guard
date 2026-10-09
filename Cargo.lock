@@ -939,7 +939,7 @@ dependencies = [
 
 [[package]]
 name = "destructive_command_guard"
-version = "0.15.3+tom.1"
+version = "0.15.3+tom.2"
 dependencies = [
  "aho-corasick",
  "assert_cmd",

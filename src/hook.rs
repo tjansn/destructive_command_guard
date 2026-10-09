@@ -183,6 +183,10 @@ pub struct HookInput {
 pub struct ToolInput {
     /// The command string (for Bash tools).
     pub command: Option<serde_json::Value>,
+    /// Codex exec tools may override the session cwd for this command.
+    /// Keep malformed values visible so scoping fails closed, not to the
+    /// session directory where an unrelated safe namesake might exist.
+    pub workdir: Option<serde_json::Value>,
 }
 
 /// Antigravity CLI (`agy`) tool-call envelope.

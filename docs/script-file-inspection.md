@@ -34,14 +34,66 @@ Tom's user configuration it is always enabled. Automatically discovered,
 untrusted project configuration cannot turn a trusted user's true setting off.
 An explicitly trusted configuration or operator override remains authoritative.
 
-Use native PreToolUse hooks for Claude Code and Codex. Pi's global `tool_call`
-extension must call `dcg --robot test --dialect posix --stdin --enforce-budget`
-from the tool's execution directory and deny malformed output, errors and
-timeouts. The same executable/configuration must be reachable in cmux and Orca;
+Use native PreToolUse hooks for Claude Code and Codex. For blocking without
+human review, Pi can use `dcg --robot test --dialect posix --stdin --enforce-budget`.
+For local desktop review use the fork's
+[Pi extension](../integrations/pi/dcg-guard.ts), which sends a native hook JSON
+payload and requires an explicit DCG allow verdict. It denies malformed output,
+errors and timeouts. The same executable/configuration must be reachable in cmux and Orca;
 their terminals do not add a separate security boundary. Orca's isolated
 Codex home also needs its own native hook entry. Start a fresh agent process
 after changing hook configuration; changing the referenced binary alone takes
 effect on the next invocation of an already loaded hook.
+
+## One-request desktop approval (macOS)
+
+Set the trusted user hook command to `/absolute/path/dcg --desktop-review`
+and its host timeout to at least **150 seconds**. Keep `default_mode = "deny"`,
+`unverified_decision = "deny"` and `scan_script_files = true`. Copy the fork's
+[Pi extension](../integrations/pi/dcg-guard.ts) to
+`~/.pi/agent/extensions/dcg-guard.ts`, adjusting its absolute executable path.
+Restart each agent after changing its hook/extension.
+
+After a verified rule-based denial, the hook waits for a local native macOS
+dialog. It shows a German explanation of the possible effects, literal deletion
+targets/search roots and Git names, execution directory, exact command, rule and the complete contents of
+small inspected scripts. The content area scrolls. The user must enter the
+displayed six-digit code and explicitly select **Einmal freigeben**. The default
+button is **Ablehnen**. Closing, a wrong code, no response after 120 seconds,
+a busy dialog, backend failure or changed script bytes leaves the denial in
+place. The process watchdog terminates a stuck dialog after 125 seconds.
+
+Approval releases only the pending tool request. It writes no allowlist or
+reusable allow-once grant and does not bypass the host's own permissions. Script
+hashes and execution-directory identity are checked before and after the dialog.
+All recognized sibling helpers/lifecycle sources are inspected even after the
+first destructive finding, so later helper edits also invalidate approval.
+Incomplete inspection, dynamic deletion operands, oversized reviews (over 5000 bytes),
+multi-entry tool batches, unsupported platforms and disabled script inspection
+never gain desktop approval. Revise ambiguous commands to use literal targets.
+
+This avoids Codex's unsupported hook `ask` value: Codex receives an ordinary
+blocking verdict unless the human directly approves the local dialog. See
+[official hook limitations](https://learn.chatgpt.com/docs/hooks).
+`test`, `explain`, `scan` and JSONL batch mode never show approval dialogs or
+change their decision APIs. The option is explicit in the trusted hook command;
+projects cannot turn it on via an automatically discovered config file.
+
+This is an interlock for cooperative agents in the current logged-in desktop
+session, not an authenticated security boundary against a process controlling
+that same account or GUI. Native executables, imports and the remaining
+check-to-execution race retain the limitations below. Full script contents
+appear only locally in the dialog; the explanation uses templates, no LLM/API.
+
+Run `cargo test --lib desktop_review::tests` for automated checks. The ignored
+`native_dialog_manual_preview` test shows a harmless live dialog without ever
+executing a candidate command.
+
+Codex's per-tool `tool_input.workdir` takes precedence over the session cwd.
+Malformed or relative overrides fail closed for file inspection and scoped
+approval. A multi-entry batch with an override is not given a guessed cwd.
+Run `node --experimental-vm-modules tests/pi_desktop_bridge.mjs` for the Pi
+bridge's explicit-verdict, malformed-output and process-failure regressions.
 
 ## What is checked
 

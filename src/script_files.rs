@@ -108,6 +108,7 @@ enum FileFormat {
 }
 
 fn unverified(reason: &str) -> EvaluationResult {
+    crate::desktop_review::record_incomplete();
     EvaluationResult::denied_by_embedded_sink(
         "heredoc.script_files.unverified",
         &format!("Script-file inspection incomplete: {reason}"),
@@ -141,6 +142,7 @@ pub(crate) fn evaluate(
         Err(reason) => return Some(unverified(&reason)),
     };
     let mut first_warning = None;
+    let mut first_denial = None;
     for reference in references {
         if deadline.is_exceeded() {
             return Some(EvaluationResult::indeterminate_due_to_budget());
@@ -156,7 +158,7 @@ pub(crate) fn evaluate(
         let result = inspect_reference(&reference, cwd, &mut evaluate_source);
         match result {
             Ok(Some(result)) if result.decision != EvaluationDecision::Allow => {
-                return Some(result);
+                first_denial.get_or_insert(result);
             }
             Ok(Some(result)) if result.effective_mode.is_some() => {
                 first_warning.get_or_insert(result);
@@ -168,7 +170,7 @@ pub(crate) fn evaluate(
     if deadline.is_exceeded() {
         Some(EvaluationResult::indeterminate_due_to_budget())
     } else {
-        first_warning
+        first_denial.or(first_warning)
     }
 }
 
@@ -689,6 +691,7 @@ fn inspect_reference(
     if language == ScriptLanguage::Unknown {
         return Err("script language is unsupported".to_string());
     }
+    crate::desktop_review::record_script(&path, &content, cwd, language);
     let sources = match &reference.format {
         FileFormat::Script => vec![content],
         FileFormat::PackageScript(task) => package_source(&content, task)?,
@@ -716,10 +719,12 @@ fn inspect_reference(
         }
         let candidate = evaluate_source(&source, cwd, language);
         if candidate.decision != EvaluationDecision::Allow {
-            result = candidate;
-            break;
+            if result.decision == EvaluationDecision::Allow {
+                result = candidate;
+            }
+            continue;
         }
-        if candidate.effective_mode.is_some() {
+        if candidate.effective_mode.is_some() && result.decision == EvaluationDecision::Allow {
             result = candidate;
         }
     }

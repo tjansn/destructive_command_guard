@@ -941,6 +941,7 @@ fn is_top_level_global_flag(arg: &str) -> bool {
             | "--no-color"
             | "--no-suggestions"
             | "--robot"
+            | "--desktop-review"
     ) || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].chars().all(|c| c == 'v'))
 }
 
@@ -2231,7 +2232,19 @@ fn main() {
         }
     }
 
-    let hook_cwd = hook_input.cwd.as_deref().map(Path::new);
+    let workdir_override = hook_input
+        .tool_input
+        .as_ref()
+        .and_then(|input| input.workdir.as_ref());
+    let hook_cwd = match workdir_override {
+        Some(value) if additional_commands.is_empty() => {
+            Some(Path::new(value.as_str().unwrap_or("")))
+        }
+        // A batch may carry several different execution directories. Never
+        // apply the primary entry's override to its other commands.
+        Some(_) => Some(Path::new("")),
+        None => hook_input.cwd.as_deref().map(Path::new),
+    };
 
     // Directory-scoped allowlist entries are judged against the directory the
     // harness says the command will run in, never the hook process's own
@@ -2274,6 +2287,12 @@ fn main() {
     // emitting two decision documents on one-JSON-document protocols.
     // Exactly one response is chosen afterwards by precedence:
     // Deny > Indeterminate > Ask > Warn > Log/Allow (ties keep scan order).
+    let desktop_review_eligible = cli.desktop_review
+        && additional_commands.is_empty()
+        && hook_input.tool_calls.is_none()
+        && heredoc_settings.scan_script_files;
+    let review_capture = desktop_review_eligible
+        .then(destructive_command_guard::desktop_review::ReviewCapture::start);
     let mut decisive: Option<ResolvedCommandOutcome> = None;
     let mut primary_allow_row: Option<Box<CommandEntry>> = None;
 
@@ -2317,7 +2336,41 @@ fn main() {
         "hook request resolved"
     );
     let exit_code = if let Some(outcome) = decisive {
-        publish_decisive_response(&eval_context, outcome, &mut history_writer)
+        let approved = review_capture.as_ref().is_some_and(|capture| {
+            let ResolvedCommandOutcome::DenyFamily(resolved) = &outcome else { return false };
+            if !matches!(resolved.mode, DecisionMode::Deny | DecisionMode::Ask) {
+                return false;
+            }
+            let Some(info) = resolved.result.pattern_info.as_ref() else { return false };
+            let Some(cwd) = scope_base else { return false };
+            let snapshot = capture.snapshot();
+            let Some(description) = snapshot.description(
+                &resolved.command, cwd, info, cli.agent.as_deref().unwrap_or(history_agent_type),
+            ) else {
+                emit_stderr!("[dcg] Keine Desktop-Freigabe: Prüfung unvollständig oder Vorgang zu umfangreich für einen vollständigen Dialog.");
+                return false;
+            };
+            emit_stderr!("[dcg] Warte auf deine einmalige Freigabe im macOS-Dialog (maximal 120 Sekunden).");
+            if !snapshot.request(&description, cwd) {
+                emit_stderr!("[dcg] Nicht freigegeben: abgelehnt, abgelaufen, Dialog nicht verfügbar oder geprüfte Dateien geändert. Nicht durch Umformulieren erneut versuchen.");
+                return false;
+            }
+            emit_stderr!("[dcg] Durch lokale Bestätigung einmalig freigegeben; keine dauerhafte Ausnahme.");
+            if let Some(writer) = history_writer.as_ref() {
+                writer.log(build_history_entry(
+                    history_agent_type, &resolved.command, &cwd.display().to_string(),
+                    HistoryOutcome::Allow, resolved.eval_duration,
+                    info.pack_id.as_deref(), info.pattern_name.as_deref(),
+                    Some("desktop-review:one-request"),
+                ));
+            }
+            true
+        });
+        if approved {
+            EXIT_SUCCESS
+        } else {
+            publish_decisive_response(&eval_context, outcome, &mut history_writer)
+        }
     } else {
         // Every entry was evaluated and allowed: a later panic (history
         // flush) must not turn that into a block.

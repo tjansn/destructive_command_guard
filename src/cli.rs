@@ -118,6 +118,11 @@ impl OutputFormat {
 #[command(version, about, long_about = None)]
 #[command(after_help = "Run 'dcg doctor' to verify your installation.")]
 pub struct Cli {
+    /// Ask the local macOS operator before a verified hook denial proceeds.
+    /// Only affects single-request hook mode; never changes test/scan verdicts.
+    #[arg(long)]
+    pub desktop_review: bool,
+
     /// Increase verbosity (-v, -vv, -vvv)
     #[arg(short, long, action = clap::ArgAction::Count, global = true, env = "DCG_VERBOSE")]
     pub verbose: u8,

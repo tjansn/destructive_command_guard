@@ -1,5 +1,10 @@
 # Pi Integration
 
+**Tom's fork:** for fail-closed integration with one-request macOS approval,
+use [integrations/pi/dcg-guard.ts](../integrations/pi/dcg-guard.ts) and the
+[desktop-review setup](script-file-inspection.md#one-request-desktop-approval-macos).
+The upstream recipe below does not implement this fork's desktop review.
+
 Last updated: 2026-08-26
 
 This document shows how to connect dcg to the [Pi coding agent](https://github.com/earendil-works/pi)
