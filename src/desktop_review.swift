@@ -197,23 +197,19 @@ final class ReviewController: NSObject, NSWindowDelegate {
         let projectName = label(info.project, size: 13, weight: .medium)
         projectName.maximumNumberOfLines = 2
         projectName.lineBreakMode = .byTruncatingMiddle
-        projectName.toolTip = info.repository ?? info.cwd
         let project = horizontal([
             icon("folder", size: 12, color: .secondaryLabelColor),
             projectName,
         ])
-        let path = scrollText(info.cwd, height: 30, color: .secondaryLabelColor)
-        path.setAccessibilityLabel("Arbeitsordner: \(info.cwd)")
-        let identity = vertical([agent, project, path], spacing: 4)
+        let identity = vertical([agent, project], spacing: 4)
         agent.widthAnchor.constraint(equalTo: identity.widthAnchor).isActive = true
         project.widthAnchor.constraint(equalTo: identity.widthAnchor).isActive = true
-        path.widthAnchor.constraint(equalTo: identity.widthAnchor).isActive = true
         return card(identity)
     }
 
     private func actionSummary(_ info: ReviewDescription) -> NSView {
-        let action = label(info.title, size: 21, weight: .semibold)
-        let explanation = label(info.effect, size: 13)
+        let action = label(info.title, size: 16, weight: .semibold)
+        let explanation = label(info.effect, size: 12)
         let effect = vertical([action, explanation], spacing: 7)
         action.widthAnchor.constraint(equalTo: effect.widthAnchor).isActive = true
         explanation.widthAnchor.constraint(equalTo: effect.widthAnchor).isActive = true
@@ -222,27 +218,10 @@ final class ReviewController: NSObject, NSWindowDelegate {
             effect.addArrangedSubview(notice)
             notice.widthAnchor.constraint(equalTo: effect.widthAnchor).isActive = true
         }
-        if !info.targets.isEmpty {
-            var summary = info.targets.prefix(2).map { "• \($0)" }.joined(separator: "\n")
-            if info.targets.count > 2 {
-                summary += "\n+ \(info.targets.count - 2) weitere Ziele in den Details"
-            }
-            let targets = scrollText(summary, height: info.targets.count == 1 ? 32 : 52)
-            targets.setAccessibilityLabel("Betroffene Ziele")
-            effect.addArrangedSubview(targets)
-            targets.widthAnchor.constraint(equalTo: effect.widthAnchor).isActive = true
-        }
         return effect
     }
 
-    private func commandSummary(_ info: ReviewDescription) -> NSView {
-        let command = label(info.command, size: 11)
-        command.font = .monospacedSystemFont(ofSize: 11, weight: .medium)
-        command.maximumNumberOfLines = 2
-        command.lineBreakMode = .byTruncatingMiddle
-        command.toolTip = info.command
-        command.setAccessibilityLabel("Genauer Aufruf: \(info.command)")
-
+    private func detailsControl() -> NSView {
         let toggle = NSButton(title: "Details", target: self, action: #selector(toggleDetails))
         toggle.isBordered = false
         toggle.font = .systemFont(ofSize: 12, weight: .medium)
@@ -254,13 +233,7 @@ final class ReviewController: NSObject, NSWindowDelegate {
         toggle.heightAnchor.constraint(equalToConstant: 32).isActive = true
         toggle.widthAnchor.constraint(equalToConstant: 76).isActive = true
         detailsButton = toggle
-        let text = vertical([
-            label("Aufruf", size: 10, weight: .medium, color: .secondaryLabelColor), command,
-        ], spacing: 3)
-        command.widthAnchor.constraint(equalTo: text.widthAnchor).isActive = true
-        let row = horizontal([text, spacer(), toggle], spacing: 12)
-        text.widthAnchor.constraint(equalTo: row.widthAnchor, constant: -100).isActive = true
-        return row
+        return horizontal([toggle, spacer()], spacing: 12)
     }
 
     private func authenticationRow() -> NSView {
@@ -328,16 +301,16 @@ final class ReviewController: NSObject, NSWindowDelegate {
 
         let identity = identityCard(info)
         let effect = actionSummary(info)
-        let command = commandSummary(info)
+        let disclosure = detailsControl()
         let details = scrollText(info.text, height: 150, mono: true)
         details.isHidden = true
         self.details = details
         let divider = NSBox()
         divider.boxType = .separator
         let authentication = authenticationRow()
-        let stack = vertical([identity, effect, command, details, divider, authentication], spacing: 12)
+        let stack = vertical([identity, effect, disclosure, details, divider, authentication], spacing: 12)
         stack.setCustomSpacing(16, after: identity)
-        stack.setCustomSpacing(0, after: command)
+        stack.setCustomSpacing(0, after: disclosure)
         stack.setCustomSpacing(12, after: details)
         content.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -346,7 +319,7 @@ final class ReviewController: NSObject, NSWindowDelegate {
             stack.topAnchor.constraint(equalTo: content.topAnchor, constant: Self.inset),
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -Self.inset),
         ])
-        for row in [identity, effect, command, details, divider, authentication] as [NSView] {
+        for row in [identity, effect, disclosure, details, divider, authentication] as [NSView] {
             row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
         self.stack = stack

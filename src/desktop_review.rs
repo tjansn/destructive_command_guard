@@ -149,6 +149,7 @@ impl ReviewSnapshot {
         }
         targets.sort();
         targets.dedup();
+        let title = action_title(pack, pattern, &targets);
         let repository = repository_root(cwd);
         let project = repository
             .as_deref()
@@ -172,7 +173,7 @@ impl ReviewSnapshot {
                 || std::env::var_os("CMUX_SURFACE_ID").is_some(),
         );
         let mut text = format!(
-            "Agent: {agent}\nOberfläche: {}\nProjekt: {}\nRepository: {}\n\nWas kann passieren?\n{effect}\n\nArbeitsordner:\n{}\n\nGenauer Aufruf:\n{}\n\nAuslöser der Rückfrage:\n{}\nRegel: {}:{}\n",
+            "Agent: {agent}\nOberfläche: {}\nProjekt: {}\nRepository: {}\n\nWas soll passieren?\n{title}\n\nWelche Folgen hat das?\n{effect}\n\nArbeitsordner:\n{}\n\nGenauer Aufruf:\n{}\n\nAuslöser der Rückfrage:\n{}\nRegel: {}:{}\n",
             host.as_deref().unwrap_or("Terminal / direkt"),
             visible_inline(&project),
             repository.as_ref().map_or_else(
@@ -218,7 +219,7 @@ impl ReviewSnapshot {
             project: visible_inline(&project),
             repository: repository.map(|path| visible_inline(&path.display().to_string())),
             cwd: visible_inline(&cwd.display().to_string()),
-            title: action_title(pack, pattern).to_owned(),
+            title,
             effect: effect.to_owned(),
             warning: (command.contains("ssh ") || command.contains("scp ")).then(|| {
                 "Kann auf einem anderen Rechner wirken. Host und Ziel im Aufruf prüfen.".to_owned()
@@ -288,19 +289,37 @@ fn host_label(orca: bool, cmux: bool) -> Option<String> {
     }
 }
 
-fn action_title(pack: &str, pattern: &str) -> &'static str {
+fn action_title(pack: &str, pattern: &str, targets: &[String]) -> String {
+    if pack == "core.filesystem" && !pattern.contains("truncate") && !pattern.contains("redirect") {
+        if let [target] = targets
+            && Path::new(target).is_absolute()
+            && let Some(name) = Path::new(target)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(visible_inline)
+            && name.len() <= 80
+        {
+            return format!("„{name}“ löschen");
+        }
+        if targets.len() > 1 && targets.iter().all(|target| Path::new(target).is_absolute()) {
+            return format!("{} Dateien oder Ordner löschen", targets.len());
+        }
+    }
     match pack {
         "core.filesystem" if pattern.contains("truncate") || pattern.contains("redirect") => {
-            "Dateien überschreiben?"
+            "Dateien überschreiben oder leeren"
         }
-        "core.filesystem" => "Dateien endgültig löschen?",
-        "core.git" if pattern.contains("reset-hard") => "Änderungen verwerfen?",
-        "core.git" if pattern.contains("clean") => "Nicht erfasste Dateien löschen?",
-        "core.git" if pattern.contains("branch") => "Git-Branches verändern?",
-        "core.git" => "Gespeicherte Arbeit verändern?",
-        other if other.starts_with("system.disk") => "Datenträger verändern?",
-        _ => "Daten verändern oder löschen?",
+        "core.filesystem" => "Dateien oder Ordner löschen",
+        "core.git" if pattern.contains("reset-hard") => {
+            "Dateien auf einen gespeicherten Stand zurücksetzen"
+        }
+        "core.git" if pattern.contains("clean") => "Nicht in Git gespeicherte Dateien löschen",
+        "core.git" if pattern.contains("branch") => "Lokale Git-Branches verändern",
+        "core.git" => "Gespeicherte Arbeit verändern",
+        other if other.starts_with("system.disk") => "Datenträger verändern",
+        _ => "Daten verändern oder löschen",
     }
+    .to_owned()
 }
 
 // Literal rm operands are shown in ordinary language as concrete paths.
@@ -401,22 +420,22 @@ fn removal_targets(source: &str, cwd: &Path) -> Option<Vec<String>> {
 fn effect_description(pack: &str, pattern: &str) -> &'static str {
     if pack == "core.filesystem" {
         if pattern.contains("truncate") || pattern.contains("redirect") {
-            "Vorhandene Dateien können überschrieben oder geleert werden. Der bisherige Inhalt kann dabei verloren gehen."
+            "Der bisherige Dateiinhalt kann verloren gehen."
         } else {
-            "Die angegebenen Dateien oder Ordner können samt Inhalt dauerhaft gelöscht werden. Es wird kein Papierkorb verwendet. Ohne Backup sind die Daten meist verloren."
+            "Es wird kein Papierkorb verwendet. Ohne Backup sind die Daten meist verloren."
         }
     } else if pack == "core.git" && pattern.contains("reset-hard") {
-        "Änderungen, die noch nicht in Git gesichert sind, gehen verloren. Betroffene Dateien werden auf den gewählten gespeicherten Stand zurückgesetzt."
+        "Nicht in Git gespeicherte Änderungen gehen verloren."
     } else if pack == "core.git" && pattern.contains("clean") {
-        "Git löscht Dateien und Ordner, die dort nicht gespeichert sind. Git kann sie danach meist nicht wiederherstellen."
+        "Git kann diese Dateien danach meist nicht wiederherstellen."
     } else if pack == "core.git" && pattern.contains("branch") {
-        "Lokale Git-Branches können gelöscht oder ersetzt werden. Arbeit, die nur dort gespeichert ist, kann schwerer wiederzufinden sein."
+        "Nur dort gespeicherte Arbeit kann schwerer wiederzufinden sein."
     } else if pack == "core.git" {
-        "Dieser Git-Aufruf kann vorhandene Arbeit verwerfen oder die Versionsgeschichte verändern. Prüfe den unten genannten Git-Vorgang und seine Ziele."
+        "Vorhandene Arbeit oder der bisherige Verlauf können verloren gehen."
     } else if pack.starts_with("system.disk") {
-        "Datenträger oder Dateisysteme können überschrieben, formatiert oder anderweitig verändert werden. Dabei können sehr viele Daten unwiederbringlich verloren gehen."
+        "Viele Daten können unwiederbringlich verloren gehen."
     } else {
-        "Der Aufruf enthält einen als destruktiv erkannten Vorgang. Vorhandene Daten oder Ressourcen können gelöscht, überschrieben oder verändert werden. Prüfe die konkrete Aktion und ihre Ziele unten."
+        "Vorhandene Daten oder Ressourcen können verloren gehen."
     }
 }
 
@@ -683,7 +702,43 @@ mod tests {
                 .contains(&cwd.join("./old files").display().to_string())
         );
         assert_eq!(text.command, "rm -rf './old files'");
+        assert_eq!(text.title, "„old files“ löschen");
+        assert!(!text.title.contains(&cwd.display().to_string()));
         assert!(text.text.contains("keine dauerhafte Ausnahme"));
+    }
+
+    #[test]
+    fn compact_action_keeps_multiple_and_long_targets_complete_in_details() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().canonicalize().unwrap();
+        let capture = ReviewCapture::start();
+        let snapshot = capture.snapshot();
+        let multiple = snapshot
+            .description("rm -rf old backup", &cwd, &match_info("rm-rf"), "Codex")
+            .unwrap();
+        assert_eq!(multiple.title, "2 Dateien oder Ordner löschen");
+        for target in ["old", "backup"] {
+            assert!(
+                multiple
+                    .text
+                    .contains(&cwd.join(target).display().to_string())
+            );
+        }
+        let long_name = "🗂".repeat(30);
+        let long = snapshot
+            .description(
+                &format!("rm -rf '{long_name}'"),
+                &cwd,
+                &match_info("rm-rf"),
+                "Codex",
+            )
+            .unwrap();
+        assert_eq!(long.title, "Dateien oder Ordner löschen");
+        assert!(long.title.len() <= 128);
+        assert!(
+            long.text
+                .contains(&cwd.join(long_name).display().to_string())
+        );
     }
 
     #[test]

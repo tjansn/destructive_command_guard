@@ -62,12 +62,15 @@ host timeout, including when repairing a stale executable path. It never copies
 arbitrary arguments from the previous hook command.
 
 After a verified rule-based denial, the hook waits for a compact local native
-macOS window. The detected agent, Orca/cmux context when available, project name
-and execution directory appear above the German explanation of the action and
-its consequences. The nearest `.git` directory or worktree marker identifies
-the repository without executing Git. A folder is shown when none is found.
-The exact command is previewed; **Details** expands the complete
-command, all literal targets/search roots and Git names, rule and the full
+macOS window. The detected agent, Orca/cmux context when available and project
+name appear above a short German action summary followed by its consequences.
+For a single literal removal target, the summary names the file or folder
+without its full path; multiple targets are counted. Long names and non-path
+targets retain a general action summary. The nearest `.git` directory or
+worktree marker identifies the repository without executing Git. A folder is
+shown when none is found.
+**Details** expands the exact execution directory and complete
+command, all literal target paths/search roots and Git names, rule and the full
 contents of small inspected scripts. Nothing is discarded from those details.
 On macOS 26 or newer the surface uses native **Liquid Glass**; older supported
 systems use a native translucent material. System appearance and accessibility
@@ -75,7 +78,8 @@ preferences remain in control of the material.
 Agent and project form one quiet inset surface; the action and consequences
 have stronger visual weight. The footer combines the real Touch ID view and
 the reject button. The 460-point-wide layout uses concentric 28/12-point corners
-with a 16-point inset, readable command text and shorter German explanations.
+with a 16-point inset, a modest 16-point action heading and concise consequences.
+Full paths and technical command text appear only in the expanded details.
 Details expand immediately, with no decorative movement on this frequent flow.
 
 macOS **Touch ID** is embedded directly in this window through
