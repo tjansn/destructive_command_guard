@@ -1,6 +1,6 @@
 # dcg (Destructive Command Guard)
 
-**Tom's fork (`0.15.3+tom.5`):** adds bounded script-file inspection to the
+**Tom's fork (`0.15.3+tom.6`):** adds bounded script-file inspection to the
 shared pre-execution evaluator and optional local macOS approval dialogs with
 embedded Touch ID, agent/project context and Liquid Glass, including for Codex.
 See [setup, coverage and limits](docs/script-file-inspection.md).

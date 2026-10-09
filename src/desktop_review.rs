@@ -403,14 +403,14 @@ fn effect_description(pack: &str, pattern: &str) -> &'static str {
         if pattern.contains("truncate") || pattern.contains("redirect") {
             "Vorhandene Dateien können überschrieben oder geleert werden. Der bisherige Inhalt kann dabei verloren gehen."
         } else {
-            "Dateien oder Ordner können dauerhaft gelöscht werden. Bei rekursivem Löschen betrifft das auch alle enthaltenen Dateien und Unterordner. Es wird kein Papierkorb verwendet; eine Wiederherstellung benötigt meist ein Backup. Die Ziele stehen im Aufruf bzw. Skript unten."
+            "Die angegebenen Dateien oder Ordner können samt Inhalt dauerhaft gelöscht werden. Es wird kein Papierkorb verwendet. Ohne Backup sind die Daten meist verloren."
         }
     } else if pack == "core.git" && pattern.contains("reset-hard") {
-        "Nicht gespeicherte Änderungen an von Git verwalteten Dateien werden verworfen. Dateien werden auf den gewählten Git-Stand zurückgesetzt; dabei können Dateien verschwinden. Nicht eingecheckte Arbeit kann verloren gehen."
+        "Änderungen, die noch nicht in Git gesichert sind, gehen verloren. Betroffene Dateien werden auf den gewählten gespeicherten Stand zurückgesetzt."
     } else if pack == "core.git" && pattern.contains("clean") {
-        "Git entfernt Dateien und gegebenenfalls Ordner, die nicht in der Versionsverwaltung gespeichert sind. Diese Dateien sind anschließend auch über Git meist nicht wiederherstellbar."
+        "Git löscht Dateien und Ordner, die dort nicht gespeichert sind. Git kann sie danach meist nicht wiederherstellen."
     } else if pack == "core.git" && pattern.contains("branch") {
-        "Lokale Git-Branches können gelöscht oder ersetzt werden. Nur darüber erreichbare Arbeit kann schwerer wiederzufinden sein; eine erzwungene Löschung prüft nicht, ob sie bereits übernommen wurde."
+        "Lokale Git-Branches können gelöscht oder ersetzt werden. Arbeit, die nur dort gespeichert ist, kann schwerer wiederzufinden sein."
     } else if pack == "core.git" {
         "Dieser Git-Aufruf kann vorhandene Arbeit verwerfen oder die Versionsgeschichte verändern. Prüfe den unten genannten Git-Vorgang und seine Ziele."
     } else if pack.starts_with("system.disk") {

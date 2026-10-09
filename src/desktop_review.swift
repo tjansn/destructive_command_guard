@@ -49,7 +49,26 @@ final class ReviewWindow: NSWindow {
 }
 
 @MainActor
+final class ReviewCard: NSView {
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        layer?.backgroundColor = (dark ? NSColor.white.withAlphaComponent(0.055)
+                                      : NSColor.black.withAlphaComponent(0.035)).cgColor
+        layer?.cornerRadius = 12
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+}
+
+@MainActor
 final class ReviewController: NSObject, NSWindowDelegate {
+    private static let width: CGFloat = 460
+    private static let inset: CGFloat = 16
     private let request: ReviewRequest
     private let context = LAContext()
     private var timer: Timer?
@@ -111,18 +130,41 @@ final class ReviewController: NSObject, NSWindowDelegate {
         return view
     }
 
-    private func scrollText(_ value: String, height: CGFloat, mono: Bool = false) -> NSScrollView {
+    private func spacer() -> NSView {
+        let view = NSView()
+        view.setContentHuggingPriority(.init(1), for: .horizontal)
+        return view
+    }
+
+    private func card(_ content: NSView) -> NSView {
+        let view = ReviewCard()
+        view.wantsLayer = true
+        view.translatesAutoresizingMaskIntoConstraints = false
+        content.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+            content.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            content.topAnchor.constraint(equalTo: view.topAnchor, constant: 12),
+            content.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -12),
+        ])
+        return view
+    }
+
+    private func scrollText(_ value: String, height: CGFloat, mono: Bool = false,
+                            color: NSColor = .labelColor) -> NSScrollView {
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
         scroll.drawsBackground = false
         scroll.translatesAutoresizingMaskIntoConstraints = false
-        let text = NSTextView(frame: NSRect(x: 0, y: 0, width: 432, height: height))
+        let width = Self.width - 2 * Self.inset
+        let text = NSTextView(frame: NSRect(x: 0, y: 0, width: width, height: height))
         text.isEditable = false
         text.isSelectable = true
         text.isRichText = false
         text.drawsBackground = false
-        text.textColor = .secondaryLabelColor
+        text.textColor = color
         text.font = mono ? .monospacedSystemFont(ofSize: 11, weight: .regular)
                          : .systemFont(ofSize: 11)
         text.textContainerInset = NSSize(width: 0, height: 2)
@@ -131,88 +173,49 @@ final class ReviewController: NSObject, NSWindowDelegate {
         text.isHorizontallyResizable = false
         text.autoresizingMask = [.width]
         text.textContainer?.widthTracksTextView = true
-        text.textContainer?.containerSize = NSSize(width: 432, height: CGFloat.greatestFiniteMagnitude)
+        text.textContainer?.containerSize = NSSize(width: width, height: CGFloat.greatestFiniteMagnitude)
         scroll.documentView = text
         scroll.heightAnchor.constraint(equalToConstant: height).isActive = true
         return scroll
     }
 
-    private func buildWindow() -> ReviewWindow {
-        let info = request.description
-        let window = ReviewWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 440),
-                                  styleMask: [.borderless], backing: .buffered, defer: false)
-        window.title = "DCG · \(info.agent) · \(info.project)"
-        window.isReleasedWhenClosed = false
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.hasShadow = true
-        window.level = .floating
-        window.isMovableByWindowBackground = true
-        window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
-        window.delegate = self
-        window.cancel = { [weak self] in self?.finish(false) }
-
-        let content = NSView()
-        let surface: NSView
-        if #available(macOS 26.0, *) {
-            let glass = NSGlassEffectView()
-            glass.style = .regular
-            glass.cornerRadius = 26
-            glass.contentView = content
-            surface = glass
-        } else {
-            let material = NSVisualEffectView()
-            material.material = .hudWindow
-            material.blendingMode = .behindWindow
-            material.state = .active
-            material.wantsLayer = true
-            material.layer?.cornerRadius = 26
-            material.layer?.masksToBounds = true
-            material.addSubview(content)
-            content.translatesAutoresizingMaskIntoConstraints = false
-            NSLayoutConstraint.activate([
-                content.leadingAnchor.constraint(equalTo: material.leadingAnchor),
-                content.trailingAnchor.constraint(equalTo: material.trailingAnchor),
-                content.topAnchor.constraint(equalTo: material.topAnchor),
-                content.bottomAnchor.constraint(equalTo: material.bottomAnchor),
-            ])
-            surface = material
-        }
-        window.contentView = surface
-
-        let header = horizontal([
-            icon("shield.lefthalf.filled", size: 13, color: .secondaryLabelColor),
-            label("DCG · Einmalige Freigabe", size: 11, weight: .medium, color: .secondaryLabelColor),
-        ])
-        let agentName = label(info.agent, size: 18, weight: .semibold)
+    private func identityCard(_ info: ReviewDescription) -> NSView {
+        let agentName = label(info.agent, size: 14, weight: .semibold)
         agentName.maximumNumberOfLines = 1
         agentName.lineBreakMode = .byTruncatingTail
         agentName.toolTip = info.agent
         let agent = horizontal([
-            icon("terminal", size: 17, color: .labelColor),
+            icon("terminal", size: 14, color: .controlAccentColor),
             agentName,
         ])
         if let host = info.host {
-            agent.addArrangedSubview(label("· \(host)", size: 13, color: .secondaryLabelColor))
+            agent.addArrangedSubview(label("· \(host)", size: 11, color: .secondaryLabelColor))
         }
-        let projectName = label(info.project, size: 14, weight: .medium)
+        agent.addArrangedSubview(spacer())
+        agent.addArrangedSubview(icon("shield.lefthalf.filled", size: 11, color: .secondaryLabelColor))
+        agent.addArrangedSubview(label("DCG", size: 10, weight: .semibold, color: .secondaryLabelColor))
+        let projectName = label(info.project, size: 13, weight: .medium)
         projectName.maximumNumberOfLines = 2
         projectName.lineBreakMode = .byTruncatingMiddle
         projectName.toolTip = info.repository ?? info.cwd
         let project = horizontal([
-            icon(info.repository == nil ? "folder" : "chevron.left.forwardslash.chevron.right", size: 13, color: .secondaryLabelColor),
+            icon("folder", size: 12, color: .secondaryLabelColor),
             projectName,
         ])
-        let path = scrollText(info.cwd, height: 34)
+        let path = scrollText(info.cwd, height: 30, color: .secondaryLabelColor)
         path.setAccessibilityLabel("Arbeitsordner: \(info.cwd)")
-        let identity = vertical([agent, project, path], spacing: 5)
+        let identity = vertical([agent, project, path], spacing: 4)
         agent.widthAnchor.constraint(equalTo: identity.widthAnchor).isActive = true
         project.widthAnchor.constraint(equalTo: identity.widthAnchor).isActive = true
         path.widthAnchor.constraint(equalTo: identity.widthAnchor).isActive = true
+        return card(identity)
+    }
 
-        let action = label(info.title, size: 23, weight: .semibold)
+    private func actionSummary(_ info: ReviewDescription) -> NSView {
+        let action = label(info.title, size: 21, weight: .semibold)
         let explanation = label(info.effect, size: 13)
-        let effect = vertical([action, explanation], spacing: 8)
+        let effect = vertical([action, explanation], spacing: 7)
+        action.widthAnchor.constraint(equalTo: effect.widthAnchor).isActive = true
         explanation.widthAnchor.constraint(equalTo: effect.widthAnchor).isActive = true
         if let warning = info.warning {
             let notice = label(warning, size: 12, weight: .semibold, color: .systemOrange)
@@ -229,59 +232,121 @@ final class ReviewController: NSObject, NSWindowDelegate {
             effect.addArrangedSubview(targets)
             targets.widthAnchor.constraint(equalTo: effect.widthAnchor).isActive = true
         }
+        return effect
+    }
 
-        let command = label(info.command, size: 11, color: .secondaryLabelColor)
-        command.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+    private func commandSummary(_ info: ReviewDescription) -> NSView {
+        let command = label(info.command, size: 11)
+        command.font = .monospacedSystemFont(ofSize: 11, weight: .medium)
         command.maximumNumberOfLines = 2
         command.lineBreakMode = .byTruncatingMiddle
         command.toolTip = info.command
         command.setAccessibilityLabel("Genauer Aufruf: \(info.command)")
 
-        let toggle = NSButton(title: "Details und Skripte", target: self, action: #selector(toggleDetails))
+        let toggle = NSButton(title: "Details", target: self, action: #selector(toggleDetails))
         toggle.isBordered = false
         toggle.font = .systemFont(ofSize: 12, weight: .medium)
-        toggle.contentTintColor = .secondaryLabelColor
-        toggle.image = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: nil)
-        toggle.imagePosition = .imageLeading
+        toggle.contentTintColor = .controlAccentColor
+        toggle.image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: nil)
+        toggle.imagePosition = .imageTrailing
         toggle.setAccessibilityLabel("Genauen Aufruf, alle Ziele und vollständige geprüfte Skripte anzeigen")
-        toggle.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        toggle.translatesAutoresizingMaskIntoConstraints = false
+        toggle.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        toggle.widthAnchor.constraint(equalToConstant: 76).isActive = true
         detailsButton = toggle
-        let details = scrollText(info.text, height: 150, mono: true)
-        details.isHidden = true
-        self.details = details
+        let text = vertical([
+            label("Aufruf", size: 10, weight: .medium, color: .secondaryLabelColor), command,
+        ], spacing: 3)
+        command.widthAnchor.constraint(equalTo: text.widthAnchor).isActive = true
+        let row = horizontal([text, spacer(), toggle], spacing: 12)
+        text.widthAnchor.constraint(equalTo: row.widthAnchor, constant: -100).isActive = true
+        return row
+    }
 
+    private func authenticationRow() -> NSView {
         let auth = LAAuthenticationView(context: context, controlSize: .large)
         auth.translatesAutoresizingMaskIntoConstraints = false
         auth.widthAnchor.constraint(equalToConstant: 48).isActive = true
         auth.heightAnchor.constraint(equalToConstant: 48).isActive = true
         let instruction = vertical([
-            label("Mit Fingerabdruck erlauben", size: 13, weight: .semibold),
-            label("Finger auf Touch ID legen. Gilt nur für diesen Aufruf.", size: 11, color: .secondaryLabelColor),
+            label("Finger auflegen", size: 13, weight: .semibold),
+            label("Diesen Vorgang einmal erlauben", size: 11, color: .secondaryLabelColor),
         ], spacing: 3)
-        let authentication = horizontal([auth, instruction], spacing: 12)
-        instruction.widthAnchor.constraint(equalTo: authentication.widthAnchor, constant: -60).isActive = true
         let cancel = NSButton(title: "Ablehnen", target: self, action: #selector(decline))
         cancel.bezelStyle = .rounded
         cancel.keyEquivalent = "\u{1b}"
-        cancel.heightAnchor.constraint(equalToConstant: 32).isActive = true
-        let spacer = NSView()
-        spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-        let footer = horizontal([
-            label("Ohne Freigabe bleibt alles gestoppt.", size: 10, color: .secondaryLabelColor),
-            spacer, cancel,
-        ])
+        cancel.translatesAutoresizingMaskIntoConstraints = false
+        cancel.heightAnchor.constraint(equalToConstant: 36).isActive = true
+        cancel.widthAnchor.constraint(equalToConstant: 80).isActive = true
+        let authentication = horizontal([auth, instruction, spacer(), cancel], spacing: 12)
+        instruction.widthAnchor.constraint(lessThanOrEqualTo: authentication.widthAnchor, constant: -164).isActive = true
+        window?.initialFirstResponder = cancel
+        return authentication
+    }
 
-        let stack = vertical([header, identity, effect, command, toggle, details, authentication, footer], spacing: 14)
-        stack.setCustomSpacing(0, after: toggle)
+    private func buildWindow() -> ReviewWindow {
+        let info = request.description
+        let window = ReviewWindow(contentRect: NSRect(x: 0, y: 0, width: Self.width, height: 440),
+                                  styleMask: [.borderless], backing: .buffered, defer: false)
+        self.window = window
+        window.title = "DCG · \(info.agent) · \(info.project)"
+        window.isReleasedWhenClosed = false
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = true
+        window.level = .floating
+        window.isMovableByWindowBackground = true
+        window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+        window.delegate = self
+        window.cancel = { [weak self] in self?.finish(false) }
+
+        let content = NSView()
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView()
+            glass.style = .regular
+            glass.cornerRadius = 28
+            glass.contentView = content
+            window.contentView = glass
+        } else {
+            let material = NSVisualEffectView()
+            material.material = .hudWindow
+            material.blendingMode = .behindWindow
+            material.state = .active
+            material.wantsLayer = true
+            material.layer?.cornerRadius = 28
+            material.layer?.masksToBounds = true
+            material.addSubview(content)
+            content.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                content.leadingAnchor.constraint(equalTo: material.leadingAnchor),
+                content.trailingAnchor.constraint(equalTo: material.trailingAnchor),
+                content.topAnchor.constraint(equalTo: material.topAnchor),
+                content.bottomAnchor.constraint(equalTo: material.bottomAnchor),
+            ])
+            window.contentView = material
+        }
+
+        let identity = identityCard(info)
+        let effect = actionSummary(info)
+        let command = commandSummary(info)
+        let details = scrollText(info.text, height: 150, mono: true)
+        details.isHidden = true
+        self.details = details
+        let divider = NSBox()
+        divider.boxType = .separator
+        let authentication = authenticationRow()
+        let stack = vertical([identity, effect, command, details, divider, authentication], spacing: 12)
+        stack.setCustomSpacing(16, after: identity)
+        stack.setCustomSpacing(0, after: command)
         stack.setCustomSpacing(12, after: details)
         content.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
-            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -24),
-            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 24),
-            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -24),
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: Self.inset),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -Self.inset),
+            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: Self.inset),
+            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -Self.inset),
         ])
-        for row in [identity, effect, command, details, authentication, footer] as [NSView] {
+        for row in [identity, effect, command, details, divider, authentication] as [NSView] {
             row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
         self.stack = stack
@@ -292,14 +357,14 @@ final class ReviewController: NSObject, NSWindowDelegate {
         guard let window, let stack else { return }
         window.contentView?.layoutSubtreeIfNeeded()
         let old = window.frame
-        let height = stack.fittingSize.height + 48
-        window.setFrame(NSRect(x: old.minX, y: old.maxY - height, width: 480, height: height), display: true)
+        let height = stack.fittingSize.height + 2 * Self.inset
+        window.setFrame(NSRect(x: old.minX, y: old.maxY - height, width: Self.width, height: height), display: true)
     }
 
     @objc private func toggleDetails() {
         guard let details else { return }
         details.isHidden.toggle()
-        detailsButton?.image = NSImage(systemSymbolName: details.isHidden ? "chevron.right" : "chevron.down",
+        detailsButton?.image = NSImage(systemSymbolName: details.isHidden ? "chevron.down" : "chevron.up",
                                        accessibilityDescription: nil)
         resizeToFit()
     }
@@ -369,7 +434,11 @@ final class ReviewController: NSObject, NSWindowDelegate {
     }
 }
 
+// A separately compiled UI test entry can choose an appearance. The same
+// controller and real authentication remain active in those previews.
+#if !DCG_UI_PREVIEW
 @main
+#endif
 struct ReviewEntry {
     @MainActor
     static func main() {

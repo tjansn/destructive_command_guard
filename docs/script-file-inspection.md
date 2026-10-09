@@ -66,12 +66,17 @@ macOS window. The detected agent, Orca/cmux context when available, project name
 and execution directory appear above the German explanation of the action and
 its consequences. The nearest `.git` directory or worktree marker identifies
 the repository without executing Git. A folder is shown when none is found.
-The exact command is previewed; **Details und Skripte** expands the complete
+The exact command is previewed; **Details** expands the complete
 command, all literal targets/search roots and Git names, rule and the full
 contents of small inspected scripts. Nothing is discarded from those details.
 On macOS 26 or newer the surface uses native **Liquid Glass**; older supported
 systems use a native translucent material. System appearance and accessibility
 preferences remain in control of the material.
+Agent and project form one quiet inset surface; the action and consequences
+have stronger visual weight. The footer combines the real Touch ID view and
+the reject button. The 460-point-wide layout uses concentric 28/12-point corners
+with a 16-point inset, readable command text and shorter German explanations.
+Details expand immediately, with no decorative movement on this frequent flow.
 
 macOS **Touch ID** is embedded directly in this window through
 [LAAuthenticationView](https://developer.apple.com/documentation/localauthenticationembeddedui/laauthenticationview).
