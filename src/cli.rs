@@ -13416,6 +13416,16 @@ fn is_dcg_hook_entry_for_matcher(entry: &serde_json::Value, matcher: &str) -> bo
 /// value onto the repaired hook.
 const DCG_OWNED_HOOK_KEYS: &[&str] = &["type", "command", "shell"];
 
+// Preserve this operator-selected hook option during repair. Only the single
+// known flag is carried forward, never arbitrary arguments or shell syntax.
+fn command_requests_desktop_review(command: &str) -> bool {
+    let command = command.trim();
+    let command = command.strip_prefix('&').map_or(command, str::trim_start);
+    shell_words::split(command).is_ok_and(|words| {
+        words.len() == 2 && is_dcg_program_basename(&words[0]) && words[1] == "--desktop-review"
+    })
+}
+
 /// Whether `hook` is the dcg hook `desired_hook` describes, judged on the
 /// dcg-owned keys only.
 ///
@@ -13423,10 +13433,19 @@ const DCG_OWNED_HOOK_KEYS: &[&str] = &["type", "command", "shell"];
 /// current dcg hook; comparing whole objects (the pre-#345 behavior) made
 /// every such hook look stale, and the "repair" then dropped the timeout.
 fn hook_has_dcg_identity(hook: &serde_json::Value, desired_hook: &serde_json::Value) -> bool {
+    let review_command = hook
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .filter(|command| command_requests_desktop_review(command));
     hook.is_object()
-        && DCG_OWNED_HOOK_KEYS
-            .iter()
-            .all(|key| hook.get(key) == desired_hook.get(key))
+        && DCG_OWNED_HOOK_KEYS.iter().all(|key| {
+            hook.get(key) == desired_hook.get(key)
+                || (*key == "command"
+                    && review_command.is_some_and(|command| {
+                        command.strip_suffix(" --desktop-review")
+                            == desired_hook.get(key).and_then(serde_json::Value::as_str)
+                    }))
+        })
 }
 
 /// Rebuild the hook object dcg will write, keeping host-owned fields from the
@@ -13443,9 +13462,21 @@ fn merge_host_owned_hook_fields(
     let Some(previous) = previous.and_then(serde_json::Value::as_object) else {
         return desired_hook;
     };
-    let serde_json::Value::Object(desired) = desired_hook else {
+    let serde_json::Value::Object(mut desired) = desired_hook else {
         return desired_hook;
     };
+    if previous
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(command_requests_desktop_review)
+        && let Some(command) = desired.get("command").and_then(serde_json::Value::as_str)
+        && !command_requests_desktop_review(command)
+    {
+        desired.insert(
+            "command".to_string(),
+            serde_json::Value::String(format!("{command} --desktop-review")),
+        );
+    }
     let mut merged = previous.clone();
     for key in DCG_OWNED_HOOK_KEYS {
         merged.remove(*key);
@@ -30948,6 +30979,62 @@ exclude = ["target/**"]
                     .find(|hook| hook["command"].as_str().is_some_and(is_dcg_command))
             })
             .expect("a dcg hook under the canonical matcher")
+    }
+
+    #[test]
+    fn self_heal_keeps_desktop_review_when_current() {
+        let desired = claude_dcg_hook().unwrap();
+        let command = format!("{} --desktop-review", desired["command"].as_str().unwrap());
+        let settings = serde_json::json!({"hooks":{"PreToolUse":[{
+            "matcher": CLAUDE_SHELL_MATCHER,
+            "hooks": [dcg_hook_with_timeout(&command, 150)]
+        }]}});
+        assert!(settings_has_exact_dcg_hook(&settings, &desired));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let bytes = serde_json::to_vec_pretty(&settings).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        ensure_hook_registered_at(&path, &dir.path().join("selfheal.lock")).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        for force in [false, true] {
+            let mut repaired = settings.clone();
+            install_dcg_hook_into_settings(&mut repaired, force).unwrap();
+            assert_eq!(canonical_dcg_hook(&repaired)["command"], command);
+            assert_eq!(canonical_dcg_hook(&repaired)["timeout"], 150);
+        }
+    }
+
+    #[test]
+    fn self_heal_repair_preserves_only_the_desktop_review_option() {
+        let desired = claude_dcg_hook().unwrap();
+        let expected = format!("{} --desktop-review", desired["command"].as_str().unwrap());
+        for force in [false, true] {
+            for matcher in [CLAUDE_SHELL_MATCHER, LEGACY_CLAUDE_SHELL_MATCHERS[0]] {
+                let mut settings = serde_json::json!({"hooks":{"PreToolUse":[{
+                    "matcher": matcher,
+                    "hooks": [dcg_hook_with_timeout("'/stale path/dcg' --desktop-review", 150),
+                              {"type":"command","command":"other-hook"}]
+                }]}});
+                assert!(install_dcg_hook_into_settings(&mut settings, force).unwrap());
+                assert_eq!(canonical_dcg_hook(&settings)["command"], expected);
+                assert_eq!(canonical_dcg_hook(&settings)["timeout"], 150);
+                assert!(settings_has_exact_dcg_hook(&settings, &desired));
+            }
+        }
+        for command in [
+            "dcg --desktop-review --other",
+            "dcg --desktop-review; other",
+            "other --desktop-review",
+            "dcg --other --desktop-review",
+        ] {
+            assert!(!command_requests_desktop_review(command), "{command}");
+            let mut settings = serde_json::json!({"hooks":{"PreToolUse":[{
+                "matcher": CLAUDE_SHELL_MATCHER,
+                "hooks": [dcg_hook_with_timeout(command, 150)]
+            }]}});
+            install_dcg_hook_into_settings(&mut settings, true).unwrap();
+            assert_eq!(canonical_dcg_hook(&settings)["command"], desired["command"]);
+        }
     }
 
     #[test]

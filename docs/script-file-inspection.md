@@ -53,6 +53,9 @@ and its host timeout to at least **150 seconds**. Keep `default_mode = "deny"`,
 [Pi extension](../integrations/pi/dcg-guard.ts) to
 `~/.pi/agent/extensions/dcg-guard.ts`, adjusting its absolute executable path.
 Restart each agent after changing its hook/extension.
+Claude hook self-repair preserves an existing `--desktop-review` option and its
+host timeout, including when repairing a stale executable path. It never copies
+arbitrary arguments from the previous hook command.
 
 After a verified rule-based denial, the hook waits for a local native macOS
 dialog. It shows a German explanation of the possible effects, literal deletion
