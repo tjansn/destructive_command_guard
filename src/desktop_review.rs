@@ -12,6 +12,8 @@ use std::cell::{Cell, RefCell};
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
+#[cfg(target_os = "macos")]
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
@@ -170,7 +172,7 @@ impl ReviewSnapshot {
     }
 
     /// Show a local modal dialog, then recheck every captured source byte and
-    /// cwd identity. An explicit button AND the displayed code are required.
+    /// cwd identity. An explicit button AND fresh Touch ID are required.
     pub fn request(&self, description: &str, cwd: &Path) -> bool {
         let Some(_lock) = review_lock() else {
             return false;
@@ -190,11 +192,11 @@ impl ReviewSnapshot {
         if !self.unchanged() || description.len() > MAX_REVIEW_TEXT {
             return false;
         }
-        let code = format!("{:06}", rand::random_range(100_000..1_000_000_u32));
+        let nonce = format!("{:032x}", rand::random::<u128>());
         let text = format!(
-            "{description}\n\nZum einmaligen Freigeben {code} eingeben und „Einmal freigeben“ wählen. Ohne Antwort wird nach {DIALOG_SECONDS} Sekunden abgelehnt."
+            "{description}\n\nZum Erlauben „Einmal freigeben“ wählen und mit Touch ID bestätigen. Ohne Antwort bleibt der Vorgang nach {DIALOG_SECONDS} Sekunden gestoppt."
         );
-        dialog(&text, &code)
+        dialog(&text, &nonce)
             && self.unchanged()
             && directory_identity(cwd).as_ref() == Some(&before)
     }
@@ -403,59 +405,102 @@ fn review_lock() -> Option<File> {
     Some(file)
 }
 
-// All candidate text is argv DATA. Never interpolate it into AppleScript.
 #[cfg(target_os = "macos")]
-const DIALOG_SCRIPT: &str = r"ObjC.import('Cocoa');
-function run(argv) {
-    const app = $.NSApplication.sharedApplication;
-    app.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
-    const alert = $.NSAlert.alloc.init;
-    alert.messageText = 'DCG – Vorgang freigeben?';
-    alert.informativeText = 'Lies die Wirkung und Ziele. Zum Freigeben den unten genannten Code eingeben.';
-    alert.alertStyle = $.NSAlertStyleWarning;
-    alert.addButtonWithTitle('Ablehnen');
-    alert.addButtonWithTitle('Einmal freigeben');
-    const box = $.NSView.alloc.initWithFrame($.NSMakeRect(0, 0, 620, 430));
-    const scroll = $.NSScrollView.alloc.initWithFrame($.NSMakeRect(0, 45, 620, 385));
-    scroll.hasVerticalScroller = true;
-    scroll.borderType = $.NSBezelBorder;
-    const text = $.NSTextView.alloc.initWithFrame($.NSMakeRect(0, 0, 600, 385));
-    text.editable = false;
-    text.selectable = true;
-    text.richText = false;
-    text.font = $.NSFont.systemFontOfSize(13);
-    text.string = argv[0];
-    text.verticallyResizable = true;
-    text.horizontallyResizable = false;
-    text.textContainer.containerSize = $.NSMakeSize(600, 100000);
-    text.textContainer.widthTracksTextView = true;
-    scroll.documentView = text;
-    box.addSubview(scroll);
-    const input = $.NSTextField.alloc.initWithFrame($.NSMakeRect(0, 5, 220, 28));
-    input.placeholderString = 'Freigabecode';
-    box.addSubview(input);
-    alert.accessoryView = box;
-    const timer = $.NSTimer.scheduledTimerWithTimeIntervalRepeatsBlock(120, false, function() { app.abortModal; });
-    app.activateIgnoringOtherApps(true);
-    const answer = alert.runModal;
-    timer.invalidate;
-    if (answer === $.NSAlertSecondButtonReturn && ObjC.unwrap(input.stringValue) === argv[1]) {
-        return 'approved:' + argv[1];
+const DIALOG_HELPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/DCG"));
+
+/// Materialize only the exact native program embedded at build time. A corrupt
+/// or replaced cache entry is refused, never executed or silently overwritten.
+#[cfg(target_os = "macos")]
+fn prepare_native_helper_in(base: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    let mut digest = String::with_capacity(64);
+    for byte in Sha256::digest(DIALOG_HELPER) {
+        let _ = write!(digest, "{byte:02x}");
     }
-    return 'denied';
-}";
+    let directory = base.join(digest);
+    let path = directory.join("DCG");
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        prefix.push(component);
+        match fs::symlink_metadata(&prefix) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return None,
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return None,
+            _ => {}
+        }
+    }
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&directory)
+        .ok()?;
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(DIALOG_HELPER).ok()?;
+            file.sync_all().ok()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return None,
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(&path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o122 != 0o100 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(DIALOG_HELPER.len() as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes == DIALOG_HELPER).then_some(path)
+}
 
 #[cfg(target_os = "macos")]
-fn native_dialog(text: &str, code: &str) -> bool {
-    let Ok(mut child) = Command::new("/usr/bin/osascript")
-        .args(["-l", "JavaScript", "-e", DIALOG_SCRIPT, "--", text, code])
-        .stdin(Stdio::null())
+fn approved_reply(success: bool, output: &str, nonce: &str) -> bool {
+    success && output.trim() == format!("approved:{nonce}")
+}
+
+#[cfg(target_os = "macos")]
+fn native_dialog(text: &str, nonce: &str) -> bool {
+    let Some(base) = crate::config::user_config_dir() else {
+        return false;
+    };
+    let Some(helper) = prepare_native_helper_in(&base.join("dcg/desktop-review")) else {
+        crate::emit_stderr!(
+            "[dcg] Touch-ID-Dialog nicht verfügbar oder verändert. Der Vorgang bleibt gestoppt."
+        );
+        return false;
+    };
+    let Ok(payload) = serde_json::to_vec(&serde_json::json!({"text": text, "nonce": nonce})) else {
+        return false;
+    };
+    let Ok(mut child) = Command::new(helper)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
     else {
         return false;
     };
+    // Full commands and script contents travel through stdin, never through
+    // shell interpolation or process-list-visible command-line arguments.
+    if child
+        .stdin
+        .take()
+        .is_none_or(|mut stream| stream.write_all(&payload).is_err())
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    }
     let start = Instant::now();
     loop {
         match child.try_wait() {
@@ -473,8 +518,9 @@ fn native_dialog(text: &str, code: &str) -> bool {
                 }
                 let mut output = String::new();
                 return child.stdout.take().is_some_and(|stream| {
-                    stream.take(128).read_to_string(&mut output).is_ok()
-                        && output.trim() == format!("approved:{code}")
+                    stream.take(129).read_to_string(&mut output).is_ok()
+                        && output.len() <= 128
+                        && approved_reply(status.success(), &output, nonce)
                 });
             }
             Ok(None) if start.elapsed() < Duration::from_secs(DIALOG_SECONDS + 5) => {
@@ -553,9 +599,10 @@ mod tests {
         let cwd = root.path().canonicalize().unwrap();
         let capture = ReviewCapture::start();
         let snapshot = capture.snapshot();
-        assert!(snapshot.request_with("fixture", &cwd, |text, code| {
-            assert_eq!(code.len(), 6);
-            assert!(text.contains(code));
+        assert!(snapshot.request_with("fixture", &cwd, |text, nonce| {
+            assert_eq!(nonce.len(), 32);
+            assert!(!text.contains(nonce));
+            assert!(text.contains("Touch ID"));
             true
         }));
         assert!(!snapshot.request_with("fixture", &cwd, |_, _| false));
@@ -602,10 +649,64 @@ mod tests {
     #[ignore = "manual macOS dialog; no candidate command is executed"]
     fn native_dialog_manual_preview() {
         let approved = native_dialog(
-            "DIES IST EIN HARMLOSER DIALOGTEST.\n\nEs wird kein Befehl ausgeführt und nichts gelöscht.\n\nBeispiel: Ein alter Ordner samt Inhalt würde dauerhaft gelöscht, ohne Papierkorb.\nZiel: /Beispiel/alter-Ordner\n\nZum Testen der einmaligen Zustimmung: Code 123456 eingeben und „Einmal freigeben“ wählen. Du kannst auch ablehnen.",
-            "123456",
+            "DIES IST EIN HARMLOSER DIALOGTEST.\n\nEs wird kein Befehl ausgeführt und nichts gelöscht.\n\nBeispiel: Ein alter Ordner samt Inhalt würde dauerhaft gelöscht, ohne Papierkorb.\nZiel: /Beispiel/alter-Ordner\n\nZum Testen „Einmal freigeben“ wählen und danach mit dem Finger bestätigen. Du kannst auch ablehnen.",
+            "00000000000000000000000000000001",
         );
         eprintln!("Manual preview approved: {approved}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_helper_cache_refuses_modified_bytes_and_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let path = prepare_native_helper_in(&root).unwrap();
+        assert_eq!(prepare_native_helper_in(&root), Some(path.clone()));
+        fs::write(&path, b"replaced program").unwrap();
+        assert!(prepare_native_helper_in(&root).is_none());
+        assert_eq!(fs::read(path).unwrap(), b"replaced program");
+        let target = root.join("outside");
+        fs::create_dir(&target).unwrap();
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        assert!(prepare_native_helper_in(&alias).is_none());
+        assert_eq!(fs::read_dir(target).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_helper_requires_valid_input_and_bound_success_reply() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let helper = prepare_native_helper_in(&root).unwrap();
+        for input in ["{}", "null", r#"{"text":"example","nonce":"123456"}"#] {
+            let mut child = Command::new(&helper)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(!output.status.success());
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "denied");
+        }
+        let nonce = "00000000000000000000000000000001";
+        assert!(approved_reply(true, &format!("approved:{nonce}\n"), nonce));
+        assert!(!approved_reply(false, &format!("approved:{nonce}"), nonce));
+        for reply in [
+            "denied",
+            "approved:other",
+            "approved:",
+            "approved:other\napproved:00000000000000000000000000000001",
+        ] {
+            assert!(!approved_reply(true, reply, nonce));
+        }
     }
 
     #[test]

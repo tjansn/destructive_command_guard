@@ -67,6 +67,44 @@ fn main() {
     }
 
     embed_windows_resources();
+    embed_macos_review_helper();
+}
+
+/// Build the small native Touch ID dialog once and embed it in dcg. Review
+/// never invokes a compiler or downloads code on the user's execution path.
+fn embed_macos_review_helper() {
+    println!("cargo:rerun-if-changed=src/desktop_review.swift");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        return;
+    }
+    let arch = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("aarch64") => "arm64",
+        Ok("x86_64") => "x86_64",
+        other => panic!("unsupported macOS review helper architecture: {other:?}"),
+    };
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo OUT_DIR"));
+    let output = std::process::Command::new("/usr/bin/swiftc")
+        .args([
+            "-swift-version",
+            "5",
+            "-parse-as-library",
+            "-warnings-as-errors",
+            "-O",
+            "-target",
+        ])
+        .arg(format!("{arch}-apple-macosx12.0"))
+        .arg("src/desktop_review.swift")
+        .arg("-module-cache-path")
+        .arg(out.join("swift-modules"))
+        .arg("-o")
+        .arg(out.join("DCG"))
+        .output()
+        .expect("macOS desktop review requires Apple's Swift compiler (Command Line Tools)");
+    assert!(
+        output.status.success(),
+        "Touch ID helper did not compile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Embed the source identity that DSR already validated before creating its

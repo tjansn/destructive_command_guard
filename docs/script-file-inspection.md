@@ -8,6 +8,10 @@ There is no LLM, cloud request, executable script invocation or filename cache.
 ## Enable globally
 
 Build the pinned Rust toolchain's checkout with `cargo build --release --locked`.
+On macOS, Apple's Command Line Tools (including Swift) are required at build
+time for the embedded native Touch ID dialog; the installed binary requires
+no compiler and downloads no helper code at runtime. The native helper targets
+macOS 12 or later and is built for the selected Rust target architecture.
 Install `target/release/dcg` at the executable path already used by your hooks.
 In `~/.config/dcg/config.toml` enable:
 
@@ -60,11 +64,23 @@ arbitrary arguments from the previous hook command.
 After a verified rule-based denial, the hook waits for a local native macOS
 dialog. It shows a German explanation of the possible effects, literal deletion
 targets/search roots and Git names, execution directory, exact command, rule and the complete contents of
-small inspected scripts. The content area scrolls. The user must enter the
-displayed six-digit code and explicitly select **Einmal freigeben**. The default
-button is **Ablehnen**. Closing, a wrong code, no response after 120 seconds,
+small inspected scripts. The content area scrolls. The user selects
+**Einmal freigeben**, then confirms through macOS **Touch ID**. A fresh
+LocalAuthentication context requires biometrics, verifies that the device uses
+Touch ID, disables reuse of a previous unlock and offers no code/password
+fallback. Fingerprint data remains with macOS; DCG receives only success or
+failure. The default button is **Ablehnen**. Closing, failed authentication,
+unavailable/locked-out Touch ID, no response after 120 seconds,
 a busy dialog, backend failure or changed script bytes leaves the denial in
 place. The process watchdog terminates a stuck dialog after 125 seconds.
+The authentication uses [Apple's LocalAuthentication framework](https://developer.apple.com/documentation/localauthentication).
+
+The helper is compiled once and embedded in the Rust executable. On first use,
+DCG materializes it in its private configuration cache and verifies its exact
+bytes and executable permissions before each use. Modified files and symlink
+paths are refused. Commands and script contents travel as JSON on stdin, not as
+shell code or process-list-visible arguments. A random per-request nonce binds
+the helper reply; it is a transport token, never a user-entered approval code.
 
 Approval releases only the pending tool request. It writes no allowlist or
 reusable allow-once grant and does not bypass the host's own permissions. Script
@@ -82,15 +98,17 @@ blocking verdict unless the human directly approves the local dialog. See
 change their decision APIs. The option is explicit in the trusted hook command;
 projects cannot turn it on via an automatically discovered config file.
 
-This is an interlock for cooperative agents in the current logged-in desktop
-session, not an authenticated security boundary against a process controlling
-that same account or GUI. Native executables, imports and the remaining
+Touch ID adds operating-system authentication to the local review. It does not
+protect against a process able to replace DCG itself or its hook configuration
+under the same user account. Native executables, imports and the remaining
 check-to-execution race retain the limitations below. Full script contents
 appear only locally in the dialog; the explanation uses templates, no LLM/API.
 
 Run `cargo test --lib desktop_review::tests` for automated checks. The ignored
-`native_dialog_manual_preview` test shows a harmless live dialog without ever
-executing a candidate command.
+`native_dialog_manual_preview` test shows a harmless live dialog and real
+Touch ID authentication without ever executing a candidate command. Automated
+tests exercise invalid helper input, altered/symlinked cache entries and bound
+success replies; they do not simulate a successful fingerprint.
 
 Codex's per-tool `tool_input.workdir` takes precedence over the session cwd.
 Malformed or relative overrides fail closed for file inspection and scoped

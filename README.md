@@ -1,8 +1,8 @@
 # dcg (Destructive Command Guard)
 
-**Tom's fork (`0.15.3+tom.2`):** adds bounded script-file inspection to the
-shared pre-execution evaluator and optional local macOS approval dialogs,
-including for Codex. See [setup, coverage and limits](docs/script-file-inspection.md).
+**Tom's fork (`0.15.3+tom.4`):** adds bounded script-file inspection to the
+shared pre-execution evaluator and optional local macOS approval dialogs with
+Touch ID, including for Codex. See [setup, coverage and limits](docs/script-file-inspection.md).
 The upstream release installers below do not install this fork; build this
 checkout with Cargo and keep `general.update_pin = true`.
 
