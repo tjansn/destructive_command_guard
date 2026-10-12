@@ -68,6 +68,7 @@ pub mod confidence;
 pub mod config;
 pub mod context;
 pub mod desktop_review;
+pub mod effects;
 pub mod error_codes;
 pub mod evaluator;
 pub mod exit_codes;

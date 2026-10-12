@@ -114,3 +114,25 @@ proof about later unsandboxed runs, and must never be presented as more.
 5. **Wording.** Trial summaries and docs say "observed safe in one sandboxed run", never "safe"/"proven".
 
 Order: A, B, then C. C may ship in the same release as A+B; Tom installs once.
+
+## Part D: Distill's full review (in scope after C)
+
+Read `/Users/tom/dev/Projects/distill/work/feed-fix-qa/dcg-review.md` completely. Implement, in this order, with the
+acceptance-matrix rows that belong to each (fixtures only, never real credential stores or services):
+
+1. Shared invocation semantics (review §1): executable source vs syntax/data operand vs startup/preload source vs
+   dynamic source, for the interpreters dcg already inspects; reuse `heredoc.rs effective_shell_command`'s query-only
+   `command -v/-V` classification in `script_files.rs` (unshadowed builtin only; substitutions still inspected).
+2. Outcome-specific results and diagnostics (§2): definite dangerous operation / unsupported-dynamic / analysis
+   limit / review unavailable-or-cancelled, each with its own machine-readable code and remediation text; an analysis
+   timeout gets a bounded slow path that parses only (never runs the candidate), cached by content+language+policy, and
+   never turns into an allow.
+3. Finite test inputs (§3): bounded resolution of explicit `node --test` operands, finite local globs, npm
+   pre/main/post lifecycle scripts, static imports, preload options; dynamic cases stay inconclusive and fall back to
+   the existing trial (no second trial implementation).
+4. Part C already covers §4 (read boundary, owned loopback, runtime identity, honest labels); use the review's
+   "Trial network/read boundary" and "Version trust" matrix rows as its acceptance tests, and add canaries for reads and
+   delegated side effects (a disposable fixture host service must remain unchanged).
+
+Out of scope until Tom decides: §5 long-running service capability, and §4 "observation versus enforcement" (running the
+requested task itself under continuing confinement instead of trial-then-host). Keep trial-then-host, labelled honestly.

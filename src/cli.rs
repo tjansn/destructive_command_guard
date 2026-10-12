@@ -20377,6 +20377,17 @@ fn selected_trial_entries(
     Ok(entries)
 }
 
+fn selected_learned_entries(
+    project_only: bool,
+) -> std::io::Result<Vec<crate::trial_store::LearnedFilesystem>> {
+    let mut entries = crate::trial_store::TrialStore::user()?.list_learned()?;
+    if project_only {
+        let root = crate::trial_store::project_root(&std::env::current_dir()?)?;
+        entries.retain(|entry| entry.cwd.starts_with(&root));
+    }
+    Ok(entries)
+}
+
 /// List allowlist entries.
 fn allowlist_list(
     project_only: bool,
@@ -20387,6 +20398,7 @@ fn allowlist_list(
 
     let inspected = inspect_allowlist_layers(project_only, user_only);
     let trial_entries = selected_trial_entries(project_only)?;
+    let learned_entries = selected_learned_entries(project_only)?;
     let mut all_entries: Vec<(AllowlistLayer, std::path::PathBuf, AllowEntry, bool)> = Vec::new();
 
     for inspection in &inspected {
@@ -20421,7 +20433,7 @@ fn allowlist_list(
                 println!();
             }
 
-            if all_entries.is_empty() && trial_entries.is_empty() {
+            if all_entries.is_empty() && trial_entries.is_empty() && learned_entries.is_empty() {
                 println!("{}", "No allowlist entries found.".yellow());
                 return Ok(());
             }
@@ -20481,6 +20493,21 @@ fn allowlist_list(
                 println!("    Summary: {}", entry.summary);
                 println!();
             }
+            for entry in &learned_entries {
+                println!(
+                    "  learned_filesystem:{} [user, operand-bound]",
+                    entry.fingerprint
+                );
+                println!("    Command: {}", entry.command);
+                println!("    Directory: {}", entry.cwd.display());
+                println!("    Rule: {}", entry.rule_id);
+                for operand in &entry.operands {
+                    println!("    Operand: {}", operand.display());
+                }
+                println!("    Approved by {} on {}", entry.source, entry.created_at);
+                println!("    Summary: {}", entry.summary);
+                println!();
+            }
         }
         AllowlistOutputFormat::Json => {
             let mut json_entries: Vec<serde_json::Value> = all_entries
@@ -20521,6 +20548,14 @@ fn allowlist_list(
                 });
                 json_entries.push(json);
             }
+            for entry in &learned_entries {
+                let mut json = serde_json::to_value(entry)?;
+                json["layer"] = serde_json::json!("user");
+                json["selector"] = serde_json::json!({
+                    "type": "learned_filesystem", "value": entry.fingerprint,
+                });
+                json_entries.push(json);
+            }
 
             println!("{}", serde_json::to_string_pretty(&json_entries)?);
         }
@@ -20546,6 +20581,20 @@ fn allowlist_remove(
             return Err(format!("Verified trial '{fingerprint}' was not found").into());
         }
         println!("Removed verified trial {fingerprint}");
+        return Ok(());
+    }
+    if let Some(fingerprint) = rule_id.strip_prefix("learned_filesystem:") {
+        let selected = selected_learned_entries(layer == AllowlistLayer::Project)?;
+        if !selected
+            .iter()
+            .any(|entry| entry.fingerprint == fingerprint)
+            || !crate::trial_store::TrialStore::user()?.remove(fingerprint)?
+        {
+            return Err(
+                format!("Learned filesystem approval '{fingerprint}' was not found").into(),
+            );
+        }
+        println!("Removed learned filesystem approval {fingerprint}");
         return Ok(());
     }
 
@@ -20706,8 +20755,8 @@ fn allowlist_prune(
     let project_root = project_only
         .then(|| crate::trial_store::project_root(&std::env::current_dir()?))
         .transpose()?;
-    let trials_pruned =
-        crate::trial_store::TrialStore::user()?.prune_at(project_root.as_deref(), dry_run)?;
+    let versions_pruned = crate::trial_store::TrialStore::user()?
+        .prune_counts_at(project_root.as_deref(), dry_run)?;
 
     match format {
         AllowlistOutputFormat::Pretty => {
@@ -20719,14 +20768,23 @@ fn allowlist_prune(
                 );
                 println!();
             }
-            if pruned.is_empty() && trials_pruned == 0 {
+            if pruned.is_empty() && versions_pruned.total() == 0 {
                 println!("{}", "No expired allowlist entries found.".green());
                 return Ok(());
             }
 
             let action = if dry_run { "Would prune" } else { "Pruned" };
-            if trials_pruned > 0 {
-                println!("{action} {trials_pruned} stale verified trial entries");
+            if versions_pruned.verified_trials > 0 {
+                println!(
+                    "{action} {} stale verified trial entries",
+                    versions_pruned.verified_trials
+                );
+            }
+            if versions_pruned.learned_filesystem > 0 {
+                println!(
+                    "{action} {} stale learned filesystem approvals",
+                    versions_pruned.learned_filesystem
+                );
             }
             if !pruned.is_empty() {
                 println!(
@@ -20788,8 +20846,9 @@ fn allowlist_prune(
                 } else {
                     "not_selected"
                 },
-                "pruned": entries.len() + trials_pruned,
-                "verified_trials_pruned": trials_pruned,
+                "pruned": entries.len() + versions_pruned.total(),
+                "verified_trials_pruned": versions_pruned.verified_trials,
+                "learned_filesystem_pruned": versions_pruned.learned_filesystem,
                 "entries": entries,
             });
             println!("{}", serde_json::to_string_pretty(&output)?);

@@ -1,4 +1,4 @@
-//! Exact-version sandbox approvals, stored beside the trusted user allowlist.
+//! Exact-version sandbox and filesystem approvals beside the trusted user allowlist.
 //!
 //! No project file can grant an approval. In the absence of reliable unprivileged
 //! read tracing, fingerprints cover the complete non-ignored source manifest,
@@ -51,6 +51,34 @@ pub struct VerifiedTrial {
     pub summary: String,
 }
 
+/// A Touch ID approval bound to one filesystem rule and its operand identities.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LearnedFilesystem {
+    pub kind: String,
+    pub fingerprint: String,
+    pub cwd: PathBuf,
+    pub command: String,
+    pub rule_id: String,
+    pub operands: Vec<PathBuf>,
+    pub created_at: String,
+    pub source: String,
+    pub summary: String,
+}
+
+/// Separate counts keep CLI reports clear about the two approval kinds.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PrunedVersions {
+    pub verified_trials: usize,
+    pub learned_filesystem: usize,
+}
+
+impl PrunedVersions {
+    #[must_use]
+    pub const fn total(self) -> usize {
+        self.verified_trials + self.learned_filesystem
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct CachedHash {
     size: u64,
@@ -65,6 +93,8 @@ struct StoreData {
     #[serde(default)]
     verified_trials: Vec<VerifiedTrial>,
     #[serde(default)]
+    learned_filesystem: Vec<LearnedFilesystem>,
+    #[serde(default)]
     file_hashes: BTreeMap<String, CachedHash>,
     #[serde(default)]
     summaries: Vec<(String, String)>,
@@ -75,6 +105,7 @@ impl Default for StoreData {
         Self {
             schema_version: SCHEMA_VERSION,
             verified_trials: Vec::new(),
+            learned_filesystem: Vec::new(),
             file_hashes: BTreeMap::new(),
             summaries: Vec::new(),
         }
@@ -255,12 +286,89 @@ impl TrialStore {
         })
     }
 
+    pub fn lookup_learned(
+        &self,
+        current: &crate::effects::OperandFingerprint,
+    ) -> io::Result<Option<LearnedFilesystem>> {
+        self.with_data(|data| {
+            Ok((
+                data.learned_filesystem
+                    .iter()
+                    .find(|entry| {
+                        valid_learned_entry(entry)
+                            && entry.fingerprint == current.digest
+                            && entry.cwd == current.cwd
+                            && entry.command == current.command
+                            && entry.rule_id == current.rule_id
+                            && entry.operands == current.operands
+                    })
+                    .cloned(),
+                false,
+            ))
+        })
+    }
+
+    /// Only desktop review may create a reusable definite-filesystem approval.
+    pub fn approve_learned(
+        &self,
+        fingerprint: &crate::effects::OperandFingerprint,
+        summary: &str,
+    ) -> io::Result<LearnedFilesystem> {
+        // Recheck at the write boundary: unsupported, changed, and dcg-owned
+        // operands cannot enter the store even if a caller kept an old digest.
+        let current = crate::effects::fingerprint(
+            &fingerprint.command,
+            &fingerprint.cwd,
+            &fingerprint.rule_id,
+        )?;
+        if current != *fingerprint {
+            return Err(io::Error::other(
+                "filesystem operands changed during review",
+            ));
+        }
+        let entry = LearnedFilesystem {
+            kind: "learned_filesystem".to_owned(),
+            fingerprint: fingerprint.digest.clone(),
+            cwd: fingerprint.cwd.clone(),
+            command: fingerprint.command.clone(),
+            rule_id: fingerprint.rule_id.clone(),
+            operands: fingerprint.operands.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            source: "user-review".to_owned(),
+            summary: bounded_summary(summary),
+        };
+        if !valid_learned_entry(&entry) {
+            return Err(io::Error::other("invalid filesystem approval"));
+        }
+        self.with_data(|data| {
+            data.learned_filesystem
+                .retain(|old| old.fingerprint != entry.fingerprint);
+            data.learned_filesystem.push(entry.clone());
+            Ok((entry, true))
+        })
+    }
+
+    pub fn list_learned(&self) -> io::Result<Vec<LearnedFilesystem>> {
+        self.with_data(|data| {
+            Ok((
+                data.learned_filesystem
+                    .iter()
+                    .filter(|entry| valid_learned_entry(entry))
+                    .cloned()
+                    .collect(),
+                false,
+            ))
+        })
+    }
+
     pub fn remove(&self, id: &str) -> io::Result<bool> {
         let id = id.strip_prefix("sha256:").unwrap_or(id);
         self.with_data(|data| {
-            let before = data.verified_trials.len();
+            let before = data.verified_trials.len() + data.learned_filesystem.len();
             data.verified_trials.retain(|entry| entry.fingerprint != id);
-            let removed = data.verified_trials.len() != before;
+            data.learned_filesystem
+                .retain(|entry| entry.fingerprint != id);
+            let removed = data.verified_trials.len() + data.learned_filesystem.len() != before;
             Ok((removed, removed))
         })
     }
@@ -272,6 +380,16 @@ impl TrialStore {
 
     /// Count or remove stale entries, optionally restricting to one project.
     pub fn prune_at(&self, project: Option<&Path>, dry_run: bool) -> io::Result<usize> {
+        self.prune_counts_at(project, dry_run)
+            .map(PrunedVersions::total)
+    }
+
+    /// Count the two approval kinds separately, using the same pruning operation.
+    pub fn prune_counts_at(
+        &self,
+        project: Option<&Path>,
+        dry_run: bool,
+    ) -> io::Result<PrunedVersions> {
         let entries = self.list()?;
         let mut stale = BTreeSet::new();
         for entry in entries {
@@ -289,15 +407,37 @@ impl TrialStore {
                 stale.insert(entry.fingerprint);
             }
         }
+        let mut stale_learned = BTreeSet::new();
+        for entry in self.list_learned()? {
+            if project.is_some_and(|project| !entry.cwd.starts_with(project)) {
+                continue;
+            }
+            let current = crate::effects::fingerprint(&entry.command, &entry.cwd, &entry.rule_id);
+            if !current.is_ok_and(|value| value.digest == entry.fingerprint) {
+                stale_learned.insert(entry.fingerprint);
+            }
+        }
         self.with_data(|data| {
             if dry_run {
-                return Ok((stale.len(), false));
+                return Ok((
+                    PrunedVersions {
+                        verified_trials: stale.len(),
+                        learned_filesystem: stale_learned.len(),
+                    },
+                    false,
+                ));
             }
             let before = data.verified_trials.len();
             data.verified_trials
                 .retain(|entry| !stale.contains(&entry.fingerprint));
-            let removed = before - data.verified_trials.len();
-            Ok((removed, removed > 0))
+            let learned_before = data.learned_filesystem.len();
+            data.learned_filesystem
+                .retain(|entry| !stale_learned.contains(&entry.fingerprint));
+            let removed = PrunedVersions {
+                verified_trials: before - data.verified_trials.len(),
+                learned_filesystem: learned_before - data.learned_filesystem.len(),
+            };
+            Ok((removed, removed.total() > 0))
         })
     }
 
@@ -442,6 +582,21 @@ fn valid_entry(entry: &VerifiedTrial) -> bool {
             .all(|byte| byte.is_ascii_hexdigit())
         && entry.cwd.starts_with(&entry.project_root)
         && entry.project_root.is_absolute()
+}
+
+fn valid_learned_entry(entry: &LearnedFilesystem) -> bool {
+    entry.kind == "learned_filesystem"
+        && entry.source == "user-review"
+        && entry.fingerprint.len() == 64
+        && entry
+            .fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        && entry.cwd.is_absolute()
+        && !entry.command.is_empty()
+        && entry.rule_id.starts_with("core.filesystem:")
+        && !entry.operands.is_empty()
+        && entry.operands.iter().all(|path| path.is_absolute())
 }
 
 fn bounded_summary(value: &str) -> String {
@@ -612,6 +767,34 @@ pub fn project_root(cwd: &Path) -> io::Result<PathBuf> {
         }
     }
     Ok(cwd)
+}
+
+/// Tracked paths relative to the requested directory, without running Git hooks.
+pub(crate) fn tracked_files(root: &Path) -> io::Result<BTreeSet<PathBuf>> {
+    let output = git(root, &["ls-files", "-z"])?;
+    if !output.status.success() {
+        return Err(io::Error::other("git tracking information is unavailable"));
+    }
+    let mut files = BTreeSet::new();
+    for raw in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|raw| !raw.is_empty())
+    {
+        let path = PathBuf::from(std::str::from_utf8(raw).map_err(io::Error::other)?);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Err(io::Error::other("invalid git tracking path"));
+        }
+        files.insert(path);
+        if files.len() > MAX_MANIFEST_FILES {
+            return Err(io::Error::other("git tracking exceeds its file limit"));
+        }
+    }
+    Ok(files)
 }
 
 fn source_manifest(root: &Path) -> io::Result<BTreeSet<PathBuf>> {
@@ -1008,6 +1191,160 @@ mod tests {
             .unwrap();
         assert!(reopened.remove(&next.digest).unwrap());
         assert!(!reopened.remove(&next.digest).unwrap());
+    }
+
+    #[cfg(unix)]
+    fn learned_fingerprint(project: &Path) -> crate::effects::OperandFingerprint {
+        crate::effects::fingerprint(
+            &format!(
+                "/bin/rm -r '{}'",
+                project.canonicalize().unwrap().join("run.sh").display()
+            ),
+            &project.canonicalize().unwrap(),
+            "core.filesystem:rm-recursive-general",
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn learned_approval_persists_separately_and_removes_by_digest() {
+        let (temp, project, store) = fixture();
+        let trial = fingerprint(&store, &project);
+        store.approve(&trial, "trial", "one observed run").unwrap();
+        let learned = learned_fingerprint(&project);
+        let approved = store
+            .approve_learned(&learned, "user approved one file")
+            .unwrap();
+        assert_eq!(approved.kind, "learned_filesystem");
+        assert_eq!(approved.source, "user-review");
+        assert_eq!(approved.command, learned.command);
+        assert_eq!(approved.cwd, learned.cwd);
+        assert_eq!(approved.rule_id, learned.rule_id);
+        assert_eq!(approved.operands, learned.operands);
+        assert!(!approved.created_at.is_empty());
+
+        let reopened = TrialStore::new(temp.path().join("trusted"));
+        assert_eq!(reopened.lookup_learned(&learned).unwrap(), Some(approved));
+        assert_eq!(reopened.list().unwrap().len(), 1);
+        assert_eq!(reopened.list_learned().unwrap().len(), 1);
+        assert!(
+            reopened
+                .remove(&format!("sha256:{}", learned.digest))
+                .unwrap()
+        );
+        assert!(!reopened.remove(&learned.digest).unwrap());
+        assert!(reopened.list_learned().unwrap().is_empty());
+        assert!(reopened.lookup(&trial).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn learned_lookup_checks_command_rule_cwd_and_operands_even_with_same_digest() {
+        let (_temp, project, store) = fixture();
+        let learned = learned_fingerprint(&project);
+        store.approve_learned(&learned, "approved").unwrap();
+        let mut changed = learned_fingerprint(&project);
+        changed.command.push_str(" --other");
+        assert!(store.lookup_learned(&changed).unwrap().is_none());
+        let mut changed = learned_fingerprint(&project);
+        changed.rule_id = "core.filesystem:rm-sensitive-path".to_owned();
+        assert!(store.lookup_learned(&changed).unwrap().is_none());
+        let mut changed = learned_fingerprint(&project);
+        changed.cwd = project.with_file_name("other");
+        assert!(store.lookup_learned(&changed).unwrap().is_none());
+        let mut changed = learned_fingerprint(&project);
+        changed.operands.push(project.join("different"));
+        assert!(store.lookup_learned(&changed).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn learned_approval_rechecks_operands_before_recording() {
+        let (_temp, project, store) = fixture();
+        let learned = learned_fingerprint(&project);
+        fs::write(project.join("run.sh"), "changed during dialog").unwrap();
+        assert!(store.approve_learned(&learned, "approved").is_err());
+        assert!(store.list_learned().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn learned_prune_counts_stale_kinds_and_dry_run_preserves_store() {
+        let (temp, project, store) = fixture();
+        let trial = fingerprint(&store, &project);
+        store.approve(&trial, "trial", "observed").unwrap();
+        let learned = learned_fingerprint(&project);
+        store.approve_learned(&learned, "approved").unwrap();
+        assert_eq!(store.prune().unwrap(), 0);
+        fs::remove_file(project.join("run.sh")).unwrap();
+        let path = temp.path().join("trusted/verified_trials.json");
+        let before = fs::read(&path).unwrap();
+        assert_eq!(
+            store
+                .prune_counts_at(Some(&trial.project_root), true)
+                .unwrap(),
+            PrunedVersions {
+                verified_trials: 1,
+                learned_filesystem: 1,
+            }
+        );
+        assert_eq!(fs::read(path).unwrap(), before);
+        assert_eq!(
+            store
+                .prune_at(Some(&project.join("unrelated")), false)
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.prune_at(Some(&trial.project_root), false).unwrap(), 2);
+        assert!(store.list().unwrap().is_empty());
+        assert!(store.list_learned().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn learned_entries_reject_non_review_sources_and_bound_summaries() {
+        let (temp, project, store) = fixture();
+        let learned = learned_fingerprint(&project);
+        let approved = store
+            .approve_learned(&learned, &"é".repeat(10_000))
+            .unwrap();
+        assert_eq!(approved.summary.len(), SUMMARY_LIMIT);
+        let path = temp.path().join("trusted/verified_trials.json");
+        let mut data: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        data["learned_filesystem"][0]["source"] = serde_json::json!("trial");
+        fs::write(path, serde_json::to_vec(&data).unwrap()).unwrap();
+        assert!(store.lookup_learned(&learned).unwrap().is_none());
+        assert!(store.list_learned().unwrap().is_empty());
+    }
+
+    #[test]
+    fn tracked_files_excludes_untracked_files_and_uses_directory_relative_paths() {
+        let (_temp, project, _store) = fixture();
+        assert!(tracked_files(&project).is_err());
+        assert!(
+            git(&project, &["init", "--quiet"])
+                .unwrap()
+                .status
+                .success()
+        );
+        fs::create_dir(project.join("nested")).unwrap();
+        fs::write(project.join("nested/tracked"), "tracked contents").unwrap();
+        assert!(
+            git(&project, &["add", "nested/tracked"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert_eq!(
+            tracked_files(&project).unwrap(),
+            BTreeSet::from([PathBuf::from("nested/tracked")])
+        );
+        assert_eq!(
+            tracked_files(&project.join("nested")).unwrap(),
+            BTreeSet::from([PathBuf::from("tracked")])
+        );
     }
 
     #[test]

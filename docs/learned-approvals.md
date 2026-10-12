@@ -24,3 +24,30 @@ On 2026-10-12 the native acceptance entry compiled, but the installed guard deni
 launching the temporary helper because its `/tmp` path contains a symlink. It was not
 rerouted or bypassed. Therefore the automated controller behavior is verified, while
 live focus recovery with Orca remains an operator acceptance step before installation.
+
+## Filesystem evidence and remembered approvals
+
+Literal, single-segment system `mv`/`cp` commands can resolve the sensitive-source
+rule when both operands establish a single regular-file replacement or creation.
+Symlinks (including ancestors), shell expansion, relative operands, unknown options,
+custom executables and inherited startup/preload context cannot supply that proof.
+The other rules are evaluated again before allowing the command. Recursive removal
+never gets an automatic effect approval; the dialog reports bounded file/byte counts
+and Git tracking instead.
+
+A Touch ID approval for a definite filesystem rule can be remembered as
+`learned_filesystem`, with `source = user-review`. Its key binds the raw command,
+canonical cwd, system executable, rule and every operand's identity and content.
+Small files are hashed; files larger than 64 MiB retain their full metadata identity.
+Directory manifests have 10,000-entry, 64-level and 64-MiB total content-hash limits.
+Failure to obtain complete evidence leaves a one-request review. Operands are checked
+again after the dialog and immediately before a learned approval is used.
+
+Entries have no expiry. `dcg allowlist list` includes them; `remove` revokes their
+fingerprint and `prune` removes changed or missing versions. Only the trusted user
+store records these approvals; project allowlists cannot manufacture entries.
+
+DCG executables, state and managed hook configurations always require review, including
+parent directories containing those files. An unreadable or oversized parent tree is
+also excluded from learning. The dialog says **Änderung an dcg selbst – wird nie
+gemerkt**. Approving such a request never records a reusable filesystem entry.

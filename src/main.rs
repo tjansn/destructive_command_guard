@@ -1337,6 +1337,37 @@ fn resolve_hook_command(
 
     let eval_duration = eval_start.elapsed();
 
+    if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
+        && destructive_command_guard::effects::changes_self(command)
+    {
+        if result.decision != EvaluationDecision::Deny || result.pattern_info.is_none() {
+            result = destructive_command_guard::evaluator::EvaluationResult::denied_by_pack_pattern(
+                "core.filesystem",
+                "dcg-self-change",
+                destructive_command_guard::effects::SELF_PROTECTION,
+                None,
+                destructive_command_guard::packs::Severity::Critical,
+                &[],
+            );
+        }
+        if let Some(info) = result.pattern_info.as_mut()
+            && !info
+                .reason
+                .contains(destructive_command_guard::effects::SELF_PROTECTION)
+        {
+            info.reason.push_str("\n\n");
+            info.reason
+                .push_str(destructive_command_guard::effects::SELF_PROTECTION);
+        }
+        ctx.log_decision(&result, command, DecisionMode::Deny, eval_duration);
+        return ResolvedCommandOutcome::DenyFamily(Box::new(ResolvedDenyFamily {
+            command: command.to_owned(),
+            result,
+            mode: DecisionMode::Deny,
+            eval_duration,
+        }));
+    }
+
     if result.decision == EvaluationDecision::Indeterminate || result.skipped_due_to_budget {
         ctx.log_decision(&result, command, DecisionMode::Deny, eval_duration);
         return ResolvedCommandOutcome::DeadlineExhausted {
@@ -1606,7 +1637,12 @@ fn publish_decisive_response(
             // Script-source uncertainty requires a version-bound trial/review.
             // Its early inspection gate cannot consume ordinary command-only
             // exceptions, so never issue a code that cannot resolve this denial.
-            if !destructive_command_guard::trial::eligible(info) && !remaining.is_zero() {
+            if !destructive_command_guard::trial::eligible(info)
+                && !info
+                    .reason
+                    .contains(destructive_command_guard::effects::SELF_PROTECTION)
+                && !remaining.is_zero()
+            {
                 let budget = PersistBudget {
                     lock_wait: remaining.min(ALLOW_ONCE_LOCK_WAIT),
                     allow_maintenance: remaining > ALLOW_ONCE_MAINTENANCE_MIN_BUDGET,
@@ -2298,6 +2334,9 @@ fn main() {
         && additional_commands.is_empty()
         && hook_input.tool_calls.is_none()
         && heredoc_settings.scan_script_files;
+    let effect_eligible = additional_commands.is_empty()
+        && hook_input.tool_calls.is_none()
+        && matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown);
     let review_capture = (desktop_review_eligible || trial_eligible)
         .then(destructive_command_guard::desktop_review::ReviewCapture::start);
     let mut decisive: Option<ResolvedCommandOutcome> = None;
@@ -2353,6 +2392,12 @@ fn main() {
                 desktop_review_eligible,
                 cli.agent.as_deref().unwrap_or(history_agent_type),
             );
+        let filesystem_effect = effect_eligible
+            .then(|| assess_filesystem_outcome(&eval_context, &outcome))
+            .flatten();
+        if let Some(assessment) = &filesystem_effect {
+            allow_filesystem_effect(&eval_context, &mut outcome, shell_dialect, assessment);
+        }
         let mut review_unavailable = if !cli.desktop_review {
             (heredoc_settings.scan_script_files || hook_protocol == hook::HookProtocol::Codex).then_some(
                 "Desktop-Freigabe nicht gestartet: --desktop-review fehlt im aktiven Hook-Aufruf.",
@@ -2376,26 +2421,35 @@ fn main() {
             let Some(info) = resolved.result.pattern_info.as_ref() else { return false };
             let Some(cwd) = scope_base else { return false };
             let snapshot = capture.snapshot();
-            let Some(description) = snapshot.description(
+            let Some(mut description) = snapshot.description(
                 &resolved.command, cwd, info, cli.agent.as_deref().unwrap_or(history_agent_type),
             ) else {
                 review_unavailable = Some("Desktop-Freigabe nicht gestartet: Die Prüfung ist unvollständig oder der Vorgang ist zu umfangreich für einen vollständigen Dialog.");
                 emit_stderr!("[dcg] Keine Desktop-Freigabe: Prüfung unvollständig oder Vorgang zu umfangreich für einen vollständigen Dialog.");
                 return false;
             };
-            emit_stderr!("[dcg] Warte auf deine einmalige Freigabe im macOS-Dialog (maximal 120 Sekunden).");
-            if !snapshot.request(&description, cwd) {
+            if let Some(assessment) = &filesystem_effect {
+                description.filesystem_effect(assessment);
+            }
+            let store = destructive_command_guard::trial_store::TrialStore::user().ok();
+            emit_stderr!("[dcg] Warte auf deine Freigabe im macOS-Dialog (maximal 120 Sekunden).");
+            let accepted = filesystem_effect.as_ref().map_or_else(
+                || snapshot.request(&description, cwd),
+                |assessment| assessment.review_with(store.as_ref(), || snapshot.request(&description, cwd)),
+            );
+            if !accepted {
                 review_unavailable = Some("Nicht per Fingerabdruck freigegeben: abgelehnt, abgelaufen, Dialog nicht verfügbar oder geprüfte Dateien geändert.");
                 emit_stderr!("[dcg] Nicht freigegeben: abgelehnt, abgelaufen, Dialog nicht verfügbar oder geprüfte Dateien geändert. Nicht durch Umformulieren erneut versuchen.");
                 return false;
             }
-            emit_stderr!("[dcg] Durch lokale Bestätigung einmalig freigegeben; keine dauerhafte Ausnahme.");
+            let learned = filesystem_effect.as_ref().is_some_and(|assessment| store.as_ref().is_some_and(|store| assessment.learned(store)));
+            emit_stderr!("[dcg] {}", if learned { "Durch Touch ID freigegeben; unveränderte Dateisystemziele für diese Regel gemerkt." } else { "Durch lokale Bestätigung einmalig freigegeben; keine dauerhafte Ausnahme." });
             if let Some(writer) = history_writer.as_ref() {
                 writer.log(build_history_entry(
                     history_agent_type, &resolved.command, &cwd.display().to_string(),
                     HistoryOutcome::Allow, resolved.eval_duration,
                     info.pack_id.as_deref(), info.pattern_name.as_deref(),
-                    Some("desktop-review:one-request"),
+                    Some(if learned { "desktop-review:filesystem-version" } else { "desktop-review:one-request" }),
                 ));
             }
             true
@@ -2440,6 +2494,78 @@ fn main() {
     // flush the audit row first.
     drop(history_writer);
     finish_hook_mode(exit_code);
+}
+
+fn assess_filesystem_outcome(
+    ctx: &HookEvalContext<'_>,
+    outcome: &ResolvedCommandOutcome,
+) -> Option<destructive_command_guard::effects::Assessment> {
+    let ResolvedCommandOutcome::DenyFamily(resolved) = outcome else {
+        return None;
+    };
+    let info = resolved.result.pattern_info.as_ref()?;
+    if info.pack_id.as_deref() != Some("core.filesystem") {
+        return None;
+    }
+    let rule = format!("core.filesystem:{}", info.pattern_name.as_deref()?);
+    Some(destructive_command_guard::effects::assess(
+        &resolved.command,
+        ctx.scope_base?,
+        &rule,
+    ))
+}
+
+fn allow_filesystem_effect(
+    ctx: &HookEvalContext<'_>,
+    outcome: &mut ResolvedCommandOutcome,
+    dialect: ShellDialect,
+    assessment: &destructive_command_guard::effects::Assessment,
+) {
+    use destructive_command_guard::trial_store::TrialStore;
+    let Some(version) = assessment.version.as_ref() else {
+        return;
+    };
+    if assessment.self_protected {
+        return;
+    }
+    let learned = TrialStore::user().is_ok_and(|store| assessment.learned(&store));
+    if !assessment.allow && !learned {
+        return;
+    }
+    // Resolve exactly one hazard. All other rules keep their original authority.
+    let Some(rule) = version.rule_id.split_once(':') else {
+        return;
+    };
+    let relaxed =
+        ctx.allowlists
+            .with_rule_grants(&[rule], "bound filesystem effect", "filesystem-effect");
+    let deadline = Deadline::new(Duration::from_millis(
+        ctx.config.effective_hook_timeout_ms(),
+    ));
+    let residual_ctx = HookEvalContext {
+        allowlists: &relaxed,
+        deadline: &deadline,
+        ..*ctx
+    };
+    let residual = resolve_hook_command(&residual_ctx, &version.command, dialect, None);
+    if matches!(residual, ResolvedCommandOutcome::Allow(_))
+        && destructive_command_guard::effects::fingerprint(
+            &version.command,
+            &version.cwd,
+            &version.rule_id,
+        )
+        .is_ok_and(|current| current == *version)
+    {
+        emit_stderr!(
+            "dcg: {}",
+            if learned {
+                "Touch-ID-Freigabe für unveränderte Dateisystemziele wiederverwendet."
+            } else {
+                "Dateisystemwirkung geprüft: genau eine reguläre Datei, keine Verzeichnisrekursion."
+            }
+        );
+        *outcome = residual;
+    }
 }
 
 /// Trials resolve only their explicit rule grant. A fresh residual evaluation

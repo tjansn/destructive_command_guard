@@ -362,7 +362,7 @@ final class ReviewController: NSObject, NSWindowDelegate {
         authInstruction = prompt
         let instruction = vertical([
             prompt,
-            label("Diesen Vorgang einmal erlauben", size: 11, color: .secondaryLabelColor),
+            label("Diesen Vorgang freigeben", size: 11, color: .secondaryLabelColor),
         ], spacing: 3)
         let cancel = NSButton(title: "Ablehnen", target: self, action: #selector(decline))
         cancel.bezelStyle = .rounded

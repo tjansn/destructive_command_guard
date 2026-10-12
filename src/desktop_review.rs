@@ -128,6 +128,27 @@ pub struct ReviewDescription {
     text: String,
 }
 
+impl ReviewDescription {
+    /// Replace the one-request footer only when complete operand evidence can
+    /// earn a version-bound approval. Self-protection always stays one-request.
+    pub fn filesystem_effect(&mut self, assessment: &crate::effects::Assessment) {
+        if let Some(summary) = &assessment.summary {
+            self.effect = visible(summary);
+            self.text.push_str("\n\nGeprüfte Dateisystemwirkung:\n");
+            self.text.push_str(&visible(summary));
+        }
+        if assessment.self_protected {
+            self.warning = Some(crate::effects::SELF_PROTECTION.to_owned());
+        } else if assessment.version.is_some() {
+            self.text = self.text.replace(
+                "Die Freigabe gilt einmal für den gesamten Aufruf oben, einschließlich weiterer Skriptschritte. Es wird keine dauerhafte Ausnahme angelegt. Bei unklaren Zielen ablehnen.",
+                "Touch ID merkt sich ausschließlich diesen Aufruf, diese Regel und die unveränderten Dateisystemobjekte. Änderungen erfordern erneut eine Prüfung. Bei unklaren Zielen ablehnen.",
+            );
+            self.warning = Some("Freigabe wird für unveränderte Ziele gemerkt.".to_owned());
+        }
+    }
+}
+
 impl ReviewSnapshot {
     /// Inputs actually opened by static inspection, included in trial versions
     /// even when they are ignored by Git or outside the project manifest.
