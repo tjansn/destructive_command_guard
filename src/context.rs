@@ -1136,16 +1136,32 @@ pub fn is_argument_data(command: &str, preceding_flag: Option<&str>) -> bool {
 /// Decode one static POSIX word for the scoped flowctl data contract.
 fn flowctl_static_word(raw: &str) -> Option<String> {
     use crate::normalize::{ShellDialect, ShellTokenDecoder, ShellTokenRole};
-    // Reject shell expansion and control metacharacters. Numeric byte values
-    // keep this boundary explicit and independent of quote-removal behavior.
-    if raw.is_empty()
-        || raw.bytes().any(|byte| {
-            matches!(
-                byte,
-                36 | 96 | 42 | 63 | 91 | 123 | 126 | 59 | 124 | 38 | 40 | 41 | 60 | 62
-            )
-        })
-    {
+    if raw.is_empty() {
+        return None;
+    }
+    // Quoted receipt text may contain shell-looking punctuation without
+    // executing it. Only active expansions/operators withdraw this proof;
+    // quote removal alone cannot distinguish literal '$x' from active "$x".
+    let mut single = false;
+    let mut double = false;
+    let mut bytes = raw.bytes();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'\\' if !single => {
+                bytes.next()?;
+            }
+            b'\'' if !double => single = !single,
+            b'"' if !single => double = !double,
+            b'$' | b'`' if !single => return None,
+            b'*' | b'?' | b'[' | b'{' | b'~' | b';' | b'|' | b'&' | b'(' | b')' | b'<' | b'>'
+                if !single && !double =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    if single || double {
         return None;
     }
     let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);

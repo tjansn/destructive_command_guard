@@ -12933,6 +12933,16 @@ fn model_literal_posix_executable_assignments(
         let Some(replacement) = bindings.get(&name) else {
             break;
         };
+        // Assignment-time quotes do not survive an unquoted expansion.
+        // Treating F='bash -c'; $F as the executable 'bash -c' would allow
+        // and mask a real shell launcher. Leave splitting/globbing values on
+        // the original dynamic-launcher path instead of granting this model.
+        if !segment[argv0_range.clone()].starts_with('"')
+            && shell_word_value(replacement, ShellDialect::Posix)
+                .is_none_or(|value| !value_is_inert_when_substituted(&value))
+        {
+            break;
+        }
         let mut resolved = String::with_capacity(
             segment.len() + replacement.len().saturating_sub(argv0_range.len()),
         );
@@ -14284,7 +14294,11 @@ fn evaluate_command_in_single_dialect_view(
     // Extract the executable payload now so the quick-reject paths below do
     // not discard it before semantic evaluation.
     let sed_shell_sources = collect_sed_shell_sources(command, project_path);
-    let tar_helper_sources = collect_tar_helper_sources(command, shell_dialect);
+    let tar_helper_sources = collect_tar_helper_sources(
+        command,
+        shell_dialect,
+        nested_command_depth == 0 && command == allow_once_command,
+    );
     let force_core_git = dialect_may_hide_core_git(command, shell_dialect, ordered_packs);
     let force_core_filesystem = ordered_packs
         .iter()
@@ -14545,7 +14559,7 @@ fn evaluate_command_in_single_dialect_view(
         return EvaluationResult::allowed();
     }
 
-    if let Some(result) = evaluate_tar_helper_sources(
+    let tar_review_denial = match evaluate_tar_helper_sources(
         &tar_helper_sources,
         enabled_keywords,
         ordered_packs,
@@ -14560,8 +14574,20 @@ fn evaluate_command_in_single_dialect_view(
         nested_command_depth,
         inherited_automated_stdin,
     ) {
-        return result;
-    }
+        // Unresolved tar argv can conceal a helper, but it must not replace
+        // an established protected-file write with generic review guidance.
+        // Keep this deny unless another stage identifies a concrete denial.
+        Some(result)
+            if result.pattern_info.as_ref().is_some_and(|hit| {
+                hit.pack_id.as_deref() == Some("core.filesystem")
+                    && hit.pattern_name.as_deref() == Some(TAR_EXEC_UNVERIFIED_RULE)
+            }) =>
+        {
+            Some(result)
+        }
+        Some(result) => return result,
+        None => None,
+    };
 
     if let Some(result) = evaluate_sed_shell_sources(
         &sed_shell_sources,
@@ -14578,7 +14604,11 @@ fn evaluate_command_in_single_dialect_view(
         nested_command_depth,
         inherited_automated_stdin,
     ) {
-        return result;
+        return if result.is_denied() {
+            result
+        } else {
+            tar_review_denial.unwrap_or(result)
+        };
     }
 
     // Step 7: Mask heredoc content for non-executing targets (cat, tee, etc.)
@@ -14609,6 +14639,11 @@ fn evaluate_command_in_single_dialect_view(
         Some(&nested_context),
         inherited_automated_stdin,
     );
+    if !result.is_denied()
+        && let Some(denial) = tar_review_denial
+    {
+        return denial;
+    }
     // Attribute an ALLOW outcome to the recorded heredoc/launcher allowlist
     // grant — but never let that attribution replace a pack denial or an
     // indeterminate verdict. A grant scoped to e.g.
@@ -18320,6 +18355,7 @@ struct TarHelperOptions {
     uncertain: bool,
     auto_compress: bool,
     writes_local_files: bool,
+    literal_home_members: bool,
     checkpoints: Vec<String>,
     to_commands: Vec<String>,
     compressors: Vec<String>,
@@ -18724,7 +18760,13 @@ impl TarHelperOptions {
                 if dynamic(arg) && (traditional || !consumed_operand) {
                     self.uncertain = true;
                 }
-            } else if dynamic(arg) {
+            } else if dynamic(arg)
+                && !(self.literal_home_members
+                    && masked.home_path_markers.iter().any(|marker| {
+                        arg.strip_prefix(marker)
+                            .is_some_and(|suffix| suffix.starts_with('/') && !dynamic(suffix))
+                    }))
+            {
                 self.uncertain = true;
             }
             // GNU tar continues option processing after member operands.
@@ -18859,7 +18901,65 @@ fn tar_callsite_may_write_files(command: &str) -> bool {
     false
 }
 
-fn collect_tar_helper_sources(command: &str, dialect: ShellDialect) -> Vec<TarHelperSource> {
+fn tar_invocation_ranges(command: &str) -> Result<Vec<(usize, usize)>, &'static str> {
+    let mut ranges = command_segment_ranges(command);
+    if !command.contains(['(', '{'])
+        || !tokenize_for_shell_dialect(command, ShellDialect::Posix)
+            .iter()
+            .any(|token| matches!(token.text(command), Some("(" | "{")))
+    {
+        return Ok(ranges);
+    }
+    if command.len() as u64 > MAX_INDIRECT_INPUT_BYTES {
+        return Err("grouped tar source exceeds the byte limit");
+    }
+    let ast = AstGrep::try_new(command, SupportLang::Bash)
+        .map_err(|_| "grouped tar source could not be parsed")?;
+    if ast.root().get_inner_node().has_error() {
+        return Err("grouped tar source requires shell-grammar recovery");
+    }
+    for (index, node) in ast.root().dfs().enumerate() {
+        if index >= 4096 {
+            return Err("grouped tar source exceeds the syntax-node limit");
+        }
+        if node.kind().as_ref() != "command" {
+            continue;
+        }
+        let mut parent = node.parent();
+        let mut grouped = false;
+        let mut depth = 0;
+        while let Some(ancestor) = parent {
+            depth += 1;
+            if depth > 64 {
+                return Err("grouped tar source exceeds the syntax-depth limit");
+            }
+            match ancestor.kind().as_ref() {
+                "subshell" | "compound_statement" => grouped = true,
+                // Substitutions already own ranges; uninvoked function bodies
+                // are not evidence that this tar command executes now.
+                "command_substitution" | "process_substitution" | "function_definition" => {
+                    grouped = false;
+                    break;
+                }
+                _ => {}
+            }
+            parent = ancestor.parent();
+        }
+        if grouped {
+            let range = node.range();
+            ranges.push((range.start, range.end));
+        }
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    Ok(ranges)
+}
+
+fn collect_tar_helper_sources(
+    command: &str,
+    dialect: ShellDialect,
+    original_callsite: bool,
+) -> Vec<TarHelperSource> {
     if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
         || (!command
             .as_bytes()
@@ -18872,7 +18972,14 @@ fn collect_tar_helper_sources(command: &str, dialect: ShellDialect) -> Vec<TarHe
     let data_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
     let mut sources = Vec::new();
     let mut caller_writes_files = None;
-    for (start, end) in command_segment_ranges(data_view.as_ref()) {
+    // Plain shell groups are not sequence separators. Their command nodes
+    // identify the real executable, while data_view retains outer redirects
+    // that can truncate a callback's inspected input before tar starts.
+    let ranges = match tar_invocation_ranges(data_view.as_ref()) {
+        Ok(ranges) => ranges,
+        Err(reason) => return vec![TarHelperSource::AnalysisLimit(reason)],
+    };
+    for (start, end) in ranges {
         let segment = &data_view[start..end];
         let Ok(masked) = mask_command_substitutions(segment) else {
             continue;
@@ -18923,6 +19030,21 @@ fn collect_tar_helper_sources(command: &str, dialect: ShellDialect) -> Vec<TarHe
         }
         let mut options = TarHelperOptions {
             uncertain: decoded.is_none(),
+            // Tilde expansion produces one quoted home path, never a split
+            // list of options. Use that fact only for a standalone tar whose
+            // caller HOME is absolute. Modeled or nested commands cannot
+            // borrow that fact from the host: an outer assignment may have
+            // changed HOME. Visible assignments/wrappers and prior commands
+            // also retain conservative expansion handling. Helper option
+            // values themselves still use the ordinary dynamic-value check.
+            literal_home_members: original_callsite
+                && data_view.trim() == segment.trim()
+                && crate::config::home_dir().is_some_and(|home| home.is_absolute())
+                && shell_words::split(segment).is_ok_and(|words| {
+                    words
+                        .first()
+                        .is_some_and(|word| matches!(word.rsplit('/').next(), Some("tar" | "gtar")))
+                }),
             ..TarHelperOptions::default()
         };
         let mut environment_decoder = ShellTokenDecoder::new(ShellDialect::Posix);
@@ -19342,6 +19464,49 @@ mod tar_helper_tests {
     }
 
     #[test]
+    fn tilde_member_provenance_does_not_hide_other_expansions() {
+        for (command, uncertain) in [
+            ("tar -xfC ~/.ssh", false),
+            ("tar -xfC ~/$MEMBER", true),
+            ("tar -xfC ~/*.ssh", true),
+            ("tar -xfC $MEMBER", true),
+            ("tar -xfC ~/.ssh $OPTIONS", true),
+        ] {
+            let mut options = TarHelperOptions {
+                literal_home_members: true,
+                ..TarHelperOptions::default()
+            };
+            parse_command(&mut options, command);
+            assert_eq!(options.uncertain, uncertain, "{command}");
+            assert_eq!(options.archives, ["C"], "-f owns its attached value");
+        }
+        for command in [
+            "HOME=relative tar -xfC ~/.ssh",
+            "echo ready; tar -xfC ~/.ssh",
+            "tar -xfC ~/.ssh -I ~/compressor",
+        ] {
+            assert!(
+                collect_tar_helper_sources(command, ShellDialect::Posix, true)
+                    .iter()
+                    .any(|source| matches!(
+                        source,
+                        TarHelperSource::Unverified(_)
+                            | TarHelperSource::Command {
+                                unverified: true,
+                                ..
+                            }
+                    )),
+                "{command}"
+            );
+        }
+        assert!(
+            collect_tar_helper_sources("tar -xfC ~/.ssh", ShellDialect::Posix, false)
+                .iter()
+                .any(|source| matches!(source, TarHelperSource::Unverified(_)))
+        );
+    }
+
+    #[test]
     fn tar_long_options_require_an_exact_or_unique_name() {
         assert_eq!(tar_long_option("checkpoint"), Some(("checkpoint", false)));
         assert_eq!(
@@ -19473,6 +19638,39 @@ mod tar_helper_tests {
     }
 
     #[test]
+    fn grouped_tar_callbacks_keep_outer_redirect_evidence() {
+        for (command, expected_nonlocal) in [
+            (
+                "(tar -tf archive --checkpoint-action='exec=psql -X -f safe.sql') >safe.sql",
+                true,
+            ),
+            (
+                "{ tar -tf archive --checkpoint-action='exec=psql -X -f safe.sql'; } >safe.sql",
+                true,
+            ),
+            (
+                "(tar -tf archive --checkpoint-action='exec=psql -X -f safe.sql') >/dev/null",
+                false,
+            ),
+        ] {
+            let sources = collect_tar_helper_sources(command, ShellDialect::Posix, true);
+            assert!(sources.iter().any(|source| matches!(
+                source,
+                TarHelperSource::Command { command, nonlocal_filesystem, .. }
+                    if command == "psql -X -f safe.sql" && *nonlocal_filesystem == expected_nonlocal
+            )), "{command}: {sources:?}");
+        }
+        assert!(
+            collect_tar_helper_sources(
+                "printf '%s' \"(tar -tf archive --checkpoint-action='exec=git reset --hard')\"",
+                ShellDialect::Posix,
+                true,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn read_mode_output_files_invalidate_helper_file_evidence() {
         for (command, expected_nonlocal) in [
             (
@@ -19496,7 +19694,7 @@ mod tar_helper_tests {
                 true,
             ),
         ] {
-            let sources = collect_tar_helper_sources(command, ShellDialect::Posix);
+            let sources = collect_tar_helper_sources(command, ShellDialect::Posix, true);
             assert!(sources.iter().any(|source| matches!(
                 source,
                 TarHelperSource::Command { command, nonlocal_filesystem, .. }
@@ -20891,6 +21089,7 @@ struct MaskedCommand {
     command: String,
     substitutions: Vec<(String, String)>,
     dynamic_markers: Vec<String>,
+    home_path_markers: Vec<String>,
 }
 
 fn mask_command_substitutions(command: &str) -> Result<MaskedCommand, String> {
@@ -20915,6 +21114,7 @@ fn mask_command_substitutions(command: &str) -> Result<MaskedCommand, String> {
     let mut masked = String::with_capacity(command.len());
     let mut substitutions = Vec::new();
     let mut dynamic_markers = Vec::new();
+    let mut home_path_markers = Vec::new();
     let mut substitution_index = 0usize;
     let mut index = 0usize;
     let mut in_single = false;
@@ -21031,6 +21231,12 @@ fn mask_command_substitutions(command: &str) -> Result<MaskedCommand, String> {
         if !in_single && !in_double && matches!(bytes[index], b'*' | b'?' | b'[' | b'{' | b'~') {
             let marker = unique_internal_marker(command, "GLOB", dynamic_markers.len());
             masked.push_str(&marker);
+            if bytes[index] == b'~'
+                && bytes.get(index + 1) == Some(&b'/')
+                && (index == 0 || bytes[index - 1].is_ascii_whitespace())
+            {
+                home_path_markers.push(marker.clone());
+            }
             dynamic_markers.push(marker);
             index += 1;
             continue;
@@ -21048,6 +21254,7 @@ fn mask_command_substitutions(command: &str) -> Result<MaskedCommand, String> {
         command: masked,
         substitutions,
         dynamic_markers,
+        home_path_markers,
     })
 }
 
@@ -29365,10 +29572,24 @@ fn evaluate_pack_destructive_patterns(
     } else {
         command_slice
     };
+    // Python/JavaScript source is not a POSIX command merely because its
+    // carrier is a shell hook. Applying the shell executable gate to
+    // `s = 'echo `git branch -d x`'; run(s)` drops the conservative raw-source
+    // finding even when no documentation/data-flow proof exists (#544).
+    let git_semantic_dialect = if pack_id == "core.git"
+        && normalized_offset == Some(0)
+        && crate::heredoc::range_is_non_shell_interpreter_source(
+            original_command,
+            &(slice_offset..slice_offset.saturating_add(command_slice.len())),
+        ) {
+        ShellDialect::Unknown
+    } else {
+        shell_dialect
+    };
     if pack_id == "core.git"
         && !crate::packs::core::git::command_executes_git_in_dialect(
             git_semantic_command,
-            shell_dialect,
+            git_semantic_dialect,
         )
     {
         return None;
@@ -29376,7 +29597,7 @@ fn evaluate_pack_destructive_patterns(
     let mut branch_decision = (pack_id == "core.git").then(|| {
         crate::packs::core::git::branch_command_decision_in_dialect(
             git_semantic_command,
-            shell_dialect,
+            git_semantic_dialect,
         )
     });
     // `branch-dynamic-token` is the one `core.git` finding whose entire
@@ -29418,7 +29639,7 @@ fn evaluate_pack_destructive_patterns(
             crate::packs::core::git::syntax_view_for_pattern_matching(
                 git_semantic_command,
                 command_slice,
-                shell_dialect,
+                git_semantic_dialect,
             )
         })
         .flatten();
@@ -30449,6 +30670,32 @@ fn evaluate_extracted_heredoc(
 
         if remaining_below(context.deadline, &crate::perf::FULL_HEREDOC_PIPELINE) {
             return Some(EvaluationResult::indeterminate_due_to_budget());
+        }
+
+        // Non-shell inline code is also unknown when the outer shell replaces
+        // its entire double-quoted source with a run-time expansion. Preserve
+        // single-quoted source: `$name` is literal interpreter code there.
+        if content.language != crate::heredoc::ScriptLanguage::Bash
+            && content.heredoc_type.is_none()
+            && inline_shell_script_is_wholly_dynamic(&content.content)
+            && content.content_range.as_ref().is_some_and(|range| {
+                range.start.checked_sub(1).and_then(|start| {
+                    command
+                        .as_bytes()
+                        .get(start)
+                        .zip(command.as_bytes().get(range.end))
+                }) == Some((&b'"', &b'"'))
+            })
+            && let Some(denial) = launcher_unverified_denial(
+                POSIX_INLINE_LAUNCHER_UNVERIFIED_RULE,
+                "Inline interpreter script cannot be statically verified: its entire source is an \
+                 expansion or command substitution",
+                context.allowlists,
+                context.project_path,
+                first_allowlist_hit,
+            )
+        {
+            return Some(denial);
         }
 
         // Tier 2.5: Recursive Shell Analysis
@@ -44878,6 +45125,40 @@ mod tests {
             "$9x",
         ] {
             assert!(!inline_shell_script_is_wholly_dynamic(fixed), "{fixed}");
+        }
+    }
+
+    #[test]
+    fn non_shell_inline_source_expansion_preserves_outer_quote_boundary() {
+        for command in [
+            r#"python3 -c "$SCRIPT""#,
+            r#"node -e "${SCRIPT}""#,
+            r#"ruby -e "$SCRIPT""#,
+            r#"perl -e "$SCRIPT""#,
+            r#"lua -e "$SCRIPT""#,
+            r#"php -r "$SCRIPT""#,
+        ] {
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+            assert!(result.is_denied(), "{command}: {:?}", result.pattern_info);
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref()),
+                Some("inline-launcher-unverified"),
+                "{command}"
+            );
+        }
+        for command in [
+            r"python3 -c '$SCRIPT'",
+            r#"python3 -c '"$SCRIPT"'"#,
+            r"node -e '$SCRIPT'",
+            r#"node -e '"${SCRIPT}"'"#,
+        ] {
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+            assert!(result.is_allowed(), "{command}: {:?}", result.pattern_info);
         }
     }
 

@@ -1381,10 +1381,11 @@ static HEREDOC_EXTRACTOR: LazyLock<Regex> = LazyLock::new(|| {
     // Matches: <<[-~]? followed by:
     // 1. Single-quoted delimiter: 'delim' (Group 2)
     // 2. Double-quoted delimiter: "delim" (Group 3)
-    // 3. Unquoted delimiter: delim (Group 4)
+    // 3. Bare/backslash-quoted delimiter: delim or D\OC (Group 4)
     // Group 1 is the operator variant (-/~/empty).
     // Note: * instead of + allows empty delimiters (valid in bash).
-    Regex::new(r#"<<([-~])?\s*(?:'([^']*)'|"([^"]*)"|([\w.-]+))"#).expect("heredoc regex compiles")
+    Regex::new(r#"<<([-~])?\s*(?:'([^']*)'|"([^"]*)"|((?:[\w.-]|\\[^\r\n])+))"#)
+        .expect("heredoc regex compiles")
 });
 
 /// Regex for here-string extraction with single quotes (<<<).
@@ -5591,6 +5592,18 @@ fn command_string_runner_payloads(
     let mut payloads = Vec::new();
     match name {
         DYNAMIC_RUNNER => {
+            // The documented quoted FLOWCTL handle has a complete, static
+            // gate receipt grammar. Its command text is data, just as it is
+            // for the literal executable and the inline-launcher verifier.
+            // Local redirects are evaluated separately from these argv words.
+            let argv: Vec<&str> = tokens[start]
+                .text(command)
+                .into_iter()
+                .chain(words.iter().map(|(word, _)| *word))
+                .collect();
+            if crate::context::flowctl_gate_data_values(&argv).is_some() {
+                return payloads;
+            }
             // A program the shell names at run time may be any runner, so
             // every quoted operand may be its command string, and so may the
             // operands joined (`w${x}atch 'git reset' --hard`). Words shown
@@ -6663,11 +6676,24 @@ fn extract_heredocs(
         let operator_variant = cap.get(1).map(|m| m.as_str());
 
         let (delimiter, quoted) = if let Some(m) = cap.get(2) {
-            (m.as_str(), true)
+            (Cow::Borrowed(m.as_str()), true)
         } else if let Some(m) = cap.get(3) {
-            (m.as_str(), true)
+            (Cow::Borrowed(m.as_str()), true)
         } else if let Some(m) = cap.get(4) {
-            (m.as_str(), false)
+            let raw = m.as_str();
+            if raw.contains('\\') {
+                // Any quoted byte suppresses expansion for the whole body.
+                // The closing line uses the quote-removed word, not D\OC.
+                let Ok(mut words) = shell_words::split(raw) else {
+                    continue;
+                };
+                if words.len() != 1 {
+                    continue;
+                }
+                (Cow::Owned(words.pop().expect("one delimiter word")), true)
+            } else {
+                (Cow::Borrowed(raw), false)
+            }
         } else {
             // Should be unreachable if regex matched
             continue;
@@ -6693,7 +6719,7 @@ fn extract_heredocs(
         match extract_heredoc_body(
             command,
             start_pos,
-            delimiter,
+            &delimiter,
             heredoc_type,
             limits,
             start_time,
@@ -7849,6 +7875,23 @@ fn inert_interpreter_stdin_body(command: &str, heredoc: &ActiveHeredoc) -> Optio
     (is_non_shell_interpreter_stdin_command(&target)
         && !stdin_data_sink_may_be_overridden(command, heredoc.operator_start, &target))
     .then_some(body_start..body_end)
+}
+
+/// Proven non-shell source must not inherit its outer shell's executable-word
+/// semantics. It still receives conservative raw-pattern analysis unless a
+/// separate language/data-flow proof masks a literal.
+pub(crate) fn range_is_non_shell_interpreter_source(command: &str, range: &Range<usize>) -> bool {
+    if range_is_inert_interpreter_stdin(command, range) {
+        return true;
+    }
+    range.start < range.end
+        && written_heredoc_interpreter(command).is_some_and(|source| {
+            !matches!(
+                source.language,
+                ScriptLanguage::Bash | ScriptLanguage::Unknown
+            ) && range.start >= source.body.start
+                && range.end <= source.body.end
+        })
 }
 
 /// A view for consumers asking only about OUTER shell syntax. A proven,
