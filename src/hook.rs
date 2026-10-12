@@ -3003,7 +3003,7 @@ pub fn format_denial_message(
     // recovery. The `BLOCKED` header, rule and reason stay dcg's.
     let outcome = crate::inspection::outcome(pack, pattern, reason);
     let trailer = if outcome != crate::inspection::Outcome::Dangerous {
-        outcome.remediation()
+        outcome.rule_remediation(pack, pattern)
     } else {
         pack.and_then(|pack_id| crate::packs::external_denial_trailer(pack_id, pattern))
             .unwrap_or(
@@ -3023,8 +3023,7 @@ pub fn format_denial_message(
         message.push_str("\n\n");
         message.push_str(outcome.remediation());
     }
-    if let Some(code) = allow_once_code.filter(|_| outcome == crate::inspection::Outcome::Dangerous)
-    {
+    if let Some(code) = allow_once_code.filter(|_| outcome.supports_command_review(pack, pattern)) {
         use std::fmt::Write as _;
         let _ = write!(
             message,
@@ -3163,12 +3162,12 @@ pub(crate) fn print_colorful_warning_to(
         denial = denial.with_explanation(format!(
             "[dcg:{}] {}",
             outcome.code(),
-            outcome.remediation()
+            outcome.rule_remediation(pack, pattern)
         ));
     }
 
     if audience == WarningAudience::HumanOperator
-        && outcome == crate::inspection::Outcome::Dangerous
+        && outcome.supports_command_review(pack, pattern)
         && let Some(code) = allow_once_code
     {
         denial = denial.with_allow_once_code(code);
@@ -3198,7 +3197,7 @@ pub(crate) fn print_colorful_warning_to(
             // Advertise the scoped single-command remedy ahead of the
             // persistent allowlist widening (GH#332).
             if let Some(code) =
-                allow_once_code.filter(|_| outcome == crate::inspection::Outcome::Dangerous)
+                allow_once_code.filter(|_| outcome.supports_command_review(pack, pattern))
             {
                 let _ = writeln!(writer, "  $ {cyan}dcg allow-once {code}{reset}");
             }
@@ -3368,7 +3367,7 @@ pub fn write_denial_to(
     branch_context: Option<&crate::evaluator::BranchContext>,
 ) {
     let outcome = crate::inspection::outcome(pack, pattern, reason);
-    let allow_once = allow_once.filter(|_| outcome == crate::inspection::Outcome::Dangerous);
+    let allow_once = allow_once.filter(|_| outcome.supports_command_review(pack, pattern));
     let allow_once_code = allow_once.map(|info| info.code.as_str());
 
     // Reasonix reads the exit status and shows stderr, verbatim, to the user
@@ -7906,12 +7905,24 @@ mod tests {
             };
 
             assert_eq!(decision, Some(expected_decision), "payload: {json}");
-            assert_eq!(reason, Some(REASON), "payload: {json}");
+            let reason = reason.expect("indeterminate diagnostic");
+            assert!(
+                reason.starts_with(&format!("[dcg:analysis-limit] {REASON}")),
+                "payload: {json}"
+            );
+            assert!(
+                reason.contains("parse-only retry cannot authorize execution"),
+                "payload: {json}"
+            );
             assert_ne!(decision, Some("allow"), "payload: {json}");
+
+            if protocol == HookProtocol::ClaudeCompatible {
+                assert_eq!(json["hookSpecificOutput"]["outcomeCode"], "analysis-limit");
+            }
 
             if protocol == HookProtocol::Hermes {
                 assert_eq!(json["action"], "block");
-                assert_eq!(json["message"], REASON);
+                assert_eq!(json["message"], reason);
             }
         }
     }
@@ -8074,7 +8085,10 @@ mod tests {
 
             assert_eq!(decision, Some(expected_decision), "payload: {json}");
             let reason = reason.unwrap_or_else(|| panic!("{protocol:?} carries no reason"));
-            assert!(reason.starts_with(REASON), "payload: {json}");
+            assert!(
+                reason.starts_with(&format!("[dcg:analysis-limit] {REASON}")),
+                "payload: {json}"
+            );
             assert_eq!(
                 reason.contains("unverified_decision"),
                 reason_is_annotated,

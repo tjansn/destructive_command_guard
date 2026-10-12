@@ -4,6 +4,7 @@
   "robot_mode": true,
   "command": "rm -rf /",
   "decision": "deny",
+  "outcome_code": "definite-dangerous-operation",
   "mode": "deny",
   "rule_id": "core.filesystem:rm-rf-root-home",
   "pack_id": "core.filesystem",

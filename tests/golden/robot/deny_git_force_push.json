@@ -4,6 +4,7 @@
   "robot_mode": true,
   "command": "git push --force origin main",
   "decision": "deny",
+  "outcome_code": "definite-dangerous-operation",
   "mode": "deny",
   "rule_id": "core.git:push-force-long",
   "pack_id": "core.git",

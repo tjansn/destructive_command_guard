@@ -709,7 +709,9 @@ mod macos {
             r#"{"scripts":{"test":"node --test test.cjs"}}"#,
         )
         .unwrap();
-        fs::write(fixture.project.join("test.cjs"), "const fs = require('node:fs'); if (!fs.existsSync('build')) fs.mkdirSync('build'); fs.writeFileSync('build/out', fs.readFileSync('source.txt'));\n").unwrap();
+        // A computed import deliberately keeps this an observational trial
+        // fixture now that finite, literal test inputs can pass static inspection.
+        fs::write(fixture.project.join("test.cjs"), "const fs = require('node:' + 'fs'); if (!fs.existsSync('build')) fs.mkdirSync('build'); fs.writeFileSync('build/out', fs.readFileSync('source.txt'));\n").unwrap();
         // Test the finite workload directly. The installed npm runtime probes
         // host preferences/LaunchServices on this Mac; those stay denied rather
         // than widening the policy for an incidental package-manager dependency.
@@ -733,7 +735,7 @@ mod macos {
         assert!(!String::from_utf8_lossy(&cached.stderr).contains("verifying `"));
         fs::write(
             fixture.project.join("test.cjs"),
-            "require('node:fs').unlinkSync('source.txt');\n",
+            "const fs = require('node:' + 'fs'); fs[['unlink', 'Sync'].join('')]('source.txt');\n",
         )
         .unwrap();
         let denied = hook(&fixture, "node --test test.cjs");
@@ -796,7 +798,11 @@ mod macos {
             r#"{"scripts":{"test":"node --test test.mjs"}}"#,
         )
         .unwrap();
-        fs::write(fixture.project.join("test.mjs"), "import 'node:test';").unwrap();
+        fs::write(
+            fixture.project.join("test.mjs"),
+            "await import('node:' + 'test');",
+        )
+        .unwrap();
         let output = hook(&fixture, "npm test; git stash drop");
         let verdict: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(
@@ -835,7 +841,7 @@ mod macos {
     fn relative_site_test_workflow_learns_the_exact_version() {
         let fixture = Fixture::new("printf safe");
         fs::create_dir(fixture.project.join("site")).unwrap();
-        fs::write(fixture.project.join("site/check.mjs"), "import fs from 'node:fs'; fs.mkdirSync('build', {recursive: true}); fs.writeFileSync('build/draft.html', '<p>Draft</p>');").unwrap();
+        fs::write(fixture.project.join("site/check.mjs"), "const fs = await import('node:' + 'fs'); fs.mkdirSync('build', {recursive: true}); fs.writeFileSync('build/draft.html', '<p>Draft</p>');").unwrap();
         let command = "cd site && node --test check.mjs";
         let first = hook(&fixture, command);
         assert!(

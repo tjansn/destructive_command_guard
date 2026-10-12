@@ -229,6 +229,13 @@ fn golden_hook_deny_filesystem() {
     assert_eq!(hook_output.get("packId").unwrap(), "core.filesystem");
     assert_eq!(hook_output.get("severity").unwrap(), "critical");
     assert_eq!(hook_output.get("hookEventName").unwrap(), "PreToolUse");
+    // Root includes dcg itself, so command-only approval must not be offered.
+    for field in ["allowOnceCode", "allowOnceFullHash", "remediation"] {
+        assert!(hook_output.get(field).is_none(), "Unexpected {field}");
+    }
+    let reason = hook_output["permissionDecisionReason"].as_str().unwrap();
+    assert!(reason.contains("Änderung an dcg selbst – wird nie gemerkt"));
+    assert!(!reason.contains("dcg allow-once"));
 }
 
 #[test]
@@ -316,18 +323,19 @@ fn golden_hook_allow_git_checkout_branch() {
 #[test]
 fn golden_json_structure_has_required_fields() {
     let ctx = E2ETestContext::builder("golden_json_structure_has_required_fields").build();
-    let output = ctx.run_dcg_hook("rm -rf /");
+    let output = ctx.run_dcg_hook("git reset --hard");
 
     let json = output.json.expect("Expected JSON output");
     let hook_output = json
         .get("hookSpecificOutput")
         .expect("Missing hookSpecificOutput");
 
-    // These fields are REQUIRED and must never be removed
+    // These fields are required for a finding that supports allow-once review.
     let required_fields = [
         "hookEventName",
         "permissionDecision",
         "permissionDecisionReason",
+        "outcomeCode",
         "ruleId",
         "packId",
         "severity",

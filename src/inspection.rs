@@ -19,6 +19,24 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    /// Presentation categories must not remove a working exception path.
+    /// The tar helper gate consumes exact-command grants (covered end to end);
+    /// the early script-file gate does not and must never advertise one.
+    pub fn supports_command_review(self, pack: Option<&str>, pattern: Option<&str>) -> bool {
+        self == Self::Dangerous
+            || (self == Self::Dynamic
+                && pack == Some("core.filesystem")
+                && pattern == Some("tar-exec-unverified"))
+    }
+
+    pub fn rule_remediation(self, pack: Option<&str>, pattern: Option<&str>) -> &'static str {
+        if self == Self::Dynamic && self.supports_command_review(pack, pattern) {
+            "The helper remains dynamically unresolved. Inspect its resolved executable and inputs before requesting an explicit human exception for this exact command; that exception is not static verification."
+        } else {
+            self.remediation()
+        }
+    }
+
     pub const fn code(self) -> &'static str {
         match self {
             Self::Dangerous => "definite-dangerous-operation",

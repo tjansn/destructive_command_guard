@@ -1642,7 +1642,8 @@ fn publish_decisive_response(
                     info.pack_id.as_deref(),
                     info.pattern_name.as_deref(),
                     &info.reason,
-                ) == destructive_command_guard::inspection::Outcome::Dangerous
+                )
+                .supports_command_review(info.pack_id.as_deref(), info.pattern_name.as_deref())
                 && !info
                     .reason
                     .contains(destructive_command_guard::effects::SELF_PROTECTION)

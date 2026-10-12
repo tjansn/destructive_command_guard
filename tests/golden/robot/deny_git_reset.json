@@ -4,6 +4,7 @@
   "robot_mode": true,
   "command": "git reset --hard",
   "decision": "deny",
+  "outcome_code": "definite-dangerous-operation",
   "mode": "deny",
   "rule_id": "core.git:reset-hard",
   "pack_id": "core.git",
