@@ -5214,7 +5214,10 @@ mod tests {
     #[test]
     fn test_identifies_inactive_packs() {
         let db = HistoryDb::open_in_memory().unwrap();
-        let now = Utc::now();
+        // This tests pack attribution, not the exclusive end-time boundary.
+        // Millisecond timestamp truncation can otherwise exclude every row
+        // when insertion and analysis finish in the same millisecond.
+        let now = Utc::now() - Duration::seconds(1);
 
         // Only core.git triggers
         for _ in 0..50 {
