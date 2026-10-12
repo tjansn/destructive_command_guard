@@ -1,10 +1,13 @@
-// Fail-closed Pi bridge for this fork's one-request macOS review.
+// Fail-closed Pi bridge for sandbox trials and local macOS review.
 // Candidate commands are JSON data; the bridge never executes them itself.
 import { spawn } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const DCG_BIN = "/Users/tom/.local/bin/dcg";
 const MAX_OUTPUT = 1024 * 1024;
+// Default trial (600 s) plus setup/review margin (180 s). Increase this
+// together with trial.timeout_secs before deploying a longer trial policy.
+const GUARD_TIMEOUT_MS = 780_000;
 const GUARD_FAILURE = {
   block: true,
   reason: "DCG konnte den Befehl nicht vollständig prüfen oder freigeben; Ausführung angehalten.",
@@ -36,7 +39,7 @@ function checkCommand(command: string, cwd: string): Promise<{ block: boolean; r
     timer = setTimeout(() => {
       child.kill("SIGKILL");
       finish(GUARD_FAILURE);
-    }, 140_000);
+    }, GUARD_TIMEOUT_MS);
     child.on("error", () => finish(GUARD_FAILURE));
     child.stdin?.on("error", () => finish(GUARD_FAILURE));
     child.stdout?.on("data", (chunk) => {
