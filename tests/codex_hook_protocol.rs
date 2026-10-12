@@ -895,6 +895,33 @@ fn codex_deny_stderr_is_not_empty_even_when_nosuggest() {
     );
 }
 
+#[test]
+fn codex_denial_explains_missing_desktop_review_option_in_json() {
+    let outcome = run_codex_hook("git reset --hard");
+    assert!(outcome.is_codex_block_shape(), "{outcome}");
+    let json = outcome.stdout_json();
+    let reason = json["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .expect("blocking reason");
+    assert!(reason.contains("--desktop-review fehlt"), "{outcome}");
+    assert!(reason.contains("core.git"), "{outcome}");
+}
+
+#[test]
+fn codex_desktop_review_requires_script_inspection_and_explains_it_in_json() {
+    let home = make_hermetic_home();
+    // The isolated default config has script-file inspection disabled.
+    // Even with --desktop-review, this must deny without opening a dialog.
+    let outcome = run_codex_in_home("git reset --hard", home.path(), &["--desktop-review"]);
+    assert!(outcome.is_codex_block_shape(), "{outcome}");
+    let json = outcome.stdout_json();
+    let reason = json["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .expect("blocking reason");
+    assert!(reason.contains("Skriptprüfung deaktiviert"), "{outcome}");
+    assert!(!reason.contains("--desktop-review fehlt"), "{outcome}");
+}
+
 // ---------------------------------------------------------------------------
 // P2.3 — Codex allow path: exit=0, no stdout, no stderr
 // ---------------------------------------------------------------------------

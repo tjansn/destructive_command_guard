@@ -139,6 +139,19 @@ attestation of an agent's identity against other processes in the same account.
 Codex's per-tool `tool_input.workdir` takes precedence over the session cwd.
 Malformed or relative overrides fail closed for file inspection and scoped
 approval. A multi-entry batch with an override is not given a guessed cwd.
+Some Codex runtimes pass only the canonical shell command and the session cwd
+to hooks, omitting the underlying exec tool's `workdir`. DCG cannot recover a
+directory the host did not send. In that case, express directory changes with
+an explicit literal `cd /absolute/project && ...` so both the guard and shell
+resolve relative scripts in the same directory. Do not approve an unverified
+script against a guessed directory. Absolute removal targets remain explicit.
+
+When desktop review cannot start, or authentication does not approve the
+request, its reason is included in the blocking JSON as well as stderr. This
+keeps missing hook options, incomplete inspection and cancelled authentication
+visible in Codex hosts that display only the JSON reason. It never changes the
+original blocking verdict or creates a grant.
+
 Run `node --experimental-vm-modules tests/pi_desktop_bridge.mjs` for the Pi
 bridge's explicit-verdict, malformed-output and process-failure regressions.
 

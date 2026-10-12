@@ -350,16 +350,38 @@ fn claude_and_codex_hook_protocols_deny_file_backed_commands() {
 #[test]
 fn desktop_review_keeps_safe_unverified_and_multi_entry_protocols_closed() {
     let fixture = Fixture::new();
-    for (candidate, batch, expected) in [
-        ("printf safe", false, "allow"),
-        ("bash missing.sh", false, "deny"),
-        ("git reset --hard HEAD", true, "deny"),
+    for (candidate, batch, invalid_cwd, expected, review_reason) in [
+        ("printf safe", false, false, "allow", ""),
+        (
+            "bash missing.sh",
+            false,
+            false,
+            "deny",
+            "Die Prüfung ist unvollständig",
+        ),
+        (
+            "git reset --hard HEAD",
+            true,
+            false,
+            "deny",
+            "mehrere Befehle",
+        ),
+        (
+            "git reset --hard HEAD",
+            false,
+            true,
+            "deny",
+            "kein gültiger absoluter Arbeitsordner",
+        ),
     ] {
         let mut input = json!({
             "turn_id": "desktop-review-regression",
             "tool_name": "Bash", "tool_input": {"command": candidate},
             "cwd": fixture.root, "dcg_explicit_verdict": true,
         });
+        if invalid_cwd {
+            input["cwd"] = json!("relative-directory");
+        }
         if batch {
             input["toolCalls"] = json!([
                 {"name": "Bash", "args": {"command": "git clean -fd"}}
@@ -382,6 +404,13 @@ fn desktop_review_keeps_safe_unverified_and_multi_entry_protocols_closed() {
             assert_eq!(verdict["dcg_verdict"], "allow");
         } else {
             assert_eq!(verdict["hookSpecificOutput"]["permissionDecision"], "deny");
+            assert!(
+                verdict["hookSpecificOutput"]["permissionDecisionReason"]
+                    .as_str()
+                    .expect("blocking reason")
+                    .contains(review_reason),
+                "missing review diagnostic: {verdict}"
+            );
         }
         assert!(
             !String::from_utf8_lossy(&output.stderr).contains("Warte auf"),

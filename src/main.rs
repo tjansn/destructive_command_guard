@@ -2335,7 +2335,20 @@ fn main() {
         decisive_rank = decisive.as_ref().map_or(RANK_ALLOW, outcome_rank),
         "hook request resolved"
     );
-    let exit_code = if let Some(outcome) = decisive {
+    let exit_code = if let Some(mut outcome) = decisive {
+        let mut review_unavailable = if !cli.desktop_review {
+            Some("Desktop-Freigabe nicht gestartet: --desktop-review fehlt im aktiven Hook-Aufruf.")
+        } else if !desktop_review_eligible {
+            Some(
+                "Desktop-Freigabe nicht gestartet: mehrere Befehle im Hook-Aufruf oder Skriptprüfung deaktiviert.",
+            )
+        } else if scope_base.is_none() {
+            Some(
+                "Desktop-Freigabe nicht gestartet: kein gültiger absoluter Arbeitsordner im Hook-Aufruf.",
+            )
+        } else {
+            None
+        };
         let approved = review_capture.as_ref().is_some_and(|capture| {
             let ResolvedCommandOutcome::DenyFamily(resolved) = &outcome else { return false };
             if !matches!(resolved.mode, DecisionMode::Deny | DecisionMode::Ask) {
@@ -2347,11 +2360,13 @@ fn main() {
             let Some(description) = snapshot.description(
                 &resolved.command, cwd, info, cli.agent.as_deref().unwrap_or(history_agent_type),
             ) else {
+                review_unavailable = Some("Desktop-Freigabe nicht gestartet: Die Prüfung ist unvollständig oder der Vorgang ist zu umfangreich für einen vollständigen Dialog.");
                 emit_stderr!("[dcg] Keine Desktop-Freigabe: Prüfung unvollständig oder Vorgang zu umfangreich für einen vollständigen Dialog.");
                 return false;
             };
             emit_stderr!("[dcg] Warte auf deine einmalige Freigabe im macOS-Dialog (maximal 120 Sekunden).");
             if !snapshot.request(&description, cwd) {
+                review_unavailable = Some("Nicht per Fingerabdruck freigegeben: abgelehnt, abgelaufen, Dialog nicht verfügbar oder geprüfte Dateien geändert.");
                 emit_stderr!("[dcg] Nicht freigegeben: abgelehnt, abgelaufen, Dialog nicht verfügbar oder geprüfte Dateien geändert. Nicht durch Umformulieren erneut versuchen.");
                 return false;
             }
@@ -2369,6 +2384,16 @@ fn main() {
         if approved {
             EXIT_SUCCESS
         } else {
+            // Hosts may omit hook stderr when presenting a JSON denial. Keep
+            // missing review prerequisites in the blocking reason as well.
+            if let Some(reason) = review_unavailable
+                && let ResolvedCommandOutcome::DenyFamily(resolved) = &mut outcome
+                && matches!(resolved.mode, DecisionMode::Deny | DecisionMode::Ask)
+                && let Some(info) = resolved.result.pattern_info.as_mut()
+            {
+                info.reason.push_str("\n\n");
+                info.reason.push_str(reason);
+            }
             publish_decisive_response(&eval_context, outcome, &mut history_writer)
         }
     } else {
