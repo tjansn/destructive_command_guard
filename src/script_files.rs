@@ -103,6 +103,7 @@ struct Reference {
 #[derive(Debug)]
 enum FileFormat {
     Script,
+    SyntaxOnly(String),
     PackageScript(String),
     Makefile,
 }
@@ -210,6 +211,15 @@ fn references(command: &str, deadline: &Deadline) -> Result<Vec<Reference>, Stri
             return Err("script inspection deadline exceeded".to_string());
         }
         if node.kind().as_ref() == "command" {
+            let text = node.text();
+            if query_only(&text) {
+                if crate::heredoc::shell_name_overridden(command, "command") {
+                    return Err("query builtin may be shadowed by shell state".to_owned());
+                }
+                // Keep walking: substitutions in a query's arguments execute.
+                pending.extend(node.children());
+                continue;
+            }
             references.extend(command_references(node.text().as_ref())?);
             if references.len() > MAX_FILES {
                 return Err("too many executable file references".to_string());
@@ -217,6 +227,14 @@ fn references(command: &str, deadline: &Deadline) -> Result<Vec<Reference>, Stri
         }
         if node.kind().as_ref() == "variable_assignment" {
             let assignment = node.text();
+            if assignment.split_once('=').is_some_and(|(name, _)| {
+                matches!(
+                    name,
+                    "PATH" | "NODE_OPTIONS" | "NODE_PATH" | "LD_PRELOAD" | "LD_LIBRARY_PATH"
+                ) || name.starts_with("DYLD_")
+            }) {
+                return Err("execution-affecting environment assignment requires review".to_owned());
+            }
             if let Some((name, value)) = assignment.split_once('=')
                 && matches!(name, "BASH_ENV" | "ENV")
             {
@@ -256,6 +274,19 @@ fn references(command: &str, deadline: &Deadline) -> Result<Vec<Reference>, Stri
     Ok(references)
 }
 
+fn query_only(source: &str) -> bool {
+    shell_words::split(source).is_ok_and(|words| {
+        words
+            .iter()
+            .find(|word| !assignment(word))
+            .is_some_and(|word| word == "command")
+            && crate::heredoc::effective_shell_command(&words).is_none()
+            && words
+                .iter()
+                .any(|word| matches!(word.as_str(), "-v" | "-V"))
+    })
+}
+
 fn static_word(raw: &str) -> Result<String, String> {
     if raw == "[" {
         return Ok(raw.to_string());
@@ -290,6 +321,18 @@ fn command_references(source: &str) -> Result<Vec<Reference>, String> {
     let is_env = words
         .first()
         .is_some_and(|word| word.rsplit('/').next() == Some("env"));
+    if is_env
+        && words.iter().any(|word| {
+            word.split_once('=').is_some_and(|(name, _)| {
+                matches!(
+                    name,
+                    "PATH" | "NODE_OPTIONS" | "NODE_PATH" | "LD_PRELOAD" | "LD_LIBRARY_PATH"
+                ) || name.starts_with("DYLD_")
+            })
+        })
+    {
+        return Err("execution-affecting environment assignment requires review".to_owned());
+    }
     let startup: Vec<_> = words
         .iter()
         .filter(|_| is_env)
@@ -430,7 +473,7 @@ fn executable_references(source: &str) -> Result<Vec<Reference>, String> {
         ScriptLanguage::from_command(name)
     };
     if language != ScriptLanguage::Unknown && name != "go" {
-        return interpreter_references(name, &args, language);
+        return interpreter_references(&program, &args, language);
     }
     if program.contains('/') || script_extension(&program).is_some() {
         return Ok(vec![Reference {
@@ -444,12 +487,16 @@ fn executable_references(source: &str) -> Result<Vec<Reference>, String> {
 }
 
 fn interpreter_references(
-    name: &str,
+    program: &str,
     args: &[&str],
     language: ScriptLanguage,
 ) -> Result<Vec<Reference>, String> {
+    let name = program.rsplit('/').next().unwrap_or(program);
     let mut references = Vec::new();
     let mut index = 0;
+    let mut syntax_only = false;
+    let syntax_requested = args.iter().any(|arg| matches!(*arg, "--check" | "-c"))
+        && matches!(name, "node" | "nodejs");
     if matches!(name, "fish" | "pwsh" | "powershell") {
         return Err("this interpreter's file syntax is not supported".to_string());
     }
@@ -473,6 +520,17 @@ fn interpreter_references(
         }
         if arg == "-" {
             return Ok(references); // Existing stdin/heredoc inspection owns it.
+        }
+        if matches!(name, "node" | "nodejs") && matches!(arg.as_str(), "--check" | "-c") {
+            syntax_only = true;
+            continue;
+        }
+        if language == ScriptLanguage::Bash
+            && arg.starts_with(['-', '+'])
+            && !arg.starts_with("--")
+            && arg.contains('n')
+        {
+            syntax_only = arg.starts_with('-');
         }
         if matches!(
             language,
@@ -506,6 +564,9 @@ fn interpreter_references(
             }
         };
         if inline {
+            if syntax_only {
+                return Err("mixed syntax-only and inline options require review".to_owned());
+            }
             return Ok(references);
         }
         if language == ScriptLanguage::Python && arg == "-m" {
@@ -537,6 +598,11 @@ fn interpreter_references(
             continue;
         }
         if arg.starts_with('-') || arg.starts_with('+') {
+            if syntax_requested
+                || (syntax_only && (arg.starts_with("--") || arg.contains(['i', 'l'])))
+            {
+                return Err("unmodeled syntax-check startup option requires review".to_owned());
+            }
             continue;
         }
         index -= 1;
@@ -547,7 +613,11 @@ fn interpreter_references(
             path: static_word(raw)?,
             language: Some(language),
             sourced: false,
-            format: FileFormat::Script,
+            format: if syntax_only {
+                FileFormat::SyntaxOnly(program.to_owned())
+            } else {
+                FileFormat::Script
+            },
         });
     }
     Ok(references)
@@ -636,6 +706,10 @@ fn inspect_reference(
     cwd: &Path,
     evaluate_source: &mut impl FnMut(&str, &Path, ScriptLanguage) -> EvaluationResult,
 ) -> Result<Option<EvaluationResult>, String> {
+    if let FileFormat::SyntaxOnly(program) = &reference.format {
+        verify_syntax_interpreter(program, cwd)?;
+        return Ok(None);
+    }
     let default_makefile =
         if matches!(reference.format, FileFormat::Makefile) && reference.path.is_empty() {
             ["GNUmakefile", "makefile", "Makefile"]
@@ -716,6 +790,9 @@ fn inspect_reference(
     crate::desktop_review::record_script(&path, &content, cwd, language);
     let sources = match &reference.format {
         FileFormat::Script => vec![content],
+        FileFormat::SyntaxOnly(_) => {
+            unreachable!("syntax operands were handled before source inspection")
+        }
         FileFormat::PackageScript(task) => package_source(&content, task)?,
         FileFormat::Makefile => make_source(&content)?,
     };
@@ -758,6 +835,61 @@ fn inspect_reference(
         info.matched_text_preview = None;
     }
     Ok(Some(result))
+}
+
+fn verify_syntax_interpreter(program: &str, cwd: &Path) -> Result<(), String> {
+    if std::env::vars_os().any(|(key, value)| {
+        !value.is_empty() && {
+            let key = key.to_string_lossy();
+            matches!(
+                key.as_ref(),
+                "NODE_OPTIONS" | "BASH_ENV" | "ENV" | "ZDOTDIR" | "LD_PRELOAD" | "LD_LIBRARY_PATH"
+            ) || key.starts_with("DYLD_")
+                || key.starts_with("BASH_FUNC_")
+        }
+    }) {
+        return Err("syntax-only invocation has unverified startup/preload context".to_owned());
+    }
+    let path = if program.contains('/') {
+        cwd.join(program)
+    } else {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join(program))
+            .find(|path| path.is_file())
+            .ok_or("syntax interpreter cannot be resolved")?
+    };
+    let real = path
+        .canonicalize()
+        .map_err(|_| "syntax interpreter cannot be resolved")?;
+    let name = program.rsplit('/').next().unwrap_or(program);
+    let system = ["/bin", "/usr/bin"].iter().any(|base| {
+        Path::new(base)
+            .join(name)
+            .canonicalize()
+            .is_ok_and(|p| p == real)
+    });
+    let node = matches!(name, "node" | "nodejs")
+        && ["/opt/homebrew/Cellar", "/usr/local/Cellar"]
+            .iter()
+            .any(|root| {
+                real.strip_prefix(root).is_ok_and(|p| {
+                    p.components().next().is_some_and(|c| {
+                        let name = c.as_os_str().to_string_lossy();
+                        name == "node" || name.starts_with("node@")
+                    })
+                })
+            });
+    if !system && !node {
+        return Err("syntax interpreter identity is not a trusted system executable".to_owned());
+    }
+    let mut magic = [0; 4];
+    std::fs::File::open(real)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .map_err(|_| "syntax interpreter cannot be read")?;
+    if !native_binary(&magic) {
+        return Err("syntax interpreter is a wrapper, not a native executable".to_owned());
+    }
+    Ok(())
 }
 
 fn verify_unchanged(path: &Path, before: &fs::Metadata) -> Result<(), String> {

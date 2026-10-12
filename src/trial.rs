@@ -153,9 +153,13 @@ fn display_text(text: &str, home: Option<&Path>) -> String {
 impl TrialReport {
     pub fn summary(&self, home: Option<&Path>) -> String {
         let mut lines = vec![format!(
-            "dcg trial {}: {:?}. Sandboxed copy of {}. Command: {}",
+            "dcg trial {}: {}. Sandboxed copy of {}. Command: {}",
             self.id,
-            self.observations.verdict(),
+            match self.observations.verdict() {
+                Verdict::Safe => "observed safe in one sandboxed run",
+                Verdict::Unsafe => "unsafe operation observed",
+                Verdict::Inconclusive => "inconclusive",
+            },
             display_text(&self.project_root.display().to_string(), home),
             display_text(&crate::redaction::redact_secrets(&self.command), home),
         )];
@@ -236,7 +240,7 @@ pub fn trial_environment(
         }
         if matches!(
             name.as_ref(),
-            "PATH" | "LANG" | "TERM" | "USER" | "LOGNAME" | "SHELL"
+            "PATH" | "LANG" | "TERM" | "USER" | "LOGNAME" | "SHELL" | "__CF_USER_TEXT_ENCODING"
         ) || (name.starts_with("LC_")
             && name.bytes().all(|b| b.is_ascii_uppercase() || b == b'_'))
         {
@@ -246,6 +250,9 @@ pub fn trial_environment(
     env.entry("PATH".into())
         .or_insert_with(|| "/usr/bin:/bin:/usr/sbin:/sbin".into());
     env.insert("HOME".into(), home.as_os_str().to_owned());
+    // CoreFoundation otherwise resolves the account's real home independently
+    // of HOME when native runtime code asks for preferences.
+    env.insert("CFFIXED_USER_HOME".into(), home.as_os_str().to_owned());
     env.insert("TMPDIR".into(), temp.as_os_str().to_owned());
     env.insert("CI".into(), "1".into());
     // Suppress package-manager telemetry, update notices and lazy downloads.
@@ -709,6 +716,10 @@ pub fn run(
         report.observations.issues.push("Background service/job was not started: readiness, port ownership and a complete lifecycle cannot be established by a finite trial. Exact-version desktop review is required".to_owned());
         return report;
     }
+    if !fingerprint.reproducible {
+        report.observations.issues.push("Runtime inputs or environment are not reproduced by the sandbox; one-time desktop review required".to_owned());
+        return report;
+    }
     if let Err(error) = run_inner(
         command,
         fingerprint,
@@ -813,18 +824,23 @@ fn run_inner(
     let profile = crate::trial_profile::profile(&project, &home, &temp, &tag);
     let canary_before = root.join("observation-start");
     let canary_after = root.join("observation-end");
+    let read_canary = root.join("read-canary");
+    fs::write(&read_canary, "disposable read-boundary probe")?;
+    let mut observer = LogObserver::start(&tag)?;
     let policy_probe = capture(
         Command::new("/usr/bin/sandbox-exec").args(["-p", &profile, "/usr/bin/true"]),
         Duration::from_secs(5),
         OUTPUT_CAP,
     )?;
     if !policy_probe.status.success() {
+        std::thread::sleep(Duration::from_millis(100));
         return Err(io::Error::other(format!(
-            "sandbox unavailable: {}",
-            display_text(&String::from_utf8_lossy(&policy_probe.stderr), None)
+            "sandbox unavailable ({}): {}; {:?}",
+            policy_probe.status,
+            display_text(&String::from_utf8_lossy(&policy_probe.stderr), None),
+            observer.observations(&tag)?
         )));
     }
-    let mut observer = LogObserver::start(&tag)?;
     let probe = capture(
         Command::new("/usr/bin/sandbox-exec")
             .args(["-p", &profile, "/usr/bin/touch"])
@@ -844,6 +860,26 @@ fn run_inner(
     {
         return Err(io::Error::other(
             "sandbox violation reports unavailable; command was not started",
+        ));
+    }
+    let read_probe = capture(
+        Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &profile, "/bin/cat"])
+            .arg(&read_canary),
+        Duration::from_secs(5),
+        OUTPUT_CAP,
+    )?;
+    if read_probe.status.success() || !read_probe.stdout.is_empty() {
+        return Err(io::Error::other(
+            "sandbox failed its read-enforcement probe",
+        ));
+    }
+    if !observer.wait_for(&tag, &read_canary)?.iter().any(|v| {
+        v.operation.starts_with("file-read")
+            && v.target.contains(&read_canary.display().to_string())
+    }) {
+        return Err(io::Error::other(
+            "sandbox read reports unavailable; command was not started",
         ));
     }
     eprintln!(
@@ -912,11 +948,13 @@ fn run_inner(
             violations.push(violation);
         }
     }
-    let log_complete = [&canary_before, &canary_after].iter().all(|path| {
-        violations
-            .iter()
-            .any(|v| v.target.contains(&path.display().to_string()))
-    });
+    let log_complete = [&canary_before, &canary_after, &read_canary]
+        .iter()
+        .all(|path| {
+            violations
+                .iter()
+                .any(|v| v.target.contains(&path.display().to_string()))
+        });
     if canary_before.exists() || canary_after.exists() {
         return Err(io::Error::other(
             "sandbox failed its write-enforcement probe",
@@ -925,6 +963,7 @@ fn run_inner(
     violations.retain(|v| {
         !v.target.contains(&canary_before.display().to_string())
             && !v.target.contains(&canary_after.display().to_string())
+            && !v.target.contains(&read_canary.display().to_string())
     });
     report.observations.violations = violations;
     report.observations.observation_complete = log_complete;

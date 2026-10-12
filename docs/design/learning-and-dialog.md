@@ -136,3 +136,35 @@ acceptance-matrix rows that belong to each (fixtures only, never real credential
 
 Out of scope until Tom decides: §5 long-running service capability, and §4 "observation versus enforcement" (running the
 requested task itself under continuing confinement instead of trial-then-host). Keep trial-then-host, labelled honestly.
+
+## Part E: enforcement instead of trial-then-host for finite commands (Tom approved 2026-10-12)
+
+Decision (Tom): for finite commands (test runs, `--check`/syntax checks, linters, builds whose outputs go to ignored
+paths) dcg does not run a trial and then allow an unconfined host run. It runs the requested command ONCE, in the real
+workspace, under continuing confinement, and the agent gets that real result.
+
+- Mechanism: where the agent's hook protocol can rewrite the tool input, dcg rewrites the command to a confined
+  invocation (e.g. `dcg run --confined --profile <id> -- <original>`), never through shell interpolation of the original.
+  Claude Code: PreToolUse `hookSpecificOutput.updatedInput` (verify against current Claude Code hook docs). pi bridge
+  (`integrations/pi/dcg-guard.ts`): rewrite the bash tool's command if pi's tool_call event allows mutation; otherwise keep
+  trial-then-host there. Codex/OpenCode/others: support rewriting only where their protocol documents it; else keep
+  trial-then-host with honest labels.
+- Confinement profile (reuses Part C): writes only to the project's git-ignored paths, declared build/cache dirs and a
+  per-run temp dir; tracked/non-ignored source files and `.git` unwritable; no reads of credential stores; loopback only to
+  endpoints the run itself bound; no AppleEvents, no signals to others, the same Mach restrictions; process group
+  supervision, CPU/time/output bounds; the run's environment is the agent's real environment minus credential/preload
+  variables (document exactly which).
+- Violations are enforced (denied by the kernel), reported to the agent in the result with the attempted operations, and
+  never turned into an approval. Exit status of the command is passed through.
+- Eligibility: only commands Part D's invocation semantics classifies as finite and self-contained (no detach/background,
+  no watch mode, no service start). Everything else: Part B effect checks / learned Touch ID approvals, or the existing
+  trial path where rewriting is unsupported.
+- No learned entries are needed for confined runs (each run is enforced); do not record them as approvals.
+- Tests: confined run of a fixture test suite that writes build output (passes, outputs in ignored dir); a fixture that
+  writes a tracked file / outside the project / reads a fixture "credential" / connects to a pre-existing fixture
+  listener (each blocked, reported, fixture victims unchanged); exit code passthrough; rewrite output for Claude Code and
+  the pi bridge; unsupported protocol falls back unchanged; timeout/cleanup.
+- Native acceptance on Tom's Mac: `npm test` in a temporary copy of pi-os runs confined once and reports its real result
+  (pi-os no longer writes outside temp; commit 1f894f5 on pi-os branch feat/file-commands moved its fx cache).
+
+Order: A, B, C, D, E. Same branch, separate commits, one REPORT; then Tom installs once.

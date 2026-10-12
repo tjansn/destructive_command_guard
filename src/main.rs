@@ -2646,10 +2646,29 @@ fn attempt_sandbox_trial(
         let before = store
             .fingerprint(&command, cwd, &shell, &sources)
             .map_err(|e| format!("Die Prüfung ist unvollständig. Cannot bind an exact trial version; desktop approval unavailable: {e}"))?;
+        if !before.reproducible {
+            let explanation = "Runtime inputs or environment are not reproduced by the sandbox. This request requires one-time desktop review; no reusable approval will be recorded.";
+            if !desktop || !desktop_review::request_trial(&command, cwd, explanation, agent) {
+                return Err(format!(
+                    "{explanation}\nDesktop review unavailable, declined or expired."
+                ));
+            }
+            let after = store
+                .fingerprint(&command, cwd, &shell, &sources)
+                .map_err(|e| e.to_string())?;
+            if before != after {
+                return Err("Runtime inputs changed during review; approval rejected.".to_owned());
+            }
+            return Ok(true);
+        }
         if let Some(entry) = store.lookup(&before).map_err(|e| e.to_string())? {
             emit_stderr!(
-                "dcg: verified by {} on {} (exact version).",
-                entry.source,
+                "dcg: {} on {} (exact version).",
+                if entry.source == "trial" {
+                    "observed safe in one sandboxed run"
+                } else {
+                    "approved by Touch ID"
+                },
                 entry.created_at
             );
             return Ok(true);
@@ -2710,7 +2729,15 @@ fn attempt_sandbox_trial(
         store
             .approve(&before, source, &summary)
             .map_err(|e| format!("{summary}\nCannot save exact-version approval: {e}"))?;
-        emit_stderr!("dcg: exact version verified by {source}. {}", report.id);
+        emit_stderr!(
+            "dcg: {}. {}",
+            if source == "trial" {
+                "observed safe in one sandboxed run (exact version)"
+            } else {
+                "exact version approved by Touch ID"
+            },
+            report.id
+        );
         Ok(true)
     };
     match resolve() {

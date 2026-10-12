@@ -6,6 +6,7 @@
 //! content hashes; touching a file does not alter its fingerprint.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -24,6 +25,13 @@ const MAX_STORE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MANIFEST_FILES: usize = 100_000;
 const SUMMARY_LIMIT: usize = 8192;
 const RECENT_SUMMARIES: usize = 128;
+const MAX_RUNTIME_FILES: usize = 8192;
+const MAX_RUNTIME_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const PUBLIC_RUNTIME_CONFIGS: [&str; 3] = [
+    "/private/etc/ssl/openssl.cnf",
+    "/opt/homebrew/etc/openssl@3/openssl.cnf",
+    "/usr/local/etc/openssl@3/openssl.cnf",
+];
 
 /// Inputs and content digest of one exact command version.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +42,9 @@ pub struct Fingerprint {
     pub command: String,
     pub shell: PathBuf,
     pub resolved_sources: Vec<PathBuf>,
+    /// False means isolation changed or could not bind a runtime input. Such
+    /// requests may be reviewed once, but cannot reuse or create a grant.
+    pub reproducible: bool,
 }
 
 /// A narrow approval that only resolves the script-inspection trigger.
@@ -165,9 +176,21 @@ impl TrialStore {
         executables.insert(shell.clone());
         executables.extend(sources.iter().cloned());
         resolve_interpreters(&mut executables, &cwd)?;
+        let parent_environment: BTreeMap<_, _> = std::env::vars_os().collect();
+        let (environment_digest, environment_reproduced) = runtime_environment(&parent_environment);
+        let mut runtime = ignored_runtime_inputs(&project_root);
+        let startup = shell_startup_inputs(&shell, &parent_environment);
+        let public_config = existing_runtime_inputs(PUBLIC_RUNTIME_CONFIGS.map(PathBuf::from));
+        let mut reproducible = environment_reproduced
+            && runtime.complete
+            && startup.files.is_empty()
+            && startup.complete
+            && public_config.complete;
+        runtime.files.extend(startup.files);
+        runtime.files.extend(public_config.files);
         self.with_data(|data| {
             let mut hasher = Sha256::new();
-            hash_field(&mut hasher, b"dcg-verified-trial-v1");
+            hash_field(&mut hasher, b"dcg-verified-trial-v2");
             hash_field(&mut hasher, path_text(&project_root)?.as_bytes());
             hash_field(
                 &mut hasher,
@@ -180,6 +203,7 @@ impl TrialStore {
             // Normalization intentionally erases executable prefixes and wrappers
             // elsewhere. Exact approvals must retain their original semantics.
             hash_field(&mut hasher, command.as_bytes());
+            hash_field(&mut hasher, environment_digest.as_bytes());
             hash_field(
                 &mut hasher,
                 std::env::var_os("PATH")
@@ -187,6 +211,36 @@ impl TrialStore {
                     .as_encoded_bytes(),
             );
             let mut dirty = false;
+            let mut runtime_bytes = 0_u64;
+            for (index, path) in runtime.files.iter().enumerate() {
+                hash_field(&mut hasher, b"ignored-runtime-or-startup-input");
+                hash_field(&mut hasher, path.as_os_str().as_encoded_bytes());
+                let metadata = fs::symlink_metadata(path);
+                if index >= MAX_RUNTIME_FILES {
+                    reproducible = false;
+                    break;
+                }
+                let Ok(metadata) = metadata else {
+                    reproducible = false;
+                    continue;
+                };
+                runtime_bytes = runtime_bytes.saturating_add(metadata.len());
+                if !metadata.is_file() || runtime_bytes > MAX_RUNTIME_BYTES {
+                    reproducible = false;
+                    continue;
+                }
+                match cached_hash_bounded(path, &mut data.file_hashes, metadata.len()) {
+                    Ok((digest, changed)) => {
+                        dirty |= changed;
+                        hash_field(&mut hasher, digest.as_bytes());
+                        if hash_permissions(&mut hasher, path).is_err() {
+                            reproducible = false;
+                        }
+                    }
+                    Err(_) => reproducible = false,
+                }
+            }
+            hash_field(&mut hasher, &[u8::from(reproducible)]);
             for path in &manifest {
                 hash_field(&mut hasher, b"source");
                 hash_field(&mut hasher, path_text(path)?.as_bytes());
@@ -215,6 +269,7 @@ impl TrialStore {
                     command: command.to_owned(),
                     shell,
                     resolved_sources: sources,
+                    reproducible,
                 },
                 dirty && persist_cache,
             ))
@@ -222,6 +277,9 @@ impl TrialStore {
     }
 
     pub fn lookup(&self, current_version: &Fingerprint) -> io::Result<Option<VerifiedTrial>> {
+        if !current_version.reproducible {
+            return Ok(None);
+        }
         self.with_data(|data| {
             Ok((
                 data.verified_trials
@@ -247,6 +305,11 @@ impl TrialStore {
         source: &str,
         summary: &str,
     ) -> io::Result<VerifiedTrial> {
+        if !fingerprint.reproducible {
+            return Err(io::Error::other(
+                "runtime inputs were not reproduced; one-request review is required",
+            ));
+        }
         if !matches!(source, "trial" | "user-review") {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -403,7 +466,7 @@ impl TrialStore {
                 &entry.resolved_sources,
                 !dry_run,
             );
-            if !current.is_ok_and(|value| value.digest == entry.fingerprint) {
+            if !current.is_ok_and(|value| value.reproducible && value.digest == entry.fingerprint) {
                 stale.insert(entry.fingerprint);
             }
         }
@@ -608,6 +671,241 @@ fn bounded_summary(value: &str) -> String {
             (*bytes <= SUMMARY_LIMIT).then_some(c)
         })
         .collect()
+}
+
+/// Values are hashed only. Neither the digest preimage nor rejected variable
+/// names are written to summaries, errors, or serialized approval records.
+fn runtime_environment(parent: &BTreeMap<OsString, OsString>) -> (String, bool) {
+    let trial = crate::trial::trial_environment(
+        parent
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+        Path::new("/dcg-trial-home"),
+        Path::new("/dcg-trial-tmp"),
+    );
+    let mut hash = Sha256::new();
+    let mut reproduced = true;
+    for (key, value) in parent {
+        hash_field(&mut hash, key.as_encoded_bytes());
+        hash_field(&mut hash, value.as_encoded_bytes());
+        let relocated_or_control = key.to_str().is_some_and(|name| {
+            name.starts_with("DCG_")
+                || matches!(
+                    name,
+                    "HOME"
+                        | "USERPROFILE"
+                        | "TMPDIR"
+                        | "TMP"
+                        | "TEMP"
+                        | "PWD"
+                        | "OLDPWD"
+                        | "SHLVL"
+                        | "_"
+                        | "XDG_CONFIG_HOME"
+                        | "XDG_DATA_HOME"
+                        | "XDG_CACHE_HOME"
+                        | "XDG_STATE_HOME"
+                        | "CARGO_HOME"
+                        | "RUSTUP_HOME"
+                )
+        });
+        if key == OsStr::new("CFFIXED_USER_HOME")
+            || (!relocated_or_control && trial.get(key) != Some(value))
+        {
+            reproduced = false;
+        }
+    }
+    (hex_digest(&hash.finalize()), reproduced)
+}
+
+struct RuntimeInputs {
+    files: BTreeSet<PathBuf>,
+    complete: bool,
+}
+
+fn existing_runtime_inputs(paths: impl IntoIterator<Item = PathBuf>) -> RuntimeInputs {
+    let mut inputs = RuntimeInputs {
+        files: BTreeSet::new(),
+        complete: true,
+    };
+    for path in paths {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                inputs.files.insert(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => inputs.complete = false,
+        }
+    }
+    inputs
+}
+
+/// A lockfile cannot stand in for installed bytes. Hash the ignored dependency
+/// files themselves, including native modules and package-local data, up to the
+/// explicit byte/file budget. Oversize installations stay review-only.
+fn ignored_runtime_inputs(root: &Path) -> RuntimeInputs {
+    let mut inputs = RuntimeInputs {
+        files: BTreeSet::new(),
+        complete: true,
+    };
+    let output = match optional_git(
+        root,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ],
+    ) {
+        Ok(Some(output)) => output,
+        Ok(None) => {
+            // Non-Git manifests already include every file. A broken repository
+            // query must not silently omit inputs from a previously valid repo.
+            inputs.complete = !root.join(".git").exists();
+            return inputs;
+        }
+        Err(_) => {
+            inputs.complete = false;
+            return inputs;
+        }
+    };
+    for raw in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|raw| !raw.is_empty())
+    {
+        let Ok(text) = std::str::from_utf8(raw) else {
+            inputs.complete = false;
+            continue;
+        };
+        let relative = Path::new(text);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            inputs.complete = false;
+            continue;
+        }
+        let path = root.join(relative);
+        if runtime_path(relative) || is_executable_file(&path) {
+            inputs.files.insert(path);
+            if inputs.files.len() > MAX_RUNTIME_FILES {
+                inputs.complete = false;
+                break;
+            }
+        }
+    }
+    inputs
+}
+
+fn runtime_path(path: &Path) -> bool {
+    if path.components().any(|part| {
+        matches!(
+            part.as_os_str().to_str(),
+            Some("node_modules" | ".venv" | "venv" | "site-packages" | "vendor")
+        )
+    }) {
+        return true;
+    }
+    let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+    name == ".env"
+        || name.starts_with(".env.")
+        || name.contains("config")
+        || matches!(
+            name,
+            ".npmrc"
+                | ".yarnrc"
+                | ".nvmrc"
+                | ".node-version"
+                | ".python-version"
+                | ".ruby-version"
+                | "Gemfile"
+                | "package-lock.json"
+                | ".package-lock.json"
+                | "npm-shrinkwrap.json"
+                | "yarn.lock"
+                | "pnpm-lock.yaml"
+                | "bun.lock"
+                | "bun.lockb"
+                | "Cargo.lock"
+                | "Gemfile.lock"
+                | "poetry.lock"
+                | "uv.lock"
+                | "Pipfile.lock"
+                | "composer.lock"
+                | "go.sum"
+                | "requirements.txt"
+        )
+        || matches!(
+            path.extension().and_then(OsStr::to_str),
+            Some(
+                "js" | "cjs"
+                    | "mjs"
+                    | "ts"
+                    | "tsx"
+                    | "jsx"
+                    | "py"
+                    | "pyc"
+                    | "rb"
+                    | "php"
+                    | "sh"
+                    | "bash"
+                    | "zsh"
+                    | "pl"
+                    | "lua"
+                    | "node"
+                    | "wasm"
+                    | "json"
+                    | "toml"
+                    | "yaml"
+                    | "yml"
+                    | "ini"
+                    | "cfg"
+                    | "conf"
+            )
+        )
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        matches!(
+            path.extension().and_then(OsStr::to_str),
+            Some("exe" | "cmd" | "bat" | "ps1")
+        )
+    }
+}
+
+fn shell_startup_inputs(shell: &Path, environment: &BTreeMap<OsString, OsString>) -> RuntimeInputs {
+    let mut inputs = RuntimeInputs {
+        files: BTreeSet::new(),
+        complete: true,
+    };
+    let names: &[&str] = match shell.file_name().and_then(OsStr::to_str) {
+        Some("zsh") => &[".zshenv", ".zprofile", ".zshrc", ".zlogin"],
+        Some("bash") => &[".bash_profile", ".bash_login", ".bashrc", ".profile"],
+        Some("sh" | "dash" | "ksh") => &[".profile"],
+        _ => &[],
+    };
+    if names.is_empty() {
+        return inputs;
+    }
+    let Some(home) = environment
+        .get(OsStr::new("HOME"))
+        .or_else(|| environment.get(OsStr::new("USERPROFILE")))
+    else {
+        inputs.complete = false;
+        return inputs;
+    };
+    existing_runtime_inputs(names.iter().map(|name| Path::new(home).join(name)))
 }
 
 fn path_text(path: &Path) -> io::Result<&str> {
@@ -861,6 +1159,14 @@ fn cached_hash(
     path: &Path,
     cache: &mut BTreeMap<String, CachedHash>,
 ) -> io::Result<(String, bool)> {
+    cached_hash_bounded(path, cache, u64::MAX)
+}
+
+fn cached_hash_bounded(
+    path: &Path,
+    cache: &mut BTreeMap<String, CachedHash>,
+    byte_limit: u64,
+) -> io::Result<(String, bool)> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         // A source symlink's target can change independently, including outside
@@ -875,6 +1181,9 @@ fn cached_hash(
             "source manifest contains a non-regular file",
         ));
     }
+    if metadata.len() > byte_limit {
+        return Err(io::Error::other("runtime content hash limit exceeded"));
+    }
     let mut state = file_state(&metadata)?;
     let key = path_text(path)?.to_owned();
     if let Some(cached) = cache.get(&key)
@@ -887,14 +1196,19 @@ fn cached_hash(
     let mut file = File::open(path)?;
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; 16_384];
+    let mut input = (&mut file).take(metadata.len().saturating_add(1));
+    let mut total = 0_u64;
     loop {
-        let count = file.read(&mut buffer)?;
+        let count = input.read(&mut buffer)?;
         if count == 0 {
             break;
         }
+        total += count as u64;
         hash.update(&buffer[..count]);
     }
-    if file_state(&file.metadata()?)? != state || file_state(&fs::symlink_metadata(path)?)? != state
+    if total != metadata.len()
+        || file_state(&file.metadata()?)? != state
+        || file_state(&fs::symlink_metadata(path)?)? != state
     {
         return Err(io::Error::other("source file changed while fingerprinting"));
     }
@@ -1345,6 +1659,158 @@ mod tests {
             tracked_files(&project.join("nested")).unwrap(),
             BTreeSet::from([PathBuf::from("tracked")])
         );
+    }
+
+    #[test]
+    fn runtime_environment_binds_values_without_forwarding_or_logging_them() {
+        let base = BTreeMap::from([
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (OsString::from("HOME"), OsString::from("/isolated/home")),
+            (OsString::from("TMPDIR"), OsString::from("/isolated/tmp")),
+            (OsString::from("DCG_SELF_HEAL_HOOK"), OsString::from("0")),
+        ]);
+        let first = runtime_environment(&base);
+        assert!(first.1);
+        for name in [
+            "NODE_OPTIONS",
+            "DATA_DIR",
+            "SOME_APPLICATION_SWITCH",
+            "API_TOKEN",
+            "CFFIXED_USER_HOME",
+        ] {
+            let mut changed = base.clone();
+            changed.insert(name.into(), "private-value-one".into());
+            let one = runtime_environment(&changed);
+            assert!(!one.1, "{name}");
+            assert_ne!(first.0, one.0);
+            assert!(!one.0.contains("private-value"));
+            changed.insert(name.into(), "private-value-two".into());
+            assert_ne!(one.0, runtime_environment(&changed).0);
+        }
+        let mut changed = base;
+        changed.insert("CFFIXED_USER_HOME".into(), "/dcg-trial-home".into());
+        assert!(!runtime_environment(&changed).1);
+        changed.remove(OsStr::new("CFFIXED_USER_HOME"));
+        changed.insert("LANG".into(), "en_US.UTF-8".into());
+        assert!(runtime_environment(&changed).1);
+        assert_ne!(first.0, runtime_environment(&changed).0);
+    }
+
+    #[test]
+    fn ignored_runtime_contents_and_lockfiles_invalidate_versions() {
+        let (_temp, project, store) = fixture();
+        assert!(
+            git(&project, &["init", "--quiet"])
+                .unwrap()
+                .status
+                .success()
+        );
+        fs::write(
+            project.join(".gitignore"),
+            "node_modules/\n.env\nignored/\npackage-lock.json\n",
+        )
+        .unwrap();
+        fs::create_dir_all(project.join("node_modules/dependency")).unwrap();
+        fs::create_dir(project.join("ignored")).unwrap();
+        for (path, contents) in [
+            ("node_modules/.package-lock.json", "installed version one"),
+            (
+                "node_modules/dependency/index.js",
+                "export const value = 1;",
+            ),
+            ("package-lock.json", "locked version one"),
+            (".env", "DATA_DIR=one"),
+            ("ignored/config.json", "{\"value\":1}"),
+            ("ignored/helper.py", "print('one')"),
+        ] {
+            fs::write(project.join(path), contents).unwrap();
+        }
+        let mut previous = fingerprint(&store, &project);
+        for path in [
+            "node_modules/dependency/index.js",
+            "node_modules/.package-lock.json",
+            "package-lock.json",
+            ".env",
+            "ignored/config.json",
+            "ignored/helper.py",
+        ] {
+            fs::write(project.join(path), "different runtime bytes").unwrap();
+            let changed = fingerprint(&store, &project);
+            assert_ne!(previous.digest, changed.digest, "{path}");
+            previous = changed;
+        }
+    }
+
+    #[test]
+    fn oversized_ignored_dependency_requires_review_and_cannot_be_cached() {
+        let (_temp, project, store) = fixture();
+        assert!(
+            git(&project, &["init", "--quiet"])
+                .unwrap()
+                .status
+                .success()
+        );
+        fs::write(project.join(".gitignore"), "node_modules/\n").unwrap();
+        fs::create_dir(project.join("node_modules")).unwrap();
+        File::create(project.join("node_modules/large-module"))
+            .unwrap()
+            .set_len(MAX_RUNTIME_BYTES + 1)
+            .unwrap();
+        let version = fingerprint(&store, &project);
+        assert!(!version.reproducible);
+        for source in ["trial", "user-review"] {
+            let error = store
+                .approve(&version, source, "approval is one request only")
+                .unwrap_err();
+            assert!(error.to_string().contains("one-request review"));
+        }
+        assert!(store.lookup(&version).unwrap().is_none());
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn runtime_hash_budget_applies_to_reads_and_warm_cache_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("runtime-input");
+        fs::write(&path, "one").unwrap();
+        let mut hashes = BTreeMap::new();
+        assert!(cached_hash_bounded(&path, &mut hashes, 3).is_ok());
+        assert!(cached_hash_bounded(&path, &mut hashes, 2).is_err());
+        fs::write(&path, "more").unwrap();
+        assert!(cached_hash_bounded(&path, &mut hashes, 3).is_err());
+    }
+
+    #[test]
+    fn existing_shell_startup_requires_review_and_is_hashed() {
+        let temp = tempfile::tempdir().unwrap();
+        let environment =
+            BTreeMap::from([(OsString::from("HOME"), temp.path().as_os_str().to_owned())]);
+        let absent = shell_startup_inputs(Path::new("/bin/zsh"), &environment);
+        assert!(absent.complete && absent.files.is_empty());
+        let startup = temp.path().join(".zshenv");
+        fs::write(&startup, "export DATA_DIR=elsewhere\n").unwrap();
+        let present = shell_startup_inputs(Path::new("/bin/zsh"), &environment);
+        assert_eq!(present.files, BTreeSet::from([startup.clone()]));
+        let mut hashes = BTreeMap::new();
+        let first = cached_hash(&startup, &mut hashes).unwrap().0;
+        fs::write(&startup, "export DATA_DIR=changed\n").unwrap();
+        assert_ne!(first, cached_hash(&startup, &mut hashes).unwrap().0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignored_dependency_symlink_requires_review() {
+        let (_temp, project, store) = fixture();
+        assert!(
+            git(&project, &["init", "--quiet"])
+                .unwrap()
+                .status
+                .success()
+        );
+        fs::write(project.join(".gitignore"), "node_modules/\n").unwrap();
+        fs::create_dir(project.join("node_modules")).unwrap();
+        std::os::unix::fs::symlink("../run.sh", project.join("node_modules/link.js")).unwrap();
+        assert!(!fingerprint(&store, &project).reproducible);
     }
 
     #[test]

@@ -134,6 +134,47 @@ fn literal_and_wrapped_shell_launchers_inspect_the_file() {
 }
 
 #[test]
+fn syntax_only_operands_are_data_but_execution_and_siblings_are_inspected() {
+    let fixture = Fixture::new();
+    fixture.write("danger.sh", "git reset --hard\n");
+    fixture.allowed("/bin/bash -n danger.sh");
+    fixture.denied("/bin/bash danger.sh");
+    fixture.denied("/bin/bash -n danger.sh; git reset --hard");
+    fixture.denied("/bin/bash -n +n danger.sh");
+    fixture.denied("/bin/bash -nc 'git reset --hard'");
+    fixture.write("node", "#!/bin/sh\ngit reset --hard\n");
+    fixture.write(
+        "danger.js",
+        "require('child_process').execSync('git reset --hard');\n",
+    );
+    fixture.denied("./node --check danger.js");
+    fixture.denied("env NODE_OPTIONS=--require=./danger.js node --check danger.js");
+    fixture.denied("NODE_OPTIONS=--require=./danger.js node --check danger.js");
+    if std::path::Path::new("/opt/homebrew/bin/node").exists() {
+        // No candidate is run. A huge syntax operand must not consume AST/file budgets.
+        fixture.write(
+            "large.js",
+            "require('child_process').execSync('git reset --hard');\n".repeat(10_000),
+        );
+        fixture.allowed("/opt/homebrew/bin/node --check large.js");
+        fixture.denied("/opt/homebrew/bin/node danger.js");
+        fixture.denied("/opt/homebrew/bin/node --require ./danger.js --check large.js");
+    }
+}
+
+#[test]
+fn builtin_queries_do_not_execute_the_operand_but_substitutions_and_shadowing_do() {
+    let fixture = Fixture::new();
+    fixture.allowed("command -v dcg");
+    fixture.allowed("command -V orca");
+    fixture.allowed("command -p -v orca");
+    fixture.denied("command git reset --hard");
+    fixture.denied("command -v \"$(git reset --hard)\"");
+    fixture.denied("command() { git reset --hard; }; command -v dcg");
+    fixture.denied("alias command='git reset --hard'; command -v dcg");
+}
+
+#[test]
 fn incident_wrapper_reaches_the_destructive_helper() {
     let fixture = Fixture::new();
     fixture.write(

@@ -7523,7 +7523,7 @@ fn shell_word_assigns_path(word: &str) -> bool {
 /// Resolve the command word after assignment prefixes and the two shell
 /// builtins that can explicitly dispatch another builtin. Query-only
 /// `command -v/-V` and `builtin -p` forms do not execute the following word.
-fn effective_shell_command(tokens: &[String]) -> Option<(usize, &str)> {
+pub(crate) fn effective_shell_command(tokens: &[String]) -> Option<(usize, &str)> {
     let mut index = tokens
         .iter()
         .position(|word| !is_shell_env_assignment(word))?;
@@ -7552,6 +7552,23 @@ fn effective_shell_command(tokens: &[String]) -> Option<(usize, &str)> {
     }
 
     tokens.get(index).map(|word| (index, word.as_str()))
+}
+
+/// Shared conservative proof for builtin query semantics. A definition anywhere
+/// in the shell source or inherited startup state invalidates the proof.
+pub(crate) fn shell_name_overridden(source: &str, target: &str) -> bool {
+    if std::env::var_os(format!("BASH_FUNC_{target}%%")).is_some()
+        || ["BASH_ENV", "ENV", "ZDOTDIR"]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some_and(|v| !v.is_empty()))
+    {
+        return true;
+    }
+    let ast = AstGrep::new(source, SupportLang::Bash);
+    let mut overridden = false;
+    let mut parse_error = ast.root().get_inner_node().has_error();
+    find_shell_name_override_deep(ast.root(), target, &mut overridden, &mut parse_error);
+    overridden || parse_error
 }
 
 #[must_use]

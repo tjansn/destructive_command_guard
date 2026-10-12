@@ -46,14 +46,29 @@ and update-notifier settings suppress lazy downloads and telemetry; software
 that needs omitted settings may require review. Captured output is bounded.
 
 The macOS sandbox restricts writes to the trial directories and necessary
-devices, permits loopback networking and trial-local Unix sockets, and blocks
-external signals and AppleEvents. Child processes inherit the sandbox. The
+devices. Reads are limited to those directories and documented OS/runtime trees
+(`/System`, `/usr`, `/bin`, `/sbin`, Apple/Developer libraries, Nix packages and
+Homebrew Cellar/opt), a few system data files and random/null devices. The root
+directory entry is readable for dyld initialization; this does not allow reading
+its descendants. Host credential stores, browser profiles, other projects and
+the learner database lie outside the read boundary. Mach lookups are limited to
+the OS notification center, directory lookup, logd and diagnosticd bootstrap
+services needed by the runtime; credential brokers and LaunchServices are denied.
+Inspection of other processes is denied, as are external signals and AppleEvents.
+Child processes inherit the sandbox. The
 timeout applies to the process group; temporary artifacts are removed unless
 `keep_artifacts = true` is selected for debugging.
 
+Only trial-local Unix sockets and loopback **binding/listening** are permitted.
+TCP outbound connections, including localhost, are denied: this profile does not
+establish ownership of a TCP peer. Even a connection to the trial's own listener
+therefore requires review. This conservative fallback prevents a pre-existing
+host service from acting as a deputy. A disposable HTTP fixture verifies that its
+victim remains unchanged. No host service or real credential store is probed.
+
 On macOS 27.0.1 the implementation observes an active `log stream` subscription;
 the tagged events were not retained for a later `log show` query. Denied canary
-writes verify enforcement and observation before any user command starts and
+writes and a disposable read canary verify enforcement and observation before any user command starts and
 after it ends. Missing markers, a failed subscriber, or a capped log are
 inconclusive. This follows Apple's recommendation to
 [stream sandbox violations](https://developer.apple.com/documentation/security/discovering-and-diagnosing-app-sandbox-violations).
@@ -69,9 +84,9 @@ copy-on-write cloning does not count shared blocks against that cap.
 
 | Observation | Result |
 |---|---|
-| Complete observation, no denied operations, only permitted build/cache/temp writes | Safe: record the version and allow after other rules pass |
+| Complete observation, no denied operations, only permitted build/cache/temp writes | Observed safe in one sandboxed run: record the version and allow after other rules pass |
 | Denied outside writes, external signals, AppleEvents, or deleted tracked/source files | Unsafe: deny and explain the attempted operations |
-| Network attempt, timeout, modified source files, interactive input, unavailable sandbox, or incomplete observation | Inconclusive: request existing desktop review |
+| Denied read/IPC/network attempt, timeout, modified source files, interactive input, unavailable sandbox, or incomplete observation | Inconclusive: request existing desktop review |
 
 Test failures and other nonzero exit codes are not destructive evidence by
 themselves. A formatter that changes source files needs review; a test that
@@ -88,8 +103,8 @@ again. A timestamp change without a content change keeps the content identity.
 Reliable unprivileged file-read tracing is not assumed. The conservative
 fallback fingerprints all non-ignored project files, using content hashes
 cached by file metadata. This means an unrelated source edit can require a
-new trial. Ignored dependencies, files outside the project and runtime inputs
-remain limitations; this is an observation of one execution, not a proof of
+new trial. Known ignored runtime inputs are also bounded and hashed; unresolved
+external inputs remain limitations. This is an observation of one execution, not a proof of
 arbitrary script behaviour.
 
 Use `dcg allowlist list` to inspect verified trial entries. Revoke an entry with
@@ -164,10 +179,10 @@ script inspection returns before ordinary exact-command and allow-once grants.
 For `heredoc.script_files:unverified`, dcg now emits neither an ineffective
 allow-once code nor exact-command allowlisting advice. Existing command-only
 grants remain unconsumed; they do not attest executable or project versions.
-The supported reusable approval is a safe trial or an explicit version-bound
+The supported reusable approval is an observation of one sandboxed run or an explicit version-bound
 desktop review. Other rules keep their own approval and denial authority.
 
-Finite loopback exchanges are tested with sockets owned and closed by the test.
+An owned loopback listener can bind and close; TCP exchanges require review.
 A long-running preview server is not certified by reaching a timeout or by
 detaching. Top-level background commands are not started automatically; they
 go directly to inconclusive exact-version review. Timeouts and surviving child
@@ -193,18 +208,42 @@ controlled bridge tests. Updating this checkout changes no installed binary,
 live policy or hook.
 
 The native acceptance suite includes a relative `cd site && node --test` workflow,
-its cached second invocation, a loopback socket exchange, and a background HTTP
+its cached second invocation, blocked TCP exchanges, and a background HTTP
 preview request that produces review guidance without starting a server. It also
 checks that a sibling warning cannot release an unresolved command. Browser DOM
 evaluation and screenshot loops have no dedicated end-to-end fixture; the original
 feedback lacked their complete command strings, so those cases remain design
 review items rather than claimed successful runs.
 
-One observed run proves the behaviour of that run. Scripts can branch on time,
+The success label is **observed safe in one sandboxed run**. Scripts can branch on time,
 environment, data, network or sandbox detection; a real run has different
 inputs and permissions. Exact-version binding reduces stale approvals but
 does not close the check-to-execution race or attest a mutable guard binary.
 Keep OS permissions and backups as independent protection.
+
+Runtime fingerprints include ignored lockfiles, `.env`, helper/config sources and
+the actual installed dependency bytes within bounded file/byte limits. Oversized,
+symlinked or unresolved runtime inputs require a one-request desktop review and
+cannot produce a reusable entry. Environment values are hashed without appearing
+in diagnostics or persisted records. A variable cleared by the trial, such as
+`NODE_OPTIONS`, a credential or a `DATA_DIR` override, prevents reuse and automatic
+trial approval. The macOS text-encoding variable is forwarded with locale settings.
+Existing shell startup customization also requires review. This deliberately
+reduces the workflows eligible for observation-based grants.
+
+On the tested Mac, the installed npm runtime probes host global preferences and
+LaunchServices even for a finite fixture. Those reads/IPC remain denied and the
+observational path requires review. The Node fixture tests the workload directly;
+this is a measured compatibility loss from the tighter boundary, not a new npm
+exemption. Python networking fixtures use `-S` to isolate socket behavior from
+machine-specific site packages. The `.git` write fixture uses a real temporary
+Git repository so dependency discovery completes before exercising enforcement.
+
+Verified native Node `--check` and system shell `-n` operands are syntax data, so
+their content does not spend the executable-source AST budget. Preloads, startup
+context, sibling commands and substitutions retain inspection. Unshadowed builtin
+`command -v/-V` queries share the shell evaluator's query semantics. Unsupported
+or shadowed forms continue to require review.
 
 For rollout, first run the temporary-directory trial and hook tests on the
 target Mac, measure a representative project, then build with
