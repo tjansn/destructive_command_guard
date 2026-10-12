@@ -112,6 +112,113 @@ mod macos {
     }
 
     #[test]
+    fn cli_trial_summary_allowlist_remove_and_prune_lifecycle() {
+        let fixture = Fixture::new("mkdir -p build; cat source.txt > build/out");
+        let home = fixture.temp.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let config = fixture.temp.path().join("config.toml");
+        fs::write(&config, "[trial]\ntimeout_secs = 10\n").unwrap();
+        let cli = |args: &[&str]| {
+            let output = Command::new(env!("CARGO_BIN_EXE_dcg"))
+                .args(args)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("SHELL", "/bin/sh")
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("TMPDIR", fixture.temp.path())
+                .env("TEMP", fixture.temp.path())
+                .env("TMP", fixture.temp.path())
+                .env("DCG_CONFIG", &config)
+                .env("DCG_SELF_HEAL_HOOK", "0")
+                .env(
+                    "DCG_ALLOWLIST_SYSTEM_PATH",
+                    fixture.temp.path().join("no-system.toml"),
+                )
+                .current_dir(&fixture.project)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{args:?}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let list = || {
+            serde_json::from_str::<Vec<serde_json::Value>>(&cli(&[
+                "allowlist",
+                "list",
+                "--user",
+                "--format",
+                "json",
+            ]))
+            .unwrap()
+        };
+        assert!(list().is_empty());
+        let summary = cli(&["trial", "run", "--", "/bin/sh", "./run.sh"]);
+        assert!(summary.contains(": Safe."), "{summary}");
+        let id = summary
+            .split_whitespace()
+            .nth(2)
+            .unwrap()
+            .strip_suffix(':')
+            .unwrap();
+        assert_eq!(cli(&["trial", "show", id]), summary);
+        let entries = list();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry["kind"], "verified_trial");
+        assert_eq!(entry["source"], "trial");
+        assert_eq!(entry["command"], "/bin/sh ./run.sh");
+        assert_eq!(entry["project_root"], fixture.project.to_str().unwrap());
+        assert_eq!(entry["selector"]["type"], "verified_trial");
+        assert_eq!(entry["selector"]["value"], entry["fingerprint"]);
+        let fingerprint = entry["fingerprint"].as_str().unwrap();
+        cli(&[
+            "allowlist",
+            "remove",
+            &format!("verified_trial:{fingerprint}"),
+            "--user",
+        ]);
+        assert!(list().is_empty());
+        assert_eq!(cli(&["trial", "show", id]), summary);
+
+        let repeated = cli(&["trial", "run", "--", "/bin/sh", "./run.sh"]);
+        assert!(repeated.contains(": Safe."), "{repeated}");
+        let entries = list();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["fingerprint"], fingerprint);
+        assert!(!fixture.project.join("build").exists());
+        assert_eq!(
+            fs::read_to_string(fixture.project.join("source.txt")).unwrap(),
+            "original source"
+        );
+        fs::write(fixture.project.join("source.txt"), "changed source").unwrap();
+        let preview: serde_json::Value = serde_json::from_str(&cli(&[
+            "allowlist",
+            "prune",
+            "--user",
+            "--dry-run",
+            "--format",
+            "json",
+        ]))
+        .unwrap();
+        assert_eq!(preview["dry_run"], true);
+        assert_eq!(preview["verified_trials_pruned"], 1);
+        assert_eq!(list().len(), 1);
+        let pruned: serde_json::Value =
+            serde_json::from_str(&cli(&["allowlist", "prune", "--user", "--format", "json"]))
+                .unwrap();
+        assert_eq!(pruned["dry_run"], false);
+        assert_eq!(pruned["verified_trials_pruned"], 1);
+        assert!(list().is_empty());
+    }
+
+    #[test]
     fn child_cannot_delete_outside_victim() {
         let fixture = Fixture::new("");
         let victim = fixture.temp.path().join("outside/victim");
