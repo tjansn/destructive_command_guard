@@ -18980,7 +18980,32 @@ fn collect_tar_helper_sources(
     // that can truncate a callback's inspected input before tar starts.
     let ranges = match tar_invocation_ranges(data_view.as_ref()) {
         Ok(ranges) => ranges,
-        Err(reason) => return vec![TarHelperSource::AnalysisLimit(reason)],
+        Err(reason) => {
+            // The obfuscation prefilter also admits unrelated quoted source,
+            // including PowerShell method calls under the unknown dialect.
+            // A failed Bash parse is tar evidence only when the source may
+            // actually name tar. Keep raw substrings and decoded words as a
+            // conservative superset, including quoted/escaped executables.
+            let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+            let may_name_tar = data_view
+                .as_bytes()
+                .windows(3)
+                .any(|word| word.eq_ignore_ascii_case(b"tar"))
+                || tokenize_for_shell_dialect(data_view.as_ref(), ShellDialect::Posix)
+                    .iter()
+                    .filter_map(|token| token.text(data_view.as_ref()))
+                    .filter_map(|word| decoder.decode(word, ShellTokenRole::Syntax))
+                    .any(|word| {
+                        word.rsplit('/').next().is_some_and(|name| {
+                            name.eq_ignore_ascii_case("tar") || name.eq_ignore_ascii_case("gtar")
+                        })
+                    });
+            return if may_name_tar {
+                vec![TarHelperSource::AnalysisLimit(reason)]
+            } else {
+                Vec::new()
+            };
+        }
     };
     for (start, end) in ranges {
         let segment = &data_view[start..end];
@@ -19671,6 +19696,32 @@ mod tar_helper_tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn grouped_tar_parse_failure_requires_a_tar_candidate() {
+        for command in [
+            r"[System.IO.Directory]::Delete('C:\src', $true)",
+            r"[IO.Directory]::Delete('C:\src', $flag)",
+            "(printf '%s' 'unterminated group'",
+        ] {
+            assert!(
+                collect_tar_helper_sources(command, ShellDialect::Unknown, true).is_empty(),
+                "{command}"
+            );
+        }
+        for command in [
+            "(tar -tf archive",
+            "(t''ar -tf archive",
+            r"(t\ar -tf archive",
+            "('/bin/tar' -tf archive",
+        ] {
+            let sources = collect_tar_helper_sources(command, ShellDialect::Unknown, true);
+            assert!(
+                matches!(sources.as_slice(), [TarHelperSource::AnalysisLimit(_)]),
+                "{command}: {sources:?}"
+            );
+        }
     }
 
     #[test]
