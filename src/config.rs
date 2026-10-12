@@ -1090,10 +1090,22 @@ pub(crate) fn system_config_dir() -> PathBuf {
 // folder remains the fallback when the variable is unset or empty.
 
 /// The user's home directory: `HOME` on POSIX, `USERPROFILE` on Windows,
-/// falling back to the platform lookup when the variable is unset.
+/// with a platform fallback only on Windows.
+///
+/// A scrubbed POSIX environment
+/// must not silently select the operator's account through the password DB.
 #[must_use]
 pub fn home_dir() -> Option<PathBuf> {
-    std::env::home_dir().filter(|path| !path.as_os_str().is_empty())
+    #[cfg(unix)]
+    {
+        std::env::var_os("HOME")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::home_dir().filter(|path| !path.as_os_str().is_empty())
+    }
 }
 
 /// A Windows AppData directory: the environment variable when set, else the
@@ -1114,6 +1126,8 @@ fn windows_app_data_dir(env_name: &str, under_profile: &str) -> Option<PathBuf> 
 #[must_use]
 #[allow(clippy::disallowed_methods)] // the one sanctioned `dirs` call
 pub fn user_config_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    home_dir()?;
     #[cfg(windows)]
     if let Some(dir) = windows_app_data_dir("APPDATA", r"AppData\Roaming") {
         return Some(dir);
@@ -1125,6 +1139,8 @@ pub fn user_config_dir() -> Option<PathBuf> {
 #[must_use]
 #[allow(clippy::disallowed_methods)] // the one sanctioned `dirs` call
 pub fn user_data_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    home_dir()?;
     #[cfg(windows)]
     if let Some(dir) = windows_app_data_dir("APPDATA", r"AppData\Roaming") {
         return Some(dir);
@@ -1136,6 +1152,8 @@ pub fn user_data_dir() -> Option<PathBuf> {
 #[must_use]
 #[allow(clippy::disallowed_methods)] // the one sanctioned `dirs` call
 pub fn user_data_local_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    home_dir()?;
     #[cfg(windows)]
     if let Some(dir) = windows_app_data_dir("LOCALAPPDATA", r"AppData\Local") {
         return Some(dir);
@@ -1147,6 +1165,8 @@ pub fn user_data_local_dir() -> Option<PathBuf> {
 #[must_use]
 #[allow(clippy::disallowed_methods)] // the one sanctioned `dirs` call
 pub fn user_cache_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    home_dir()?;
     #[cfg(windows)]
     if let Some(dir) = windows_app_data_dir("LOCALAPPDATA", r"AppData\Local") {
         return Some(dir);
