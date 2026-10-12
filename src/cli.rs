@@ -248,6 +248,14 @@ pub enum Command {
         action: TrialAction,
     },
 
+    /// Run an encoded finite request once under continuing confinement
+    Run {
+        #[arg(long, required = true)]
+        confined: bool,
+        #[arg(long)]
+        request: String,
+    },
+
     /// Add a rule to the allowlist (shortcut for `allowlist add`)
     #[command(name = "allow")]
     Allow {
@@ -2740,6 +2748,19 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
         Some(Command::Allowlist { action }) => {
             handle_allowlist_command(action, config.allowlist.auto_prune_expired)?;
+        }
+        Some(Command::Run {
+            confined: _,
+            request,
+        }) => {
+            use std::io::Write as _;
+            let request = crate::confined::Request::decode(&request)?;
+            let result = crate::confined::run(&request, &std::env::temp_dir())?;
+            std::io::stdout().write_all(&result.stdout)?;
+            std::io::stderr().write_all(&result.stderr)?;
+            std::io::stdout().flush()?;
+            std::io::stderr().flush()?;
+            std::process::exit(result.exit_code);
         }
         Some(Command::Trial { action }) => match action {
             TrialAction::Run { command } => {

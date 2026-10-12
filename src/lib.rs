@@ -66,6 +66,7 @@ pub mod ast_matcher;
 pub mod cli;
 pub mod confidence;
 pub mod config;
+pub mod confined;
 pub mod context;
 pub mod desktop_review;
 pub mod effects;

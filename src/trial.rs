@@ -471,13 +471,13 @@ fn copy_tree(source: &Path, dest: &Path, remaining: &mut u64, deadline: Instant)
 }
 
 #[cfg(target_os = "macos")]
-struct Captured {
-    status: std::process::ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    timed_out: bool,
-    complete: bool,
-    descendants: bool,
+pub(crate) struct Captured {
+    pub(crate) status: std::process::ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) timed_out: bool,
+    pub(crate) complete: bool,
+    pub(crate) descendants: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -523,7 +523,11 @@ impl Drop for ProcessGroup {
 }
 
 #[cfg(target_os = "macos")]
-fn capture(command: &mut Command, timeout: Duration, cap: usize) -> io::Result<Captured> {
+pub(crate) fn capture(
+    command: &mut Command,
+    timeout: Duration,
+    cap: usize,
+) -> io::Result<Captured> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -597,14 +601,14 @@ fn capture(command: &mut Command, timeout: Duration, cap: usize) -> io::Result<C
 /// macOS 27 emits these events to live subscribers without retaining them for
 /// `log show`. Keep a subscriber alive for the complete process lifetime.
 #[cfg(target_os = "macos")]
-struct LogObserver {
+pub(crate) struct LogObserver {
     child: std::process::Child,
     bytes: std::sync::Arc<std::sync::Mutex<(Vec<u8>, bool)>>,
 }
 
 #[cfg(target_os = "macos")]
 impl LogObserver {
-    fn start(tag: &str) -> io::Result<Self> {
+    pub(crate) fn start(tag: &str) -> io::Result<Self> {
         let predicate = format!(
             "(sender == \"Sandbox\" OR subsystem == \"com.apple.sandbox.reporting\") AND eventMessage CONTAINS \"{tag}\""
         );
@@ -653,7 +657,7 @@ impl LogObserver {
         Ok(Self { child, bytes })
     }
 
-    fn observations(&mut self, tag: &str) -> io::Result<Vec<Violation>> {
+    pub(crate) fn observations(&mut self, tag: &str) -> io::Result<Vec<Violation>> {
         if self.child.try_wait()?.is_some() {
             return Err(io::Error::other("sandbox log subscriber exited"));
         }
@@ -667,7 +671,7 @@ impl LogObserver {
         Ok(parse_violations(&String::from_utf8_lossy(&bytes.0), tag))
     }
 
-    fn wait_for(&mut self, tag: &str, path: &Path) -> io::Result<Vec<Violation>> {
+    pub(crate) fn wait_for(&mut self, tag: &str, path: &Path) -> io::Result<Vec<Violation>> {
         let started = Instant::now();
         loop {
             let observed = self.observations(tag)?;
@@ -942,7 +946,7 @@ fn run_inner(
     let mut violations = observer.wait_for(&tag, &canary_after)?;
     // Different kernel threads may deliver a child's reports after the final
     // canary. Drain a quiet interval before classifying the complete run.
-    std::thread::sleep(Duration::from_millis(300));
+    std::thread::sleep(Duration::from_secs(1));
     for violation in observer.observations(&tag)? {
         if !violations.contains(&violation) {
             violations.push(violation);

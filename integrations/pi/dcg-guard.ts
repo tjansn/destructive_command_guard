@@ -13,13 +13,15 @@ const GUARD_FAILURE = {
   reason: "DCG konnte den Befehl nicht vollständig prüfen oder freigeben; Ausführung angehalten.",
 };
 
-function checkCommand(command: string, cwd: string): Promise<{ block: boolean; reason?: string }> {
+type Verdict = { block: boolean; reason?: string; command?: string };
+
+function checkCommand(input: Record<string, unknown>, cwd: string): Promise<Verdict> {
   return new Promise((resolve) => {
     let settled = false;
     let stdout = "";
     let stderr = "";
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const finish = (result: { block: boolean; reason?: string }) => {
+    const finish = (result: Verdict) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
@@ -55,7 +57,12 @@ function checkCommand(command: string, cwd: string): Promise<{ block: boolean; r
     child.on("close", (code) => {
       try {
         const result = JSON.parse(stdout);
-        if (code === 0 && result.dcg_verdict === "allow") {
+        if (code === 0 && result.dcg_verdict === "confined"
+            && result.hookSpecificOutput?.permissionDecision === "allow"
+            && typeof result.hookSpecificOutput.updatedInput?.command === "string"
+            && result.hookSpecificOutput.updatedInput.command.trim().length > 0) {
+          finish({ block: false, command: result.hookSpecificOutput.updatedInput.command });
+        } else if (code === 0 && result.dcg_verdict === "allow") {
           finish({ block: false });
         } else if (result.hookSpecificOutput?.permissionDecision === "deny") {
           finish({
@@ -76,9 +83,10 @@ function checkCommand(command: string, cwd: string): Promise<{ block: boolean; r
     }
     child.stdin.end(JSON.stringify({
       tool_name: "Bash",
-      tool_input: { command },
+      tool_input: input,
       cwd,
       dcg_explicit_verdict: true,
+      dcg_input_rewrite: true,
     }));
   });
 }
@@ -89,7 +97,15 @@ export default function (pi: ExtensionAPI) {
     const command = (event.input as { command?: unknown })?.command;
     if (typeof command !== "string") return GUARD_FAILURE;
     if (!command.trim()) return;
-    const result = await checkCommand(command, ctx.cwd);
+    const result = await checkCommand(event.input as Record<string, unknown>, ctx.cwd);
     if (result.block) return result;
+    // Pi's tool_call contract explicitly permits in-place event.input mutation.
+    // Never return an ordinary allow for a confined receipt without applying it.
+    if (result.command !== undefined) {
+      try {
+        (event.input as { command: string }).command = result.command;
+        if ((event.input as { command: string }).command !== result.command) return GUARD_FAILURE;
+      } catch { return GUARD_FAILURE; }
+    }
   });
 }

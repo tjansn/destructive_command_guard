@@ -56,7 +56,33 @@ mod macos {
 
     #[test]
     fn safe_build_failing_tests_store_cache_and_source_invalidation() {
-        let fixture = Fixture::new("mkdir -p build; cat source.txt > build/out; exit 7");
+        let script = "mkdir -p build; cat source.txt > build/out; exit 7";
+        // Same harmless workload in independent disposable projects, measured
+        // together. A baseline never executes a blocked or user-supplied script.
+        let baseline = Fixture::new(script);
+        let baseline_home = baseline.temp.path().join("home");
+        fs::create_dir(&baseline_home).unwrap();
+        let baseline_started = Instant::now();
+        let baseline_output = Command::new("/bin/sh")
+            .arg("./run.sh")
+            .current_dir(&baseline.project)
+            .env_clear()
+            .envs(trial::trial_environment(
+                std::env::vars_os(),
+                &baseline_home,
+                baseline.temp.path(),
+            ))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let baseline_ms = baseline_started.elapsed().as_millis();
+        assert_eq!(baseline_output.status.code(), Some(7));
+        assert_eq!(
+            fs::read_to_string(baseline.project.join("build/out")).unwrap(),
+            "original source"
+        );
+        let fixture = Fixture::new(script);
+        let observed_started = Instant::now();
         let before = fixture
             .store
             .fingerprint(
@@ -67,6 +93,11 @@ mod macos {
             )
             .unwrap();
         let report = fixture.run(10);
+        let observed_ms = observed_started.elapsed().as_millis();
+        eprintln!(
+            "paired observational cost (initial fingerprints + trial): baseline={baseline_ms} ms observed={observed_ms} ms added={} ms",
+            observed_ms.saturating_sub(baseline_ms)
+        );
         eprintln!("{}", report.summary(None));
         assert_eq!(
             report.observations.verdict(),
@@ -381,8 +412,11 @@ mod macos {
 
     #[test]
     fn loopback_exchange_requires_review_without_endpoint_ownership_proof() {
+        // Numeric socket.connect reaches the network policy directly;
+        // create_connection first calls getaddrinfo, which may fail at the
+        // separately denied host DNS-configuration Mach service instead.
         let fixture = Fixture::new(
-            "python3 -S -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\",0)); s.listen(1); c=socket.create_connection(s.getsockname()); a,_=s.accept(); a.sendall(b\"ok\"); assert c.recv(2)==b\"ok\"; a.close(); c.close(); s.close()'",
+            "python3 -S -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\",0)); s.listen(1); c=socket.socket(); c.connect(s.getsockname()); a,_=s.accept(); a.sendall(b\"ok\"); assert c.recv(2)==b\"ok\"; a.close(); c.close(); s.close()'",
         );
         let report = fixture.run(10);
         assert_eq!(

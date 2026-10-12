@@ -22,6 +22,64 @@ fn literal(value: &str) -> String {
 
 /// The control directory (logs, sentinels, manifests) is deliberately unwritable.
 pub fn profile(project: &Path, home: &Path, temp: &Path, tag: &str) -> String {
+    render(
+        project,
+        home,
+        temp,
+        tag,
+        &[project.to_path_buf()],
+        &[],
+        true,
+    )
+}
+
+/// Real-workspace mode grants writes only to enumerated output paths. Host
+/// project sockets are never owned just because they are below the cwd.
+pub fn confined_profile(
+    project: &Path,
+    home: &Path,
+    temp: &Path,
+    tag: &str,
+    writable: &[std::path::PathBuf],
+    protected: &[std::path::PathBuf],
+) -> String {
+    render(project, home, temp, tag, writable, protected, false)
+}
+
+fn render(
+    project: &Path,
+    home: &Path,
+    temp: &Path,
+    tag: &str,
+    writable: &[std::path::PathBuf],
+    protected: &[std::path::PathBuf],
+    cloned: bool,
+) -> String {
+    let writes = writable
+        .iter()
+        .map(|p| format!("(subpath {})", literal(&p.to_string_lossy())))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let protected = protected
+        .iter()
+        .map(|p| {
+            format!(
+                "(deny file-write* (subpath {}) (with message {}))",
+                literal(&p.to_string_lossy()),
+                literal(tag)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let project_sockets = if cloned {
+        format!(
+            "(local unix-socket (subpath {})) (remote unix-socket (subpath {}))",
+            literal(&project.to_string_lossy()),
+            literal(&project.to_string_lossy())
+        )
+    } else {
+        String::new()
+    };
     let git = literal(&project.join(".git").to_string_lossy());
     let project = literal(&project.to_string_lossy());
     let home = literal(&home.to_string_lossy());
@@ -83,18 +141,19 @@ pub fn profile(project: &Path, home: &Path, temp: &Path, tag: &str) -> String {
     (literal "/private/etc/services") (literal "/private/etc/protocols"))))
 (deny file-write* (with message {tag})
   (require-not (require-any
-    (subpath {project}) (subpath {home}) (subpath {temp})
+    {writes} (subpath {home}) (subpath {temp})
     (literal "/dev/null") (literal "/dev/dtracehelper")
     (regex #"^/dev/tty[^/]*$"))))
 (deny file-write* (subpath {git}) (with message {tag}))
+(deny file-link (with message {tag}))
+{protected}
 (deny network* (with message {tag}))
 (allow network-inbound (local ip "localhost:*"))
 (allow network-bind (local ip "localhost:*"))
 (allow network-inbound network-outbound
-  (local unix-socket (subpath {project}))
+  {project_sockets}
   (local unix-socket (subpath {home}))
   (local unix-socket (subpath {temp}))
-  (remote unix-socket (subpath {project}))
   (remote unix-socket (subpath {home}))
   (remote unix-socket (subpath {temp})))
 (deny appleevent-send user-preference-write (with message {tag}))

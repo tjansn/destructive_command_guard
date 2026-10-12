@@ -162,6 +162,11 @@ pub struct HookInput {
     /// every hook protocol keeps its own allow encoding. Raw JSON value for
     /// the same parse-robustness reason as `permission_mode`.
     pub dcg_explicit_verdict: Option<serde_json::Value>,
+    /// Capability advertised only by a bridge that applies rewritten input.
+    pub dcg_input_rewrite: Option<serde_json::Value>,
+    /// Original object retained best-effort without changing parse behavior.
+    #[serde(skip)]
+    pub raw_tool_input: Option<serde_json::Value>,
 
     /// Command strings displaced by a *conflicting* snake_case/camelCase alias
     /// pair in the raw envelope (issue #410).
@@ -833,6 +838,43 @@ pub fn output_explicit_allow() -> io::Result<()> {
     deliver_verdict(EXPLICIT_ALLOW_VERDICT)
 }
 
+/// Only documented mutating hosts may receive an execution rewrite. The
+/// explicit Pi capability prevents an older bridge from allowing the original.
+pub fn supports_confined_rewrite(input: &HookInput, protocol: HookProtocol, agent: &str) -> bool {
+    protocol == HookProtocol::ClaudeCompatible
+        && input.tool_name.as_deref() == Some("Bash")
+        && input.raw_tool_input.is_some()
+        && input.tool_calls.is_none()
+        && input.tool_call.is_none()
+        && input.tool_args.is_none()
+        && input.alias_conflict_commands.is_empty()
+        && (agent == "claude-code"
+            || (agent == "pi" && input.dcg_input_rewrite == Some(serde_json::Value::Bool(true))))
+}
+
+/// Preserve the complete tool object: Claude's updatedInput replaces it.
+pub fn confined_rewrite(input: &HookInput, rewritten: &str) -> Option<serde_json::Value> {
+    let mut updated = input.raw_tool_input.clone()?;
+    updated
+        .as_object_mut()?
+        .insert("command".to_owned(), serde_json::json!(rewritten));
+    Some(
+        serde_json::json!({"dcg_verdict": "confined", "hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "permissionDecision": "allow",
+            "permissionDecisionReason": "Run once under continuing confinement; no unconfined approval or learned grant.",
+            "updatedInput": updated
+        }}),
+    )
+}
+
+pub fn output_confined_rewrite(input: &HookInput, rewritten: &str) -> io::Result<()> {
+    let output = confined_rewrite(input, rewritten)
+        .ok_or_else(|| io::Error::other("original tool input unavailable"))?;
+    let mut bytes = serde_json::to_vec(&output)?;
+    bytes.push(b'\n');
+    deliver_verdict(&bytes)
+}
+
 /// Set once something has begun writing this process's single verdict
 /// document to stdout.
 static VERDICT_OUTPUT_CLAIMED: std::sync::atomic::AtomicBool =
@@ -1120,6 +1162,9 @@ pub fn parse_hook_input(json: &str) -> Result<HookInput, serde_json::Error> {
     let first_error = match serde_json::from_str::<HookInput>(json) {
         Ok(mut input) => {
             input.cursor_version = cursor_version_from_json_metadata(json);
+            input.raw_tool_input = serde_json::from_str::<serde_json::Value>(json)
+                .ok()
+                .and_then(|v| v.get("tool_input").filter(|v| v.is_object()).cloned());
             return Ok(input);
         }
         Err(err) => err,

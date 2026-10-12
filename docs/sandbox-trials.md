@@ -1,12 +1,95 @@
 # Sandboxed trials for unverified commands
 
+## Continuing confinement for finite commands
+
+On macOS, Claude Code and the updated pi bridge run eligible finite commands
+**once in the real workspace under continuing confinement**. This takes precedence
+over observational trials, including when static inspection already allows a finite
+command. No approval or learned entry is recorded. Definite static denials still
+block; unsupported dynamic script inspection alone can proceed under enforcement
+after the remaining rules pass.
+
+Claude Code receives `hookSpecificOutput.updatedInput`, preserving every original
+tool-input field except `command`, as specified in the
+[PreToolUse contract](https://code.claude.com/docs/en/hooks#pretooluse-decision-control).
+The pi bridge advertises rewrite support and mutates `event.input.command` in place,
+as permitted by pi's
+[tool-call event contract](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/extensions/types.ts).
+It fails closed if that mutation fails. A confined receipt is distinct from an
+ordinary allow receipt. An older pi bridge, Codex, OpenCode and other protocols keep
+the observational trial path; they never receive an assumed rewrite capability.
+
+The replacement invokes this dcg executable's `run --confined --request` entrypoint.
+A bounded base64url JSON envelope carries the command, cwd, shell, profile version
+and deadline. The original command is an argument to the fixed launcher, without
+shell interpolation while constructing the replacement. There is no unconfined
+fallback if setup or execution fails.
+
+Supported forms are explicit Node test/syntax inputs, system-shell syntax checks,
+finite tsc/eslint/biome commands and npm/pnpm/yarn test/check/lint/build scripts whose
+pre/main/post entrypoints meet the same contract. Chains, substitutions, background,
+watch, service-start and unsupported runner forms are excluded. This identifies
+runner intent, not guaranteed termination of arbitrary imported code; all runtime
+code and descendants remain subject to the kernel profile and resource bounds.
+
+Git discovery grants writes only to ignored paths. Absent `build`, `dist`, `target`,
+`.build`, `.cache` and `coverage` directories must also be ignored as whole directories.
+Tracked and non-ignored sources, `.git`, dcg state/executables and hook configuration
+remain unwritable. A writable ancestor containing protected data is excluded;
+symlink roots and existing hard links in writable trees fail setup, and creating
+hard links is denied. The per-run home and temp directories are writable. Project
+files are readable; the Part C credential, external-read, network and Mach boundaries
+continue to apply. Real-project Unix sockets are not considered owned by the run.
+Because Seatbelt does not prove TCP endpoint ownership, **all outbound TCP remains
+denied**, including exchanges with the run's own listener.
+
+The real environment is retained except for the following case-insensitive removals:
+
+- Names containing `TOKEN`, `KEY`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `COOKIE` or `AUTH`.
+- Prefixes `AWS_`, `AZURE_`, `GOOGLE_`, `GCP_`, `DCG_`, `DYLD_`, `LD_`, `BASH_FUNC_`,
+  `NPM_CONFIG_` and `GIT_CONFIG_`.
+- `NODE_OPTIONS`, `NODE_PATH`, `NODE_REPL_EXTERNAL_MODULE`, `BASH_ENV`, `ENV`,
+  `ZDOTDIR`, `PYTHONPATH`, `PYTHONHOME`, `RUBYOPT`, `RUBYLIB`, `PERL5OPT`, `PERL5LIB`,
+  `PHP_INI_SCAN_DIR`, `PHPRC`, `SSH_AGENT_PID`, `SSH_AUTH_SOCK`, `DOCKER_HOST`,
+  `KUBECONFIG`, `OPENSSL_CONF` and `OPENSSL_MODULES`.
+
+`HOME`, `USERPROFILE`, `CFFIXED_USER_HOME`, the four XDG home variables and
+`TMPDIR`/`TMP`/`TEMP` point into the disposable run directory. npm is forced offline
+with update notification disabled. Values such as `DATA_DIR` remain real inputs,
+but do not expand filesystem permissions. This name-based credential filter cannot
+identify secrets placed in arbitrary innocuous variable names.
+
+The command's exit status and stdout/stderr are returned; observed kernel denials
+are appended as `[dcg:confined-denial]` with operation and target. Reporting limits
+use `[dcg:confined-limit]`. Both enforcement canaries must pass before execution.
+After execution a failed subscriber does not discard the actual result. The bounded
+one-second log drain improves reporting but cannot guarantee delivery of every
+asynchronous kernel report; enforcement does not depend on those reports.
+When the command itself reports `EPERM`/`EACCES`, a separate notice points to its
+preserved output. This is untrusted program text, never a synthetic kernel
+observation or evidence for an approval. Native fixtures check the denied syscall
+and target in the kernel report or the real Node error, as well as the failing
+status and unchanged victims.
+
+Runtime is capped at the configured trial deadline and 600 seconds, including setup.
+The hook also reserves five seconds below Claude's millisecond tool deadline
+(120 seconds by default) or pi's optional deadline in seconds. Timeout returns 124
+after terminating the process group. Each output stream retains at most 8 MiB;
+CPU, descriptors and per-file output are bounded. Explicit background modes are
+unsupported. A process deliberately escaping its group still inherits confinement,
+but is outside the cleanup guarantee. An externally killed supervisor can likewise
+prevent orderly cleanup; this is not a service lifecycle implementation.
+
 ## Static inspection outcomes and finite inputs
 
 Hook denials identify `definite-dangerous-operation`, `unsupported-dynamic`,
 `analysis-limit`, or `review-unavailable-or-cancelled`. Claude receives `outcomeCode`;
 strict protocols retain their schemas and carry `[dcg:<code>]` in the reason. Robot
-`dcg test` output includes `outcome_code`. Incomplete inspection does not advertise
-a command-only code or broad rule allowlist as a remedy.
+`dcg test` output includes `outcome_code`. Incomplete script-file inspection does not
+advertise an ineffective command-only code or broad rule allowlist as a remedy.
+The existing tar-helper exact-command human exception remains available because
+that gate consumes it; its diagnostic still identifies unresolved dynamic input,
+and does not present the exception as static verification.
 
 Interpreter argument roles distinguish executable, syntax-only and startup sources.
 Native Node `--check` and system shell `-n` do not scan their data operands for
@@ -32,7 +115,8 @@ timed-out command: it can only supply a definite finding or preserve incompleten
 
 Sandboxed trials resolve supported file-backed commands whose static
 inspection is incomplete, starting with `heredoc.script_files.unverified`.
-They do not override definite destructive matches. The hook waits while dcg
+They do not override definite destructive matches. On protocols without input
+rewriting, or for commands outside the finite contract, the hook waits while dcg
 observes a run in a disposable copy of the project, then checks the remaining
 rules before allowing the real command.
 

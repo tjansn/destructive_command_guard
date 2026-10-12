@@ -624,6 +624,88 @@ fn finite_node_test_selection_rechecks_changed_test_bytes() {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn finite_hook_rewrites_only_capable_hosts_and_never_executes_during_the_hook() {
+    use destructive_command_guard::confined::Request;
+    let fixture = Fixture::new();
+    fixture.write(
+        "once.test.js",
+        "require('node:fs').writeFileSync('executed-marker', 'ran');\n",
+    );
+    for (agent, capable, rewrite) in [
+        ("claude-code", false, true),
+        ("pi", true, true),
+        ("pi", false, false),
+        ("codex-cli", false, false),
+        ("opencode", false, false),
+    ] {
+        let mut input = json!({"tool_name":"Bash", "tool_input":{"command":"node --test once.test.js", "description":"preserve me", "timeout":600_000}, "cwd":fixture.root, "dcg_explicit_verdict":true, "dcg_input_rewrite":capable});
+        if agent == "codex-cli" {
+            input["turn_id"] = json!("confined-fixture");
+        }
+        let mut child = fixture.command().args(["--agent", agent]).spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            output["dcg_verdict"],
+            if rewrite { "confined" } else { "allow" },
+            "{agent}: {output}"
+        );
+        if rewrite {
+            let updated = &output["hookSpecificOutput"]["updatedInput"];
+            assert_eq!(updated["description"], "preserve me");
+            assert_eq!(updated["timeout"], 600_000);
+            let words = shell_words::split(updated["command"].as_str().unwrap()).unwrap();
+            let request = Request::decode(words.last().unwrap()).unwrap();
+            assert_eq!(request.command, "node --test once.test.js");
+            assert_eq!(request.cwd, fixture.root);
+        }
+        assert!(!fixture.root.join("executed-marker").exists());
+        assert!(!fixture.root.join("home/.config/dcg/trials").exists());
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn definite_findings_cannot_be_hidden_by_a_finite_rewrite() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "danger.test.js",
+        "require('child_process').execSync('git reset --hard');\n",
+    );
+    let input = json!({"tool_name":"Bash","tool_input":{"command":"node --test danger.test.js"},"cwd":fixture.root});
+    let mut child = fixture
+        .command()
+        .args(["--agent", "claude-code"])
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.to_string().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        output["hookSpecificOutput"]["permissionDecision"], "deny",
+        "{output}"
+    );
+    assert!(output["hookSpecificOutput"].get("updatedInput").is_none());
+}
+
 #[test]
 fn finite_node_imports_resolve_relative_to_the_importing_file() {
     let fixture = Fixture::new();

@@ -2347,6 +2347,14 @@ fn main() {
         .then(destructive_command_guard::desktop_review::ReviewCapture::start);
     let mut decisive: Option<ResolvedCommandOutcome> = None;
     let mut primary_allow_row: Option<Box<CommandEntry>> = None;
+    let confined_command = command.clone();
+    let rewrite_eligible = cfg!(target_os = "macos")
+        && trial_eligible
+        && hook::supports_confined_rewrite(
+            &hook_input,
+            hook_protocol,
+            cli.agent.as_deref().unwrap_or(history_agent_type),
+        );
 
     for (index, (entry_command, entry_dialect)) in std::iter::once((command, shell_dialect))
         .chain(additional_commands)
@@ -2381,6 +2389,27 @@ fn main() {
                 }
             }
         }
+    }
+
+    if rewrite_eligible
+        && let Some(invocation) = confined_invocation(
+            &eval_context,
+            decisive.as_ref(),
+            &confined_command,
+            shell_dialect,
+            &hook_input,
+        )
+    {
+        // The host executes this replacement once. Do not trial, learn or
+        // emit an ordinary allow receipt for the original command.
+        let delivered = hook::output_confined_rewrite(&hook_input, &invocation);
+        drop(history_writer);
+        finish_hook_mode(if delivered.is_ok() {
+            EXIT_SUCCESS
+        } else {
+            EXIT_DENIED
+        });
+        return;
     }
 
     tracing::debug!(
@@ -2504,6 +2533,81 @@ fn main() {
     // flush the audit row first.
     drop(history_writer);
     finish_hook_mode(exit_code);
+}
+
+fn confined_invocation(
+    ctx: &HookEvalContext<'_>,
+    outcome: Option<&ResolvedCommandOutcome>,
+    command: &str,
+    dialect: ShellDialect,
+    input: &hook::HookInput,
+) -> Option<String> {
+    use destructive_command_guard::{confined, trial};
+    let cwd = ctx.scope_base?;
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
+        || !confined::eligible(command, cwd)
+    {
+        return None;
+    }
+    if let Some(outcome) = outcome {
+        let ResolvedCommandOutcome::DenyFamily(resolved) = outcome else {
+            return None;
+        };
+        if !resolved.result.pattern_info.as_ref().is_some_and(|info| {
+            trial::eligible(info)
+                && destructive_command_guard::inspection::outcome(
+                    info.pack_id.as_deref(),
+                    info.pattern_name.as_deref(),
+                    &info.reason,
+                ) == destructive_command_guard::inspection::Outcome::Dynamic
+        }) {
+            return None;
+        }
+        let relaxed = ctx.allowlists.with_rule_grants(
+            trial::TRIAL_RULES,
+            "resolve only unverified scripts under confinement",
+            "confined-run",
+        );
+        let deadline = Deadline::new(Duration::from_millis(
+            ctx.config.effective_hook_timeout_ms(),
+        ));
+        let residual = HookEvalContext {
+            allowlists: &relaxed,
+            deadline: &deadline,
+            ..*ctx
+        };
+        if !matches!(
+            resolve_hook_command(&residual, command, dialect, None),
+            ResolvedCommandOutcome::Allow(_)
+        ) {
+            return None;
+        }
+    }
+    let tool = input.raw_tool_input.as_ref()?;
+    if tool
+        .get("run_in_background")
+        .is_some_and(|v| v != &serde_json::Value::Bool(false))
+        || tool
+            .get("tty")
+            .is_some_and(|v| v != &serde_json::Value::Bool(false))
+    {
+        return None;
+    }
+    let shell = match tool.get("shell") {
+        Some(value) => PathBuf::from(value.as_str()?),
+        None => trial::default_shell(),
+    };
+    if !matches!(shell.to_str(), Some("/bin/bash" | "/bin/sh" | "/bin/zsh")) {
+        return None;
+    }
+    let timeout = confined::tool_timeout(
+        ctx.config.trial.timeout_secs,
+        tool.get("timeout"),
+        input.dcg_input_rewrite.as_ref() == Some(&serde_json::Value::Bool(true)),
+    )?;
+    confined::Request::new(command, cwd, &shell, timeout)
+        .invocation(&std::env::current_exe().ok()?)
+        .ok()
 }
 
 fn assess_filesystem_outcome(

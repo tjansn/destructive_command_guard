@@ -194,6 +194,18 @@ pub(crate) fn classify(
             }
             continue;
         }
+        if node
+            && [
+                "--test-name-pattern=",
+                "--test-skip-pattern=",
+                "--test-concurrency=",
+                "--test-timeout=",
+            ]
+            .iter()
+            .any(|option| arg.starts_with(option))
+        {
+            continue;
+        }
         if arg.starts_with('-') || arg.starts_with('+') {
             if language == ScriptLanguage::Bash
                 && arg.starts_with("--")
