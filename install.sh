@@ -2003,6 +2003,98 @@ HERMES_BACKUP=""
 COPILOT_HOOK_FILE=""
 COPILOT_FAILURE_REASON=""
 
+trial_hook_timeout_seconds() {
+  if command -v python3 >/dev/null 2>&1; then
+    "$DEST/dcg" config --format json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    config = json.load(sys.stdin)
+    trial = config.get("trial", {})
+    enabled = trial.get("enabled", True) and config.get("heredoc", {}).get("scan_script_files", False)
+    print(min(int(trial.get("timeout_secs", 600)) + 180, 2**64 - 1) if enabled else 0)
+except (ValueError, TypeError):
+    print(780)
+'
+  else
+    printf '780\n'
+  fi
+}
+
+# Refresh existing generated hook entries after the per-agent mergers, including
+# their "already installed" paths. Keep longer operator deadlines and other hooks.
+refresh_trial_hook_timeouts() {
+  local trial_timeout
+  trial_timeout=$(trial_hook_timeout_seconds)
+  [ "$trial_timeout" -gt 0 ] || return 0
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "Cannot refresh agent trial deadlines without python3; run dcg install before using trials."
+    return 0
+  fi
+  python3 - "$trial_timeout" "$CLAUDE_SETTINGS" "$GEMINI_SETTINGS" "$CODEX_SETTINGS" \
+    "${COPILOT_HOOK_FILE:-}" "$POSIT_ASSISTANT_SETTINGS" "$HERMES_CONFIG" <<'PYEOF'
+import json
+import os
+import shlex
+import stat
+import sys
+import tempfile
+
+seconds = int(sys.argv[1])
+
+def invokes_dcg(command):
+    if not isinstance(command, str):
+        return False
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    return bool(words) and os.path.basename(words[0]) in ("dcg", "dcg.exe")
+
+def update(value, timeout, field):
+    changed = False
+    if isinstance(value, dict):
+        if any(invokes_dcg(value.get(key)) for key in ("command", "bash", "powershell", "commandWindows")):
+            previous = value.get(field)
+            if not isinstance(previous, int) or previous < timeout:
+                value[field] = timeout
+                changed = True
+        for child in value.values():
+            changed = update(child, timeout, field) or changed
+    elif isinstance(value, list):
+        for child in value:
+            changed = update(child, timeout, field) or changed
+    return changed
+
+for index, name in enumerate(sys.argv[2:]):
+    if not name or not os.path.isfile(name):
+        continue
+    path = os.path.realpath(name)
+    try:
+        with open(path) as source:
+            if index == 5:
+                import yaml
+                settings = yaml.safe_load(source)
+            else:
+                settings = json.load(source)
+        if not isinstance(settings, dict):
+            continue
+        timeout = min(seconds * 1000, 2**64 - 1) if index == 1 else seconds
+        field = "timeoutSec" if index == 3 else "timeout"
+        if not update(settings.get("hooks", {}), timeout, field):
+            continue
+        content = yaml.safe_dump(settings, sort_keys=False) if index == 5 else json.dumps(settings, indent=2) + "\n"
+        with tempfile.NamedTemporaryFile(mode="w", dir=os.path.dirname(path), prefix=".dcg-timeout-", delete=False) as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+            os.chmod(output.name, stat.S_IMODE(os.stat(path).st_mode))
+        os.replace(output.name, path)
+    except Exception as error:
+        print("dcg: could not refresh trial timeout in %s: %s" % (name, error), file=sys.stderr)
+PYEOF
+  info "Agent hook deadlines allow sandbox trials (${trial_timeout}s); raise shell/tool deadlines too and restart agents."
+}
+
 configure_claude_code() {
   local settings_file="$1"
   local cleanup_predecessor="$2"
@@ -2742,6 +2834,10 @@ configure_codex() {
   # See: https://developers.openai.com/codex/hooks
 
   local settings_file="$CODEX_SETTINGS"
+  # Ask the installed binary for its effective trial configuration. Agent hook
+  # deadlines are independent of dcg's static evaluator deadline.
+  local codex_trial_timeout
+  codex_trial_timeout=$(trial_hook_timeout_seconds)
   CODEX_FAILURE_REASON=""
   local settings_dir
   settings_dir=$(dirname "$settings_file")
@@ -2774,7 +2870,7 @@ configure_codex() {
     # path must still fall through to the merge path so it can be updated.
     if command -v python3 >/dev/null 2>&1; then
       local codex_hook_state
-      codex_hook_state=$(python3 - "$settings_file" "$DEST/dcg" <<'PYEOF'
+      codex_hook_state=$(python3 - "$settings_file" "$DEST/dcg" "$codex_trial_timeout" <<'PYEOF'
 import json
 import os
 import shlex
@@ -2782,6 +2878,7 @@ import sys
 
 hooks_file = sys.argv[1]
 dcg_path = sys.argv[2]
+trial_timeout = int(sys.argv[3])
 
 def is_dcg_command(cmd):
     if not isinstance(cmd, str) or not cmd:
@@ -2819,6 +2916,7 @@ if "PreToolUse" in hooks_obj and not isinstance(pre_tool_use, list):
     raise SystemExit(0)
 
 dcg_commands = []
+trial_timeout_current = True
 first_bash_hook_command = None
 first_bash_matcher_seen = False
 for entry in pre_tool_use:
@@ -2836,8 +2934,11 @@ for entry in pre_tool_use:
     for hook in hooks:
         if isinstance(hook, dict) and is_dcg_command(hook.get("command")):
             dcg_commands.append(hook.get("command"))
+            timeout = hook.get("timeout", 0)
+            if trial_timeout and (not isinstance(timeout, int) or timeout < trial_timeout):
+                trial_timeout_current = False
 
-if dcg_commands == [dcg_path] and first_bash_hook_command == dcg_path:
+if dcg_commands == [dcg_path] and first_bash_hook_command == dcg_path and trial_timeout_current:
     print("already")
 else:
     print("merge")
@@ -2863,7 +2964,7 @@ PYEOF
     cp "$settings_file" "$CODEX_BACKUP"
 
     if command -v python3 >/dev/null 2>&1; then
-      if python3 - "$settings_file" "$DEST/dcg" <<'PYEOF'
+      if python3 - "$settings_file" "$DEST/dcg" "$codex_trial_timeout" <<'PYEOF'
 import json
 import os
 import shlex
@@ -2871,6 +2972,7 @@ import sys
 
 hooks_file = sys.argv[1]
 dcg_path = sys.argv[2]
+trial_timeout = int(sys.argv[3])
 
 def is_dcg_command(cmd):
     """True iff `cmd` invokes the dcg binary (basename match, not substring)."""
@@ -2916,6 +3018,7 @@ elif not isinstance(config['hooks']['PreToolUse'], list):
 bash_hooks = []
 new_pre_tool_use = []
 dcg_seen = False
+previous_timeout = None
 
 for entry in config['hooks']['PreToolUse']:
     if not isinstance(entry, dict):
@@ -2932,6 +3035,9 @@ for entry in config['hooks']['PreToolUse']:
                     bash_hooks.append(hook)
                 else:
                     dcg_seen = True
+                    timeout = hook.get('timeout')
+                    if isinstance(timeout, int):
+                        previous_timeout = max(previous_timeout or 0, timeout)
             else:
                 bash_hooks.append(hook)
     else:
@@ -2940,6 +3046,8 @@ for entry in config['hooks']['PreToolUse']:
 # Add exactly one dcg hook at the beginning. Existing dcg hooks, including stale
 # paths or duplicates, are intentionally collapsed here.
 dcg_hook = {"type": "command", "command": dcg_path}
+if trial_timeout or previous_timeout is not None:
+    dcg_hook['timeout'] = max(trial_timeout, previous_timeout or 0)
 if dcg_seen or not any(
     is_dcg_command(h.get('command', ''))
     for h in bash_hooks
@@ -2978,6 +3086,10 @@ PYEOF
     fi
   else
     # Create new hooks.json file
+    local codex_timeout_field=""
+    if [ "$codex_trial_timeout" -gt 0 ]; then
+      codex_timeout_field=", \"timeout\": $codex_trial_timeout"
+    fi
     cat > "$settings_file" <<EOFSET
 {
   "hooks": {
@@ -2987,7 +3099,7 @@ PYEOF
         "hooks": [
           {
             "type": "command",
-            "command": "$DEST/dcg"
+            "command": "$DEST/dcg"$codex_timeout_field
           }
         ]
       }
@@ -3270,6 +3382,10 @@ PYEOF
 # dcg-cursor-hook: generated by dcg installer
 PYEOF
     printf 'DCG_BIN_FALLBACK = %s\n' "$dcg_path_literal"
+    local cursor_trial_timeout
+    cursor_trial_timeout=$(trial_hook_timeout_seconds)
+    [ "$cursor_trial_timeout" -gt 0 ] || cursor_trial_timeout=30
+    printf 'DCG_HOOK_TIMEOUT_SECONDS = %s\n' "$cursor_trial_timeout"
     cat <<'PYEOF'
 import json
 import os
@@ -3384,7 +3500,7 @@ def main():
             input=json.dumps(hook_input).encode("utf-8"),
             capture_output=True,
             env=env,
-            timeout=30,
+            timeout=DCG_HOOK_TIMEOUT_SECONDS,
         )
     except (FileNotFoundError, PermissionError, NotADirectoryError) as err:
         # dcg could not be started at all: fail open so a broken install does
@@ -4454,6 +4570,7 @@ if [ "$NO_CONFIGURE" -eq 0 ]; then
   # A refusal/failure is a terminal OMP_STATUS state rendered in the summary;
   # do not let `set -e` erase that truthful result or abort other install work.
   configure_omp || true
+  refresh_trial_hook_timeouts
 else
   info "Skipping agent configuration (--no-configure)"
 fi

@@ -241,6 +241,13 @@ pub enum Command {
         action: AllowlistAction,
     },
 
+    /// Run or inspect sandboxed trials of commands that need verification
+    #[command(name = "trial")]
+    Trial {
+        #[command(subcommand)]
+        action: TrialAction,
+    },
+
     /// Add a rule to the allowlist (shortcut for `allowlist add`)
     #[command(name = "allow")]
     Allow {
@@ -2002,6 +2009,22 @@ pub enum ExplainFormat {
     Json,
 }
 
+/// Manual sandbox-trial commands.
+#[derive(Subcommand, Debug)]
+pub enum TrialAction {
+    /// Verify a command in a disposable sandboxed project copy
+    Run {
+        /// Command string, or executable and arguments after `--`
+        #[arg(required = true, num_args = 1.., last = true)]
+        command: Vec<String>,
+    },
+    /// Show the content-limited summary of a recent trial
+    Show {
+        /// Trial ID printed with the verdict
+        id: String,
+    },
+}
+
 /// Allowlist subcommand actions
 #[derive(Subcommand, Debug)]
 pub enum AllowlistAction {
@@ -2715,6 +2738,19 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Allowlist { action }) => {
             handle_allowlist_command(action, config.allowlist.auto_prune_expired)?;
         }
+        Some(Command::Trial { action }) => match action {
+            TrialAction::Run { command } => {
+                let command = trial_command_line(&command);
+                let cwd = std::env::current_dir()?;
+                println!("{}", crate::trial::run_manual(&command, &cwd, &config)?);
+            }
+            TrialAction::Show { id } => {
+                let summary = crate::trial_store::TrialStore::user()?
+                    .show(&id)?
+                    .ok_or_else(|| format!("No stored trial found for '{id}'"))?;
+                println!("{summary}");
+            }
+        },
         Some(Command::Allow {
             rule_id,
             reason,
@@ -6990,6 +7026,7 @@ fn show_config_json(config: &Config, sources: &[ConfigSourceOutcome]) {
             "fail_open_on_timeout": heredoc.fallback_on_timeout,
             "languages": languages,
         },
+        "trial": config.trial,
         "overrides": {
             "allow": config.overrides.allow,
             "block": config.overrides.block,
@@ -13223,6 +13260,79 @@ fn claude_dcg_hook() -> std::io::Result<serde_json::Value> {
     claude_dcg_hook_for_executable(&current_dcg_executable()?)
 }
 
+/// Agent deadlines include the trial and desktop-review margin. This does
+/// not change the evaluator's independent static-analysis deadline.
+fn trial_hook_timeout(config: &Config) -> Option<u64> {
+    (config.trial.enabled && config.heredoc_settings().scan_script_files)
+        .then(|| config.trial.hook_timeout_secs())
+}
+
+fn raise_trial_hook_timeouts(settings: &mut serde_json::Value, seconds: Option<u64>) -> bool {
+    let Some(seconds) = seconds else {
+        return false;
+    };
+    settings
+        .get_mut("hooks")
+        .is_some_and(|hooks| raise_registered_trial_timeouts(hooks, seconds, "timeout"))
+}
+
+fn trial_hook_timeouts_current(settings: &serde_json::Value, seconds: Option<u64>) -> bool {
+    let mut checked = settings.clone();
+    !raise_trial_hook_timeouts(&mut checked, seconds)
+}
+
+fn raise_registered_trial_timeouts(
+    value: &mut serde_json::Value,
+    timeout: u64,
+    field: &str,
+) -> bool {
+    match value {
+        serde_json::Value::Array(entries) => {
+            let mut changed = false;
+            for entry in entries {
+                changed = raise_registered_trial_timeouts(entry, timeout, field) || changed;
+            }
+            changed
+        }
+        serde_json::Value::Object(object) => {
+            let own_hook = ["command", "bash", "powershell", "commandWindows"]
+                .iter()
+                .any(|key| {
+                    object
+                        .get(*key)
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(is_dcg_command)
+                });
+            let mut changed = if own_hook
+                && object
+                    .get(field)
+                    .and_then(serde_json::Value::as_u64)
+                    .is_none_or(|value| value < timeout)
+            {
+                object.insert(field.to_string(), serde_json::json!(timeout));
+                true
+            } else {
+                false
+            };
+            for child in object.values_mut() {
+                changed = raise_registered_trial_timeouts(child, timeout, field) || changed;
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn print_trial_timeout_hint(config: &Config) {
+    if let Some(seconds) = trial_hook_timeout(config) {
+        eprintln!(
+            "dcg: sandbox trials may take {}s; hook timeout is at least {seconds}s. \
+             Set the agent's shell/tool timeout to at least {seconds}s too (including Claude Code Bash and the pi bridge).",
+            config.trial.timeout_secs
+        );
+    }
+}
+
 fn antigravity_dcg_hook() -> std::io::Result<serde_json::Value> {
     claude_dcg_hook_for_executable(&current_dcg_executable()?)
 }
@@ -13679,7 +13789,8 @@ fn install_hook_silent(force: bool) -> Result<bool, Box<dyn std::error::Error>> 
         serde_json::json!({})
     };
 
-    let changed = install_dcg_hook_into_settings(&mut settings, force)?;
+    let config = Config::load();
+    let changed = install_dcg_hook_into_settings_with_trial(&mut settings, force, &config)?;
     if changed {
         let content = serde_json::to_string_pretty(&settings)?;
         std::fs::write(&settings_path, content)?;
@@ -13720,6 +13831,16 @@ fn install_dcg_hook_into_settings(
         LEGACY_CLAUDE_SHELL_MATCHERS,
         desired_hook,
     )
+}
+
+fn install_dcg_hook_into_settings_with_trial(
+    settings: &mut serde_json::Value,
+    force: bool,
+    config: &Config,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let installed = install_dcg_hook_into_settings(settings, force)?;
+    let timeout_changed = raise_trial_hook_timeouts(settings, trial_hook_timeout(config));
+    Ok(installed || timeout_changed)
 }
 
 fn install_antigravity_hook_into_settings(
@@ -13794,7 +13915,12 @@ fn install_hook(force: bool, project: bool) -> Result<(), Box<dyn std::error::Er
         serde_json::json!({})
     };
 
-    let changed = install_dcg_hook_into_settings(&mut settings, force)?;
+    let config = Config::load();
+    let changed = install_dcg_hook_into_settings_with_trial(&mut settings, force, &config)?;
+    if !project {
+        repair_codex_trial_timeout_at(&codex_hooks_json_path(), &config)?;
+    }
+    print_trial_timeout_hint(&config);
 
     // A stale PowerShell `$PROFILE` check (written by an older install.ps1)
     // can misread the hook command this binary writes and warn "Hook missing"
@@ -13885,6 +14011,9 @@ fn install_grok_hook(force: bool, project: bool) -> Result<(), Box<dyn std::erro
     };
 
     if hook_path.exists() && !force {
+        let config = Config::load();
+        repair_codex_trial_timeout_at(&hook_path, &config)?;
+        print_trial_timeout_hint(&config);
         println!(
             "{} Grok hook already exists at {}",
             "Hook already installed!".yellow(),
@@ -13898,7 +14027,10 @@ fn install_grok_hook(force: bool, project: bool) -> Result<(), Box<dyn std::erro
         std::fs::create_dir_all(parent)?;
     }
 
-    let body = build_grok_hook_config()?;
+    let mut body = build_grok_hook_config()?;
+    let config = Config::load();
+    raise_trial_hook_timeouts(&mut body, trial_hook_timeout(&config));
+    print_trial_timeout_hint(&config);
     let content = serde_json::to_string_pretty(&body)?;
     std::fs::write(&hook_path, content)?;
 
@@ -13967,7 +14099,11 @@ fn install_antigravity_hook(force: bool, project: bool) -> Result<(), Box<dyn st
         serde_json::json!({})
     };
 
-    let changed = install_antigravity_hook_into_settings(&mut settings, force)?;
+    let installed = install_antigravity_hook_into_settings(&mut settings, force)?;
+    let config = Config::load();
+    let timeout_changed = raise_trial_hook_timeouts(&mut settings, trial_hook_timeout(&config));
+    let changed = installed || timeout_changed;
+    print_trial_timeout_hint(&config);
     if !changed {
         println!("{}", "Hook already installed!".yellow());
         println!("Use --force to reinstall");
@@ -14320,7 +14456,10 @@ fn install_crush_hook_at(
         serde_json::json!({})
     };
 
-    let changed = install_crush_hook_into_config(&mut config, force, crush_dcg_hook_entry()?)?;
+    let installed = install_crush_hook_into_config(&mut config, force, crush_dcg_hook_entry()?)?;
+    let timeout_changed =
+        raise_trial_hook_timeouts(&mut config, trial_hook_timeout(&Config::load()));
+    let changed = installed || timeout_changed;
     if changed {
         let content = serde_json::to_string_pretty(&config)?;
         std::fs::write(config_path, content)?;
@@ -14713,7 +14852,12 @@ fn install_reasonix_hook_at(
         serde_json::json!({})
     };
     let entry = reasonix_dcg_hook_entry_for_executable(&current_dcg_executable()?, cfg!(windows))?;
-    let changed = install_reasonix_hook_into_settings(&mut settings, force, entry)?;
+    let installed = install_reasonix_hook_into_settings(&mut settings, force, entry)?;
+    let timeout_changed = raise_trial_hook_timeouts(
+        &mut settings,
+        trial_hook_timeout(&Config::load()).map(|seconds| seconds.saturating_mul(1000)),
+    );
+    let changed = installed || timeout_changed;
     if changed {
         std::fs::write(path, serde_json::to_string_pretty(&settings)?)?;
     }
@@ -14861,6 +15005,16 @@ fn executable_javascript_literal(executable: &std::path::Path) -> std::io::Resul
 }
 
 fn build_opencode_plugin_source(executable: &std::path::Path) -> std::io::Result<String> {
+    build_opencode_plugin_source_with_timeout(
+        executable,
+        trial_hook_timeout(&Config::load()).map_or(10_000, |seconds| seconds.saturating_mul(1000)),
+    )
+}
+
+fn build_opencode_plugin_source_with_timeout(
+    executable: &std::path::Path,
+    timeout_ms: u64,
+) -> std::io::Result<String> {
     let path_literal = executable_javascript_literal(executable)?;
     Ok(format!(
         r#"// {OPENCODE_PLUGIN_MARKER}: generated by `dcg install --opencode` — do not edit.
@@ -14925,7 +15079,7 @@ function dcgDenyReason(command) {{
       input: JSON.stringify({{ tool_name: "Bash", tool_input: {{ command }}, dcg_explicit_verdict: true }}),
       encoding: "utf8",
       env: {{ ...process.env, OPENCODE: "1" }},
-      timeout: 10000,
+      timeout: {timeout_ms},
     }});
   }} catch (err) {{
     console.error(`[dcg] OpenCode guard could not run dcg: ${{err}}`);
@@ -15552,6 +15706,7 @@ pub(crate) const OMP_CHILD_PIPE_DRAIN_GRACE_MS: u64 = 250;
 /// windows cover signal/reap propagation plus one bounded post-exit drain; if
 /// the exit capability itself never settles, this outer watchdog still closes
 /// the local observation boundary.
+#[cfg(test)]
 pub(crate) const OMP_CHILD_OBSERVATION_TIMEOUT_MS: u64 =
     OMP_CHILD_EVALUATION_TIMEOUT_MS + 2 * OMP_CHILD_PIPE_DRAIN_GRACE_MS;
 
@@ -15830,8 +15985,26 @@ fn project_omp_extension_path() -> std::io::Result<std::path::PathBuf> {
 /// and receives the real cwd as `--command-cwd` (#504). A
 /// separate generous parent-side ceiling kills a pathologically wedged child;
 /// it does not replace dcg's own configurable evaluation deadline.
+#[cfg(test)]
 fn build_omp_extension_source(executable: &std::path::Path) -> std::io::Result<String> {
+    build_omp_extension_source_with_timeout(executable, OMP_CHILD_EVALUATION_TIMEOUT_MS)
+}
+
+fn build_omp_extension_source_for_config(executable: &std::path::Path) -> std::io::Result<String> {
+    build_omp_extension_source_with_timeout(
+        executable,
+        trial_hook_timeout(&Config::load()).map_or(OMP_CHILD_EVALUATION_TIMEOUT_MS, |seconds| {
+            seconds.saturating_mul(1000)
+        }),
+    )
+}
+
+fn build_omp_extension_source_with_timeout(
+    executable: &std::path::Path,
+    child_timeout_ms: u64,
+) -> std::io::Result<String> {
     let path_literal = executable_javascript_literal(executable)?;
+    let observation_timeout_ms = child_timeout_ms.saturating_add(2 * OMP_CHILD_PIPE_DRAIN_GRACE_MS);
     Ok(format!(
         r#"// {OMP_EXTENSION_MARKER}: generated by `dcg install --omp` — do not edit.
 // Routes every Oh My Pi bash tool call through dcg (Destructive Command Guard)
@@ -15848,9 +16021,9 @@ import {{ extractLeadingCdTarget }} from "@oh-my-pi/pi-coding-agent/tools/shell-
 // absolute dcg pathname. It does not attest the bytes later resolved there;
 // ambient environment must not redirect the pathname.
 const DCG_BIN = {path_literal};
-const DCG_CHILD_TIMEOUT_MS = {OMP_CHILD_EVALUATION_TIMEOUT_MS};
+const DCG_CHILD_TIMEOUT_MS = {child_timeout_ms};
 export const DCG_CHILD_PIPE_DRAIN_GRACE_MS = {OMP_CHILD_PIPE_DRAIN_GRACE_MS};
-export const DCG_CHILD_OBSERVATION_TIMEOUT_MS = {OMP_CHILD_OBSERVATION_TIMEOUT_MS};
+export const DCG_CHILD_OBSERVATION_TIMEOUT_MS = {observation_timeout_ms};
 export const DCG_STDOUT_MAX_BYTES = {OMP_CHILD_STDOUT_MAX_BYTES};
 export const DCG_STDERR_MAX_BYTES = {OMP_CHILD_STDERR_MAX_BYTES};
 export const DCG_STDIN_CHUNK_CODE_UNITS = {OMP_CHILD_STDIN_CHUNK_CODE_UNITS};
@@ -16641,7 +16814,7 @@ fn registered_omp_extension() -> std::io::Result<OmpExtensionRegistration> {
     // start and load either extension.
     let _validated_profile = omp_active_profile()?;
     let executable = current_dcg_executable()?;
-    let expected_source = build_omp_extension_source(&executable)?;
+    let expected_source = build_omp_extension_source_for_config(&executable)?;
 
     let project_path = project_omp_extension_path()?;
     let project_state = inspect_omp_extension(&project_path, &expected_source)?;
@@ -16764,7 +16937,7 @@ fn install_opencode_plugin(force: bool, project: bool) -> Result<(), Box<dyn std
             )
             .into());
         }
-        if !force {
+        if !force && probe_opencode_plugin(&plugin_path) == OpencodePluginProbe::Current {
             println!("{}", "Plugin already installed!".yellow());
             println!("Use --force to reinstall");
             return Ok(());
@@ -16772,7 +16945,12 @@ fn install_opencode_plugin(force: bool, project: bool) -> Result<(), Box<dyn std
     }
 
     let executable = current_dcg_executable()?;
-    let source = build_opencode_plugin_source(&executable)?;
+    let config = Config::load();
+    let source = build_opencode_plugin_source_with_timeout(
+        &executable,
+        trial_hook_timeout(&config).map_or(10_000, |seconds| seconds.saturating_mul(1000)),
+    )?;
+    print_trial_timeout_hint(&config);
 
     if let Some(parent) = plugin_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -16823,7 +17001,10 @@ fn install_omp_extension(
             )
             .into());
         }
-        if !force {
+        if !force
+            && existing
+                == build_omp_extension_source_for_config(&current_dcg_executable()?)?.as_bytes()
+        {
             if announce {
                 println!("{}", "OMP extension already installed!".yellow());
                 println!("Use --force to reinstall");
@@ -16833,7 +17014,10 @@ fn install_omp_extension(
     }
 
     let executable = current_dcg_executable()?;
-    let source = build_omp_extension_source(&executable)?;
+    let source = build_omp_extension_source_for_config(&executable)?;
+    if announce {
+        print_trial_timeout_hint(&Config::load());
+    }
     if let Some(parent) = extension_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -18221,12 +18405,149 @@ pub fn ensure_hook_registered_for_agent(agent: &crate::agent::Agent) {
 fn ensure_hook_registered_inner(
     agent: &crate::agent::Agent,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::load();
+    // Native integrations also retain their original Claude-compatible hook.
+    // Refreshing their own trial deadline supplements that established repair
+    // path; it must not redirect or suppress it (including CLAUDE_CONFIG_DIR).
     let settings_path = match agent {
         crate::agent::Agent::ClaudeCode | crate::agent::Agent::Unknown => claude_settings_path(),
         _ => default_claude_settings_path(),
     };
     let lock_path = self_heal_lock_path(&settings_path);
-    ensure_hook_registered_at(&settings_path, &lock_path)
+    ensure_hook_registered_at_with_timeout(
+        &settings_path,
+        &lock_path,
+        trial_hook_timeout(&config),
+    )?;
+    if let Some(home) = crate::config::home_dir() {
+        let extra_host = match agent {
+            crate::agent::Agent::GeminiCli => {
+                Some((home.join(".gemini/settings.json"), "timeout", 1000, false))
+            }
+            crate::agent::Agent::CopilotCli => Some((
+                std::env::var_os("COPILOT_HOME")
+                    .map_or_else(|| home.join(".copilot"), std::path::PathBuf::from)
+                    .join("hooks/dcg.json"),
+                "timeoutSec",
+                1,
+                false,
+            )),
+            crate::agent::Agent::PositAssistant => Some((
+                home.join(".posit/assistant/settings.json"),
+                "timeout",
+                1,
+                false,
+            )),
+            crate::agent::Agent::Hermes => Some((
+                std::env::var_os("HERMES_HOME")
+                    .map_or_else(|| home.join(".hermes"), std::path::PathBuf::from)
+                    .join("config.yaml"),
+                "timeout",
+                1,
+                true,
+            )),
+            _ => None,
+        };
+        if let Some((path, field, units, yaml)) = extra_host {
+            return repair_registered_trial_timeout_at(&path, &config, field, units, yaml);
+        }
+    }
+    if matches!(agent, crate::agent::Agent::CodexCli) {
+        return repair_codex_trial_timeout_at(&codex_hooks_json_path(), &config);
+    }
+    if matches!(agent, crate::agent::Agent::Grok) {
+        return repair_codex_trial_timeout_at(&grok_user_hook_path(), &config);
+    }
+    if matches!(agent, crate::agent::Agent::Antigravity) {
+        return repair_codex_trial_timeout_at(&antigravity_hooks_path(), &config);
+    }
+    if matches!(
+        agent,
+        crate::agent::Agent::Crush | crate::agent::Agent::Reasonix
+    ) {
+        let (path, timeout) = if matches!(agent, crate::agent::Agent::Reasonix) {
+            (
+                reasonix_user_settings_path(),
+                trial_hook_timeout(&config).map(|value| value.saturating_mul(1000)),
+            )
+        } else {
+            (crush_user_config_path(), trial_hook_timeout(&config))
+        };
+        if path.exists() && timeout.is_some() {
+            let mut settings = if matches!(agent, crate::agent::Agent::Reasonix) {
+                read_reasonix_settings(&path)?
+            } else {
+                read_crush_config(&path)?
+            };
+            if raise_trial_hook_timeouts(&mut settings, timeout) {
+                write_settings_atomic(&path, &serde_json::to_string_pretty(&settings)?)?;
+            }
+        }
+        return Ok(());
+    }
+    if matches!(agent, crate::agent::Agent::Omp) {
+        if let OmpExtensionRegistration::OwnedUnhealthy { project, .. } =
+            registered_omp_extension()?
+        {
+            refresh_loaded_owned_omp_extensions(project, false)?;
+        }
+        return Ok(());
+    }
+    if matches!(agent, crate::agent::Agent::OpenCode) {
+        let path = opencode_user_plugin_path();
+        if probe_opencode_plugin(&path) == OpencodePluginProbe::OwnedStale {
+            write_settings_atomic(
+                &path,
+                &build_opencode_plugin_source(&current_dcg_executable()?)?,
+            )?;
+        }
+        return Ok(());
+    }
+    Ok(())
+}
+
+/// Update only registered dcg command hooks; never create a Codex trust entry.
+fn repair_codex_trial_timeout_at(
+    path: &std::path::Path,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error>> {
+    repair_registered_trial_timeout_at(path, config, "timeout", 1, false)
+}
+
+fn repair_registered_trial_timeout_at(
+    path: &std::path::Path,
+    config: &Config,
+    field: &str,
+    units: u64,
+    yaml: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(timeout) = trial_hook_timeout(config) else {
+        return Ok(());
+    };
+    if !path.exists() {
+        return Ok(());
+    }
+    let lock_path = self_heal_lock_path(path);
+    let Some(_lock) = try_acquire_self_heal_lock(&lock_path)? else {
+        return Ok(());
+    };
+    let content = std::fs::read_to_string(path)?;
+    let mut settings: serde_json::Value = if yaml {
+        serde_yaml::from_str(&content)?
+    } else {
+        serde_json::from_str(&content)?
+    };
+    if let Some(hooks) = settings.get_mut("hooks")
+        && raise_registered_trial_timeouts(hooks, timeout.saturating_mul(units), field)
+    {
+        let content = if yaml {
+            serde_yaml::to_string(&settings)?
+        } else {
+            serde_json::to_string_pretty(&settings)?
+        };
+        write_settings_atomic(path, &content)?;
+    }
+    Ok(())
 }
 
 /// Path to the advisory lock file that serializes concurrent self-heal
@@ -18397,9 +18718,18 @@ fn copy_file_permissions(
 
 /// Path-parameterized core of `ensure_hook_registered_inner` (separated for
 /// testability against an isolated settings/lock location).
+#[cfg(test)]
 fn ensure_hook_registered_at(
     settings_path: &std::path::Path,
     lock_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_hook_registered_at_with_timeout(settings_path, lock_path, None)
+}
+
+fn ensure_hook_registered_at_with_timeout(
+    settings_path: &std::path::Path,
+    lock_path: &std::path::Path,
+    timeout_secs: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !settings_path.exists() {
         // No settings.json at all — nothing to heal. The user hasn't run
@@ -18413,7 +18743,9 @@ fn ensure_hook_registered_at(
     // the common case on every hook invocation, so it stays a read + parse.
     let content = std::fs::read_to_string(settings_path)?;
     let settings: serde_json::Value = serde_json::from_str(&content)?;
-    if settings_has_exact_dcg_hook(&settings, &desired_hook) {
+    if settings_has_exact_dcg_hook(&settings, &desired_hook)
+        && trial_hook_timeouts_current(&settings, timeout_secs)
+    {
         return Ok(());
     }
 
@@ -18429,12 +18761,16 @@ fn ensure_hook_registered_at(
     // snapshot (a concurrent healer may have already repaired the file).
     let content = std::fs::read_to_string(settings_path)?;
     let mut settings: serde_json::Value = serde_json::from_str(&content)?;
-    if settings_has_exact_dcg_hook(&settings, &desired_hook) {
+    if settings_has_exact_dcg_hook(&settings, &desired_hook)
+        && trial_hook_timeouts_current(&settings, timeout_secs)
+    {
         return Ok(());
     }
 
     // Hook was removed or still uses a stale/PATH-dependent command — repair it.
-    let changed = install_dcg_hook_into_settings(&mut settings, false)?;
+    let installed = install_dcg_hook_into_settings(&mut settings, false)?;
+    let timeout_changed = raise_trial_hook_timeouts(&mut settings, timeout_secs);
+    let changed = installed || timeout_changed;
     if changed {
         let new_content = serde_json::to_string_pretty(&settings)?;
         write_settings_atomic(settings_path, &new_content)?;
@@ -19063,6 +19399,13 @@ fn allowlist_path_for_layer(layer: AllowlistLayer) -> std::path::PathBuf {
         ),
         AllowlistLayer::User => crate::allowlist::user_allowlist_path(),
         AllowlistLayer::System => crate::config::system_config_dir().join("allowlist.toml"),
+    }
+}
+
+fn trial_command_line(words: &[String]) -> String {
+    match words {
+        [command] => command.clone(),
+        _ => shell_words::join(words),
     }
 }
 
@@ -20023,6 +20366,17 @@ fn allowlist_add_command_with_paths(
     Ok(())
 }
 
+fn selected_trial_entries(
+    project_only: bool,
+) -> std::io::Result<Vec<crate::trial_store::VerifiedTrial>> {
+    let mut entries = crate::trial_store::TrialStore::user()?.list()?;
+    if project_only {
+        let root = crate::trial_store::project_root(&std::env::current_dir()?)?;
+        entries.retain(|entry| entry.project_root == root);
+    }
+    Ok(entries)
+}
+
 /// List allowlist entries.
 fn allowlist_list(
     project_only: bool,
@@ -20032,6 +20386,7 @@ fn allowlist_list(
     use colored::Colorize;
 
     let inspected = inspect_allowlist_layers(project_only, user_only);
+    let trial_entries = selected_trial_entries(project_only)?;
     let mut all_entries: Vec<(AllowlistLayer, std::path::PathBuf, AllowEntry, bool)> = Vec::new();
 
     for inspection in &inspected {
@@ -20066,7 +20421,7 @@ fn allowlist_list(
                 println!();
             }
 
-            if all_entries.is_empty() {
+            if all_entries.is_empty() && trial_entries.is_empty() {
                 println!("{}", "No allowlist entries found.".yellow());
                 return Ok(());
             }
@@ -20115,9 +20470,20 @@ fn allowlist_list(
                 println!("    File: {}", path.display());
                 println!();
             }
+            for entry in &trial_entries {
+                println!(
+                    "  verified_trial:{} [user, project-bound]",
+                    entry.fingerprint
+                );
+                println!("    Command: {}", entry.command);
+                println!("    Project: {}", entry.project_root.display());
+                println!("    Verified by {} on {}", entry.source, entry.created_at);
+                println!("    Summary: {}", entry.summary);
+                println!();
+            }
         }
         AllowlistOutputFormat::Json => {
-            let json_entries: Vec<serde_json::Value> = all_entries
+            let mut json_entries: Vec<serde_json::Value> = all_entries
                 .iter()
                 .map(|(layer, path, entry, effective)| {
                     let selector = match &entry.selector {
@@ -20147,6 +20513,14 @@ fn allowlist_list(
                     })
                 })
                 .collect();
+            for entry in &trial_entries {
+                let mut json = serde_json::to_value(entry)?;
+                json["layer"] = serde_json::json!("user");
+                json["selector"] = serde_json::json!({
+                    "type": "verified_trial", "value": entry.fingerprint,
+                });
+                json_entries.push(json);
+            }
 
             println!("{}", serde_json::to_string_pretty(&json_entries)?);
         }
@@ -20161,6 +20535,19 @@ fn allowlist_remove(
     layer: AllowlistLayer,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
+
+    if let Some(fingerprint) = rule_id.strip_prefix("verified_trial:") {
+        let selected = selected_trial_entries(layer == AllowlistLayer::Project)?;
+        if !selected
+            .iter()
+            .any(|entry| entry.fingerprint == fingerprint)
+            || !crate::trial_store::TrialStore::user()?.remove(fingerprint)?
+        {
+            return Err(format!("Verified trial '{fingerprint}' was not found").into());
+        }
+        println!("Removed verified trial {fingerprint}");
+        return Ok(());
+    }
 
     ensure_allowlist_layer_is_writable(layer)?;
 
@@ -20316,6 +20703,11 @@ fn allowlist_prune(
 
     let inactive_project_inspection = project_only && dry_run && !project_allowlist_is_trusted();
     let pruned = prune_allowlist_layers(project_only, user_only, dry_run)?;
+    let project_root = project_only
+        .then(|| crate::trial_store::project_root(&std::env::current_dir()?))
+        .transpose()?;
+    let trials_pruned =
+        crate::trial_store::TrialStore::user()?.prune_at(project_root.as_deref(), dry_run)?;
 
     match format {
         AllowlistOutputFormat::Pretty => {
@@ -20327,19 +20719,24 @@ fn allowlist_prune(
                 );
                 println!();
             }
-            if pruned.is_empty() {
+            if pruned.is_empty() && trials_pruned == 0 {
                 println!("{}", "No expired allowlist entries found.".green());
                 return Ok(());
             }
 
             let action = if dry_run { "Would prune" } else { "Pruned" };
-            println!(
-                "{} {} expired allowlist entr{}",
-                "✓".green(),
-                action,
-                if pruned.len() == 1 { "y" } else { "ies" }
-            );
-            println!();
+            if trials_pruned > 0 {
+                println!("{action} {trials_pruned} stale verified trial entries");
+            }
+            if !pruned.is_empty() {
+                println!(
+                    "{} {} expired allowlist entr{}",
+                    "✓".green(),
+                    action,
+                    if pruned.len() == 1 { "y" } else { "ies" }
+                );
+                println!();
+            }
 
             for entry in &pruned {
                 println!(
@@ -20391,7 +20788,8 @@ fn allowlist_prune(
                 } else {
                     "not_selected"
                 },
-                "pruned": entries.len(),
+                "pruned": entries.len() + trials_pruned,
+                "verified_trials_pruned": trials_pruned,
                 "entries": entries,
             });
             println!("{}", serde_json::to_string_pretty(&output)?);
@@ -30979,6 +31377,141 @@ exclude = ["target/**"]
                     .find(|hook| hook["command"].as_str().is_some_and(is_dcg_command))
             })
             .expect("a dcg hook under the canonical matcher")
+    }
+
+    #[test]
+    fn trial_cli_preserves_shell_string_and_argument_boundaries() {
+        let parsed = Cli::try_parse_from(["dcg", "trial", "run", "--", "npm", "test", "--watch"])
+            .expect("trial run parses trailing command flags");
+        let Some(Command::Trial {
+            action: TrialAction::Run { command },
+        }) = parsed.command
+        else {
+            panic!("expected trial run");
+        };
+        assert_eq!(trial_command_line(&command), "npm test --watch");
+        assert_eq!(
+            trial_command_line(&["printf '%s' \"$HOME\"".into()]),
+            "printf '%s' \"$HOME\""
+        );
+        let words = vec!["printf".into(), "%s".into(), "a b; echo unwanted".into()];
+        assert_eq!(
+            shell_words::split(&trial_command_line(&words)).unwrap(),
+            words
+        );
+        assert!(Cli::try_parse_from(["dcg", "trial", "run", "--"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["dcg", "trial", "show", "trial-123"]).unwrap().command,
+            Some(Command::Trial { action: TrialAction::Show { id } }) if id == "trial-123"
+        ));
+    }
+
+    #[test]
+    fn trial_timeouts_raise_only_dcg_preserve_larger_and_disable_cleanly() {
+        let mut settings = serde_json::json!({"hooks": {"PreToolUse": [{
+            "matcher": "Bash", "hooks": [
+                {"type": "command", "command": "dcg", "timeout": 10},
+                {"type": "command", "command": "/opt/dcg --desktop-review", "timeout": 900},
+                {"type": "command", "command": "other", "timeout": 5}
+            ]
+        }]}});
+        let original = settings.clone();
+        assert!(!raise_trial_hook_timeouts(&mut settings, None));
+        assert_eq!(settings, original);
+        assert!(raise_trial_hook_timeouts(&mut settings, Some(780)));
+        let hooks = settings["hooks"]["PreToolUse"][0]["hooks"]
+            .as_array()
+            .unwrap();
+        assert_eq!(hooks[0]["timeout"], 780);
+        assert_eq!(hooks[1]["timeout"], 900);
+        assert_eq!(hooks[2]["timeout"], 5);
+        assert!(!raise_trial_hook_timeouts(&mut settings, Some(780)));
+        for mut empty in [serde_json::json!({}), serde_json::Value::Null] {
+            let original = empty.clone();
+            assert!(!raise_trial_hook_timeouts(&mut empty, Some(780)));
+            assert_eq!(empty, original);
+        }
+    }
+
+    #[test]
+    fn trial_timeout_install_and_self_heal_use_temporary_settings() {
+        let mut config = Config::default();
+        assert_eq!(trial_hook_timeout(&config), None);
+        config.heredoc.scan_script_files = Some(true);
+        config.trial.timeout_secs = 42;
+        let mut settings = serde_json::json!({});
+        assert!(install_dcg_hook_into_settings_with_trial(&mut settings, false, &config).unwrap());
+        assert_eq!(canonical_dcg_hook(&settings)["timeout"], 222);
+        assert!(!install_dcg_hook_into_settings_with_trial(&mut settings, false, &config).unwrap());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let lock = dir.path().join("selfheal.lock");
+        std::fs::write(&path, serde_json::to_vec(&settings).unwrap()).unwrap();
+        ensure_hook_registered_at_with_timeout(&path, &lock, Some(780)).unwrap();
+        let healed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(canonical_dcg_hook(&healed)["timeout"], 780);
+
+        config.trial.enabled = false;
+        assert_eq!(trial_hook_timeout(&config), None);
+        let original = settings.clone();
+        assert!(!install_dcg_hook_into_settings_with_trial(&mut settings, false, &config).unwrap());
+        assert_eq!(settings, original);
+    }
+
+    #[test]
+    fn trial_opencode_timeout_uses_milliseconds() {
+        let source = build_opencode_plugin_source_with_timeout(
+            std::path::Path::new("/opt/bin/dcg"),
+            780_000,
+        )
+        .unwrap();
+        assert!(source.contains("timeout: 780000,"));
+        assert!(source.contains("tool.execute.before"));
+    }
+
+    #[test]
+    fn trial_other_hosts_preserve_timeout_units_and_unrelated_hooks() {
+        for timeout in [780, 780_000] {
+            let mut settings = serde_json::json!({"hooks": {"PreToolUse": [
+                {"command": "/opt/dcg", "timeout": 5},
+                {"command": "other", "timeout": 5}
+            ]}});
+            assert!(raise_trial_hook_timeouts(&mut settings, Some(timeout)));
+            assert_eq!(settings["hooks"]["PreToolUse"][0]["timeout"], timeout);
+            assert_eq!(settings["hooks"]["PreToolUse"][1]["timeout"], 5);
+            assert!(!raise_trial_hook_timeouts(&mut settings, Some(timeout)));
+        }
+        let mut copilot = serde_json::json!({"preToolUse": [
+            {"bash": "\"/opt/dcg\"", "timeoutSec": 30},
+            {"powershell": "other", "timeoutSec": 20}
+        ]});
+        assert!(raise_registered_trial_timeouts(
+            &mut copilot,
+            780,
+            "timeoutSec"
+        ));
+        assert_eq!(copilot["preToolUse"][0]["timeoutSec"], 780);
+        assert_eq!(copilot["preToolUse"][1]["timeoutSec"], 20);
+        let mut hermes = serde_json::json!({"pre_tool_call": [
+            {"command": "dcg", "timeout": 900}
+        ]});
+        assert!(!raise_registered_trial_timeouts(
+            &mut hermes,
+            780,
+            "timeout"
+        ));
+    }
+
+    #[test]
+    fn trial_omp_observation_deadline_follows_the_child_timeout() {
+        let source =
+            build_omp_extension_source_with_timeout(std::path::Path::new("/opt/bin/dcg"), 780_000)
+                .unwrap();
+        assert!(source.contains("const DCG_CHILD_TIMEOUT_MS = 780000;"));
+        assert!(source.contains("export const DCG_CHILD_OBSERVATION_TIMEOUT_MS = 780500;"));
+        assert!(source.contains("timeout: DCG_CHILD_TIMEOUT_MS,"));
     }
 
     #[test]
