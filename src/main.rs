@@ -2354,7 +2354,7 @@ fn main() {
                 cli.agent.as_deref().unwrap_or(history_agent_type),
             );
         let mut review_unavailable = if !cli.desktop_review {
-            heredoc_settings.scan_script_files.then_some(
+            (heredoc_settings.scan_script_files || hook_protocol == hook::HookProtocol::Codex).then_some(
                 "Desktop-Freigabe nicht gestartet: --desktop-review fehlt im aktiven Hook-Aufruf.",
             )
         } else if !desktop_review_eligible {
@@ -2487,8 +2487,16 @@ fn attempt_sandbox_trial(
     };
     let residual = resolve_hook_command(&residual_ctx, &command, dialect, None);
     if !matches!(residual, ResolvedCommandOutcome::Allow(_)) {
-        *outcome = residual;
-        return false;
+        // A warning/log result must never replace the unresolved denial and
+        // accidentally release the command before a trial has verified it.
+        // Definite blocking rules retain their own identity and review path.
+        if matches!(&residual, ResolvedCommandOutcome::DenyFamily(other)
+            if matches!(other.mode, DecisionMode::Deny | DecisionMode::Ask))
+        {
+            *outcome = residual;
+            return false;
+        }
+        return true;
     }
     let shell_value = input
         .tool_input

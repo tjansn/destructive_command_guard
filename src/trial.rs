@@ -68,7 +68,6 @@ pub fn execution_location(command: &str, cwd: &Path) -> (PathBuf, String) {
 
 /// A detached job has no finite readiness/lifecycle proof. Its shell exiting
 /// does not establish that the service completed a representative workload.
-#[cfg(any(target_os = "macos", test))]
 fn background_job(command: &str) -> bool {
     let ast = ast_grep_core::AstGrep::new(command, ast_grep_language::SupportLang::Bash);
     let mut pending = vec![ast.root()];
@@ -706,6 +705,10 @@ pub fn run(
         clone_method: "not started".to_owned(),
         artifact_dir: None,
     };
+    if background_job(command) {
+        report.observations.issues.push("Background service/job was not started: readiness, port ownership and a complete lifecycle cannot be established by a finite trial. Exact-version desktop review is required".to_owned());
+        return report;
+    }
     if let Err(error) = run_inner(
         command,
         fingerprint,
@@ -848,9 +851,6 @@ fn run_inner(
         display_text(&crate::redaction::redact_secrets(command), None),
         config.timeout_secs
     );
-    if background_job(command) {
-        report.observations.issues.push("Background service/job: readiness, port ownership and complete lifecycle were not verified; no automatic approval".to_owned());
-    }
     let started = Instant::now();
     let mut child = Command::new("/usr/bin/sandbox-exec");
     let (_, execution_command) = execution_location(command, &fingerprint.cwd);
