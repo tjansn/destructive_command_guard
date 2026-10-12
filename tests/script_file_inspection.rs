@@ -559,3 +559,192 @@ fn independent_task_shells_do_not_share_directory_changes() {
     );
     fixture.denied("make build");
 }
+
+fn version_review_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    let mut config = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&fixture.config)
+        .expect("open temporary policy");
+    writeln!(config, "\n[trial]\nenabled = false").expect("disable trial execution");
+    fixture.write("home/.config/dcg/.fixture", "");
+    fixture
+}
+
+fn version_review_hook(fixture: &Fixture, candidate: &str) -> (Output, Value) {
+    let home = fixture.root.join("home");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dcg"))
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("TMPDIR", &fixture.root)
+        .env("TEMP", &fixture.root)
+        .env("TMP", &fixture.root)
+        .env("DCG_CONFIG", &fixture.config)
+        .env("DCG_SELF_HEAL_HOOK", "0")
+        .env("DCG_HISTORY_DISABLED", "1")
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_HOOK_TIMEOUT_MS", "30000")
+        .env(
+            "DCG_PENDING_EXCEPTIONS_PATH",
+            fixture.root.join("pending.jsonl"),
+        )
+        .env("DCG_ALLOW_ONCE_PATH", fixture.root.join("allow-once.jsonl"))
+        .env("NO_COLOR", "1")
+        .args(["--agent", "claude-code"])
+        .current_dir(&fixture.root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run isolated hook without trials or desktop review");
+    child
+        .stdin
+        .take()
+        .expect("hook stdin")
+        .write_all(
+            json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": candidate},
+                "cwd": fixture.root,
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("send candidate as inert hook data");
+    let output = child.wait_with_output().expect("hook response");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let verdict = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{error}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    (output, verdict)
+}
+
+fn assert_version_review_denial(fixture: &Fixture, candidate: &str) {
+    let (output, verdict) = version_review_hook(fixture, candidate);
+    let denial = &verdict["hookSpecificOutput"];
+    assert_eq!(denial["permissionDecision"], "deny", "{verdict}");
+    assert_eq!(
+        denial["ruleId"], "heredoc.script_files:unverified",
+        "{verdict}"
+    );
+    for field in ["allowOnceCode", "allowOnceFullHash", "remediation"] {
+        assert!(
+            denial.get(field).is_none(),
+            "ineffective {field}: {verdict}"
+        );
+    }
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("dcg trial run"), "{text}");
+    assert!(!text.contains("dcg allow-once"), "{text}");
+    assert!(!text.contains("allowlist add-command"), "{text}");
+    assert!(
+        !text.contains("have them run the command manually"),
+        "{text}"
+    );
+    assert!(!fixture.root.join("pending.jsonl").exists());
+    assert!(
+        !fixture
+            .root
+            .join("home/.config/dcg/verified_trials.json")
+            .exists()
+    );
+}
+
+#[test]
+fn unverified_hook_offers_version_review_without_an_ineffective_code() {
+    let fixture = version_review_fixture();
+    assert_version_review_denial(&fixture, "python3 -m dcg_fixture_inspection");
+}
+
+#[test]
+fn unverified_hook_does_not_consume_legacy_command_only_approval() {
+    use destructive_command_guard::logging::RedactionConfig;
+    use destructive_command_guard::pending_exceptions::{
+        AllowOnceEntry, AllowOnceScopeKind, PendingExceptionRecord,
+    };
+
+    let fixture = version_review_fixture();
+    let candidate = "python3 -m dcg_fixture_inspection";
+    let now = chrono::Utc::now();
+    let redaction = RedactionConfig::default();
+    let cwd = fixture.root.to_string_lossy();
+    let pending = PendingExceptionRecord::new(
+        now,
+        &cwd,
+        candidate,
+        "legacy review",
+        &redaction,
+        true,
+        None,
+    );
+    let entry = AllowOnceEntry::from_pending(
+        &pending,
+        now,
+        AllowOnceScopeKind::Project,
+        &cwd,
+        true,
+        false,
+        &redaction,
+    );
+    let bytes = format!("{}\n", serde_json::to_string(&entry).unwrap());
+    fixture.write("allow-once.jsonl", &bytes);
+
+    for _ in 0..2 {
+        assert_version_review_denial(&fixture, candidate);
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("allow-once.jsonl")).unwrap(),
+            bytes
+        );
+    }
+}
+
+#[test]
+fn unverified_hook_command_allowlist_cannot_hide_a_destructive_sibling() {
+    let fixture = version_review_fixture();
+    let candidate = "python3 -m dcg_fixture_inspection; git reset --hard";
+    fixture.write(
+        "home/.config/dcg/allowlist.toml",
+        format!(
+            "[[allow]]\ncommand = {}\nreason = 'legacy command-only review'\n",
+            serde_json::to_string(candidate).unwrap(),
+        ),
+    );
+    assert_version_review_denial(&fixture, candidate);
+}
+
+#[test]
+fn definite_git_denial_retains_its_supported_allow_once_code() {
+    let fixture = version_review_fixture();
+    let (_output, verdict) = version_review_hook(&fixture, "git reset --hard");
+    let denial = &verdict["hookSpecificOutput"];
+    assert_eq!(denial["permissionDecision"], "deny", "{verdict}");
+    assert_eq!(denial["ruleId"], "core.git:reset-hard", "{verdict}");
+    assert!(
+        denial["allowOnceCode"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "{verdict}"
+    );
+    assert!(
+        denial["remediation"]["allowOnceCommand"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("dcg allow-once ")),
+        "{verdict}"
+    );
+    assert!(fixture.root.join("pending.jsonl").is_file());
+}

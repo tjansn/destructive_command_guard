@@ -109,10 +109,21 @@ enum FileFormat {
 
 fn unverified(reason: &str) -> EvaluationResult {
     crate::desktop_review::record_incomplete();
-    EvaluationResult::denied_by_embedded_sink(
+    let mut result = EvaluationResult::denied_by_embedded_sink(
         "heredoc.script_files.unverified",
         &format!("Script-file inspection incomplete: {reason}"),
-    )
+    );
+    if let Some(info) = result.pattern_info.as_mut() {
+        info.explanation = Some(
+            "Static inspection could not establish the executable sources. A sandbox trial \
+             or desktop review must verify this exact project, command and source version. \
+             Enable sandbox trials and use a hook invoked with --desktop-review for \
+             inconclusive results; `dcg trial run -- '<command>'` provides a manual sandbox \
+             check. Command-only exceptions do not resolve this inspection boundary."
+                .to_owned(),
+        );
+    }
+    result
 }
 
 /// Inspect every recognized executable file reference. The callback runs the
@@ -123,6 +134,7 @@ pub(crate) fn evaluate(
     dialect: ShellDialect,
     nonlocal: bool,
     deadline: Option<&Deadline>,
+    resolve_unverified: bool,
     mut evaluate_source: impl FnMut(&str, &Path, ScriptLanguage) -> EvaluationResult,
 ) -> Option<EvaluationResult> {
     let _scope = InspectionScope::enter();
@@ -139,7 +151,7 @@ pub(crate) fn evaluate(
     }
     let references = match references(command, deadline) {
         Ok(references) => references,
-        Err(reason) => return Some(unverified(&reason)),
+        Err(reason) => return (!resolve_unverified).then(|| unverified(&reason)),
     };
     let mut first_warning = None;
     let mut first_denial = None;
@@ -157,6 +169,12 @@ pub(crate) fn evaluate(
         };
         let result = inspect_reference(&reference, cwd, &mut evaluate_source);
         match result {
+            Ok(Some(ref result))
+                if resolve_unverified
+                    && result
+                        .pattern_info
+                        .as_ref()
+                        .is_some_and(crate::trial::eligible) => {}
             Ok(Some(result)) if result.decision != EvaluationDecision::Allow => {
                 first_denial.get_or_insert(result);
             }
@@ -164,7 +182,10 @@ pub(crate) fn evaluate(
                 first_warning.get_or_insert(result);
             }
             Ok(_) => {}
-            Err(reason) => return Some(unverified(&reason)),
+            Err(reason) if !resolve_unverified => {
+                return first_denial.or_else(|| Some(unverified(&reason)));
+            }
+            Err(_) => {}
         }
     }
     if deadline.is_exceeded() {
@@ -636,6 +657,7 @@ fn inspect_reference(
     } else {
         cwd.join(path)
     };
+    crate::desktop_review::record_source_path(&path);
     let mut prefix = PathBuf::new();
     for component in path.components() {
         prefix.push(component);

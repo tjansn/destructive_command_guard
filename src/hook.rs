@@ -187,6 +187,9 @@ pub struct ToolInput {
     /// Keep malformed values visible so scoping fails closed, not to the
     /// session directory where an unrelated safe namesake might exist.
     pub workdir: Option<serde_json::Value>,
+    /// Optional executable and interaction requirement from the tool payload.
+    pub shell: Option<serde_json::Value>,
+    pub tty: Option<serde_json::Value>,
 }
 
 /// Antigravity CLI (`agy`) tool-call envelope.
@@ -2998,11 +3001,14 @@ pub fn format_denial_message(
     // An external pack may author the closing instruction (#416): for a
     // redirect-style rule, "have the user run it by hand" is the wrong
     // recovery. The `BLOCKED` header, rule and reason stay dcg's.
-    let trailer = pack
-        .and_then(|pack_id| crate::packs::external_denial_trailer(pack_id, pattern))
-        .unwrap_or(
-            "If this operation is truly needed, ask the user for explicit permission and have them run the command manually.",
-        );
+    let trailer = if pack == Some("heredoc.script_files") && pattern == Some("unverified") {
+        "Retry through sandbox verification or desktop review for this exact version. The command remains blocked until verification succeeds."
+    } else {
+        pack.and_then(|pack_id| crate::packs::external_denial_trailer(pack_id, pattern))
+            .unwrap_or(
+                "If this operation is truly needed, ask the user for explicit permission and have them run the command manually.",
+            )
+    };
     let mut message = format_matched_message(
         "BLOCKED by dcg",
         command,

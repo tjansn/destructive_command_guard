@@ -35,6 +35,7 @@ struct ScriptEvidence {
 
 thread_local! {
     static EVIDENCE: RefCell<Option<Vec<ScriptEvidence>>> = const { RefCell::new(None) };
+    static SOURCE_PATHS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
     static INCOMPLETE: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -44,6 +45,7 @@ pub struct ReviewCapture;
 impl ReviewCapture {
     pub fn start() -> Self {
         EVIDENCE.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+        SOURCE_PATHS.with(|slot| slot.borrow_mut().clear());
         INCOMPLETE.with(|value| value.set(false));
         Self
     }
@@ -52,6 +54,7 @@ impl ReviewCapture {
     pub fn snapshot(&self) -> ReviewSnapshot {
         ReviewSnapshot {
             scripts: EVIDENCE.with(|slot| slot.borrow().clone().unwrap_or_default()),
+            source_paths: SOURCE_PATHS.with(|slot| slot.borrow().clone()),
             incomplete: INCOMPLETE.with(Cell::get),
         }
     }
@@ -60,6 +63,7 @@ impl ReviewCapture {
 impl Drop for ReviewCapture {
     fn drop(&mut self) {
         EVIDENCE.with(|slot| *slot.borrow_mut() = None);
+        SOURCE_PATHS.with(|slot| slot.borrow_mut().clear());
     }
 }
 
@@ -87,9 +91,23 @@ pub(crate) fn record_incomplete() {
     INCOMPLETE.with(|value| value.set(true));
 }
 
+/// Remember literal inputs even when opening them fails. Missing inputs cannot
+/// acquire a reusable approval for a different file created after the review.
+pub(crate) fn record_source_path(path: &Path) {
+    if EVIDENCE.with(|slot| slot.borrow().is_some()) {
+        SOURCE_PATHS.with(|slot| {
+            let mut paths = slot.borrow_mut();
+            if !paths.iter().any(|existing| existing == path) {
+                paths.push(path.to_path_buf());
+            }
+        });
+    }
+}
+
 /// No persistent approval is created: the caller may release only this request.
 pub struct ReviewSnapshot {
     scripts: Vec<ScriptEvidence>,
+    source_paths: Vec<PathBuf>,
     incomplete: bool,
 }
 
@@ -111,6 +129,16 @@ pub struct ReviewDescription {
 }
 
 impl ReviewSnapshot {
+    /// Inputs actually opened by static inspection, included in trial versions
+    /// even when they are ignored by Git or outside the project manifest.
+    pub fn resolved_paths(&self) -> Vec<PathBuf> {
+        self.source_paths
+            .iter()
+            .cloned()
+            .chain(self.scripts.iter().map(|item| item.path.clone()))
+            .collect()
+    }
+
     fn unchanged(&self) -> bool {
         self.scripts.iter().all(|item| {
             read_regular_source(&item.path)
@@ -259,6 +287,42 @@ impl ReviewSnapshot {
             && self.unchanged()
             && directory_identity(cwd).as_ref() == Some(&before)
     }
+}
+
+/// Review an inconclusive trial with its bounded observations.
+///
+/// Unlike a static
+/// review this explicitly asks the user to accept incomplete evidence. The
+/// caller must revalidate the exact-version fingerprint after authentication.
+pub fn request_trial(command: &str, cwd: &Path, summary: &str, agent: &str) -> bool {
+    let Some(_lock) = review_lock() else {
+        return false;
+    };
+    let Some(before) = directory_identity(cwd) else {
+        return false;
+    };
+    let text = format!(
+        "{}\n\nFreigabe trotz unvollständiger Sandbox-Prüfung? Die Freigabe gilt für diese exakte Befehls- und Projektversion bis eine geprüfte Datei geändert wird. Bei unklaren Folgen ablehnen.",
+        visible(summary)
+    );
+    if text.len() > MAX_REVIEW_TEXT {
+        return false;
+    }
+    let description = ReviewDescription {
+        agent: agent_label(agent),
+        host: None,
+        project: visible_inline(&cwd.file_name().unwrap_or_default().to_string_lossy()),
+        repository: repository_root(cwd).map(|p| visible_inline(&p.display().to_string())),
+        cwd: visible(&cwd.display().to_string()),
+        title: "Unvollständigen Sandbox-Test prüfen".to_owned(),
+        effect: "Der echte Befehl darf nach Freigabe außerhalb der Sandbox laufen.".to_owned(),
+        warning: Some("Ein einzelner Testlauf beweist keine allgemeine Sicherheit.".to_owned()),
+        command: visible(command),
+        targets: Vec::new(),
+        text,
+    };
+    native_dialog(&description, &format!("{:032x}", rand::random::<u128>()))
+        && directory_identity(cwd).as_ref() == Some(&before)
 }
 
 fn repository_root(cwd: &Path) -> Option<PathBuf> {
@@ -935,6 +999,7 @@ mod tests {
             crate::normalize::ShellDialect::Posix,
             false,
             None,
+            false,
             |_, _, _| crate::evaluator::EvaluationResult::denied_by_legacy("test finding"),
         );
         assert!(result.is_some());

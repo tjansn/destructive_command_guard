@@ -13828,6 +13828,9 @@ fn evaluate_command_in_single_dialect_view(
             shell_dialect,
             NonlocalFilesystemScope::active(),
             deadline,
+            allowlists
+                .match_rule_at_path("heredoc.script_files", "unverified", project_path)
+                .is_some(),
             |source, cwd, language| {
                 let mut settings = heredoc_settings.clone();
                 // Reentrant inspection shares one file/byte/depth budget.

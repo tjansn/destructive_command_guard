@@ -1603,7 +1603,10 @@ fn publish_decisive_response(
             // emitted WITHOUT a code — the block always stands.
             let mut allow_once_info: Option<hook::AllowOnceInfo> = None;
             let remaining = ctx.deadline.remaining().unwrap_or(Duration::ZERO);
-            if !remaining.is_zero() {
+            // Script-source uncertainty requires a version-bound trial/review.
+            // Its early inspection gate cannot consume ordinary command-only
+            // exceptions, so never issue a code that cannot resolve this denial.
+            if !destructive_command_guard::trial::eligible(info) && !remaining.is_zero() {
                 let budget = PersistBudget {
                     lock_wait: remaining.min(ALLOW_ONCE_LOCK_WAIT),
                     allow_maintenance: remaining > ALLOW_ONCE_MAINTENANCE_MIN_BUDGET,
@@ -2291,7 +2294,11 @@ fn main() {
         && additional_commands.is_empty()
         && hook_input.tool_calls.is_none()
         && heredoc_settings.scan_script_files;
-    let review_capture = desktop_review_eligible
+    let trial_eligible = config.trial.enabled
+        && additional_commands.is_empty()
+        && hook_input.tool_calls.is_none()
+        && heredoc_settings.scan_script_files;
+    let review_capture = (desktop_review_eligible || trial_eligible)
         .then(destructive_command_guard::desktop_review::ReviewCapture::start);
     let mut decisive: Option<ResolvedCommandOutcome> = None;
     let mut primary_allow_row: Option<Box<CommandEntry>> = None;
@@ -2336,8 +2343,20 @@ fn main() {
         "hook request resolved"
     );
     let exit_code = if let Some(mut outcome) = decisive {
+        let trial_handled = trial_eligible
+            && attempt_sandbox_trial(
+                &eval_context,
+                &mut outcome,
+                shell_dialect,
+                &hook_input,
+                review_capture.as_ref(),
+                desktop_review_eligible,
+                cli.agent.as_deref().unwrap_or(history_agent_type),
+            );
         let mut review_unavailable = if !cli.desktop_review {
-            Some("Desktop-Freigabe nicht gestartet: --desktop-review fehlt im aktiven Hook-Aufruf.")
+            heredoc_settings.scan_script_files.then_some(
+                "Desktop-Freigabe nicht gestartet: --desktop-review fehlt im aktiven Hook-Aufruf.",
+            )
         } else if !desktop_review_eligible {
             Some(
                 "Desktop-Freigabe nicht gestartet: mehrere Befehle im Hook-Aufruf oder Skriptprüfung deaktiviert.",
@@ -2349,7 +2368,7 @@ fn main() {
         } else {
             None
         };
-        let approved = review_capture.as_ref().is_some_and(|capture| {
+        let approved = matches!(outcome, ResolvedCommandOutcome::Allow(_)) || (desktop_review_eligible && !trial_handled && review_capture.as_ref().is_some_and(|capture| {
             let ResolvedCommandOutcome::DenyFamily(resolved) = &outcome else { return false };
             if !matches!(resolved.mode, DecisionMode::Deny | DecisionMode::Ask) {
                 return false;
@@ -2380,7 +2399,7 @@ fn main() {
                 ));
             }
             true
-        });
+        }));
         if approved {
             EXIT_SUCCESS
         } else {
@@ -2421,6 +2440,159 @@ fn main() {
     // flush the audit row first.
     drop(history_writer);
     finish_hook_mode(exit_code);
+}
+
+/// Trials resolve only their explicit rule grant. A fresh residual evaluation
+/// runs both before execution and on every cache hit; definite findings never
+/// reach the sandbox or inherit a version grant.
+fn attempt_sandbox_trial(
+    ctx: &HookEvalContext<'_>,
+    outcome: &mut ResolvedCommandOutcome,
+    dialect: ShellDialect,
+    input: &hook::HookInput,
+    capture: Option<&destructive_command_guard::desktop_review::ReviewCapture>,
+    desktop: bool,
+    agent: &str,
+) -> bool {
+    use destructive_command_guard::{desktop_review, trial, trial_store::TrialStore};
+    let ResolvedCommandOutcome::DenyFamily(resolved) = outcome else {
+        return false;
+    };
+    if !resolved
+        .result
+        .pattern_info
+        .as_ref()
+        .is_some_and(trial::eligible)
+    {
+        return false;
+    }
+    let Some(cwd) = ctx.scope_base else {
+        return false;
+    };
+    let command = resolved.command.clone();
+    let (execution_cwd, _) = trial::execution_location(&command, cwd);
+    let cwd = execution_cwd.as_path();
+    let relaxed = ctx.allowlists.with_rule_grants(
+        trial::TRIAL_RULES,
+        "resolve only unverified scripts",
+        "sandbox-trial",
+    );
+    let deadline = Deadline::new(Duration::from_millis(
+        ctx.config.effective_hook_timeout_ms(),
+    ));
+    let residual_ctx = HookEvalContext {
+        allowlists: &relaxed,
+        deadline: &deadline,
+        ..*ctx
+    };
+    let residual = resolve_hook_command(&residual_ctx, &command, dialect, None);
+    if !matches!(residual, ResolvedCommandOutcome::Allow(_)) {
+        *outcome = residual;
+        return false;
+    }
+    let shell_value = input
+        .tool_input
+        .as_ref()
+        .and_then(|t| t.shell.as_ref())
+        .or_else(|| input.tool_args.as_ref().and_then(|t| t.get("shell")));
+    let shell = shell_value
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(trial::default_shell, PathBuf::from);
+    let interactive = input
+        .tool_input
+        .as_ref()
+        .and_then(|t| t.tty.as_ref())
+        .or_else(|| input.tool_args.as_ref().and_then(|t| t.get("tty")))
+        .is_some_and(|v| v != &serde_json::Value::Bool(false));
+    let sources = capture
+        .map(|c| c.snapshot().resolved_paths())
+        .unwrap_or_default();
+    let resolve = || -> Result<bool, String> {
+        let store = TrialStore::user().map_err(|e| format!("Trial store unavailable: {e}"))?;
+        let before = store
+            .fingerprint(&command, cwd, &shell, &sources)
+            .map_err(|e| format!("Die Prüfung ist unvollständig. Cannot bind an exact trial version; desktop approval unavailable: {e}"))?;
+        if let Some(entry) = store.lookup(&before).map_err(|e| e.to_string())? {
+            emit_stderr!(
+                "dcg: verified by {} on {} (exact version).",
+                entry.source,
+                entry.created_at
+            );
+            return Ok(true);
+        }
+        let shell_supported = matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
+            && matches!(shell.to_str(), Some("/bin/zsh" | "/bin/bash" | "/bin/sh"));
+        let report = if interactive || !shell_supported {
+            trial::TrialReport {
+                id: format!("{:032x}", rand::random::<u128>()),
+                command: command.clone(),
+                project_root: before.project_root.clone(),
+                observations: trial::Observations {
+                    issues: vec![
+                        "TTY/user interaction required or shell unsupported; trial not started"
+                            .to_owned(),
+                    ],
+                    ..trial::Observations::default()
+                },
+                clone_ms: 0,
+                run_ms: 0,
+                exit_code: None,
+                clone_method: "not started".to_owned(),
+                artifact_dir: None,
+            }
+        } else {
+            trial::run(
+                &command,
+                &before,
+                &shell,
+                &ctx.config.trial,
+                &std::env::temp_dir(),
+            )
+        };
+        let summary = report.summary(destructive_command_guard::config::home_dir().as_deref());
+        store
+            .save_summary(&report.id, &summary)
+            .map_err(|e| format!("{summary}\nCannot save trial evidence: {e}"))?;
+        let source = match report.observations.verdict() {
+            trial::Verdict::Safe => "trial",
+            trial::Verdict::Unsafe => return Err(summary),
+            trial::Verdict::Inconclusive => {
+                if !desktop || !desktop_review::request_trial(&command, cwd, &summary, agent) {
+                    return Err(format!(
+                        "{summary}\nDesktop review unavailable, declined or expired."
+                    ));
+                }
+                "user-review"
+            }
+        };
+        let after = store
+            .fingerprint(&command, cwd, &shell, &sources)
+            .map_err(|e| e.to_string())?;
+        if before.digest != after.digest {
+            return Err(format!(
+                "{summary}\nProject or executable changed during trial/review; approval rejected."
+            ));
+        }
+        store
+            .approve(&before, source, &summary)
+            .map_err(|e| format!("{summary}\nCannot save exact-version approval: {e}"))?;
+        emit_stderr!("dcg: exact version verified by {source}. {}", report.id);
+        Ok(true)
+    };
+    match resolve() {
+        Ok(true) => *outcome = residual,
+        Ok(false) => {}
+        Err(summary) => {
+            if let ResolvedCommandOutcome::DenyFamily(resolved) = outcome {
+                resolved.mode = DecisionMode::Deny;
+                if let Some(info) = resolved.result.pattern_info.as_mut() {
+                    info.reason.push_str("\n\n");
+                    info.reason.push_str(&summary);
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Print help information.
