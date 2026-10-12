@@ -703,17 +703,7 @@ mod native {
         if !output.complete {
             issues.push("output exceeded 8 MiB per stream or remained open; retained prefix only");
         }
-        if [&output.stdout, &output.stderr].iter().any(|bytes| {
-            let text = String::from_utf8_lossy(bytes);
-            [
-                "EPERM",
-                "EACCES",
-                "Operation not permitted",
-                "Permission denied",
-            ]
-            .iter()
-            .any(|error| text.contains(error))
-        }) {
+        if crate::trial::permission_error_reported(&output.stdout, &output.stderr) {
             // Program text is untrusted and never becomes a kernel observation
             // or an approval. Keep it available even if logd omits the event.
             issues.push("the command reported a permission error; its operation and target remain in the command output, independently of possibly incomplete kernel reports");

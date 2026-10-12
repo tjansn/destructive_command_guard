@@ -144,6 +144,32 @@ mod macos {
     }
 
     #[test]
+    fn stdout_permission_error_without_a_kernel_event_never_earns_approval() {
+        // Program text is not trusted as proof of an operation, but a reported
+        // failure must prevent observational approval even on stdout alone.
+        let fixture = Fixture::new("printf 'Node test: EPERM open fixture\\n'; exit 1");
+        let report = fixture.run(10);
+        assert_eq!(report.exit_code, Some(1), "{}", report.summary(None));
+        assert_eq!(
+            report.observations.verdict(),
+            Verdict::Inconclusive,
+            "{}",
+            report.summary(None)
+        );
+        assert!(
+            report.observations.violations.is_empty(),
+            "program text became a kernel event"
+        );
+        assert!(
+            report
+                .observations
+                .issues
+                .iter()
+                .any(|issue| issue.contains("permission check"))
+        );
+    }
+
+    #[test]
     fn cli_trial_summary_allowlist_remove_and_prune_lifecycle() {
         let fixture = Fixture::new("mkdir -p build; cat source.txt > build/out");
         let home = fixture.temp.path().join("home");
@@ -412,11 +438,11 @@ mod macos {
 
     #[test]
     fn loopback_exchange_requires_review_without_endpoint_ownership_proof() {
-        // Numeric socket.connect reaches the network policy directly;
-        // create_connection first calls getaddrinfo, which may fail at the
-        // separately denied host DNS-configuration Mach service instead.
+        // Use curl for the connect syscall: Python can report a preflight
+        // permission error without producing a tagged kernel network event.
+        // Its parent owns the listener; the same sandbox still denies TCP out.
         let fixture = Fixture::new(
-            "python3 -S -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\",0)); s.listen(1); c=socket.socket(); c.connect(s.getsockname()); a,_=s.accept(); a.sendall(b\"ok\"); assert c.recv(2)==b\"ok\"; a.close(); c.close(); s.close()'",
+            "python3 -S -c 'import socket,subprocess,sys; s=socket.socket(); s.bind((\"127.0.0.1\",0)); s.listen(1); sys.exit(subprocess.run([\"/usr/bin/curl\",\"--noproxy\",\"*\",\"--max-time\",\"2\",\"-sS\",\"http://127.0.0.1:%d/\"%s.getsockname()[1]]).returncode)'",
         );
         let report = fixture.run(10);
         assert_eq!(
@@ -605,13 +631,12 @@ mod macos {
             .join("host-agent.sock");
         let listener = UnixListener::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let script = format!(
-            "import socket; s=socket.socket(socket.AF_UNIX); s.connect({:?})",
-            path.display().to_string()
-        );
         fs::write(
             fixture.project.join("run.sh"),
-            format!("python3 -S -c {}", shell_words::quote(&script)),
+            format!(
+                "/usr/bin/curl --noproxy '*' --max-time 2 -sS --unix-socket {} http://localhost/",
+                shell_words::quote(&path.display().to_string())
+            ),
         )
         .unwrap();
         let report = fixture.run(10);

@@ -94,6 +94,23 @@ pub struct Violation {
     pub target: String,
 }
 
+/// Program output is uncertainty, never a synthetic kernel observation. Node's
+/// test runner can put syscall errors on stdout rather than stderr.
+#[cfg(target_os = "macos")]
+pub(crate) fn permission_error_reported(stdout: &[u8], stderr: &[u8]) -> bool {
+    [stdout, stderr].iter().any(|bytes| {
+        let text = String::from_utf8_lossy(bytes);
+        [
+            "EPERM",
+            "EACCES",
+            "Operation not permitted",
+            "Permission denied",
+        ]
+        .iter()
+        .any(|error| text.contains(error))
+    })
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Observations {
     pub violations: Vec<Violation>,
@@ -927,16 +944,7 @@ fn run_inner(
     // Some tools preflight permissions using sandbox_check(), which need not
     // emit a kernel violation. Such failure text is uncertainty, never proof
     // of safety (and is not copied into the persisted report).
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if [
-        "Operation not permitted",
-        "Permission denied",
-        "EPERM",
-        "EACCES",
-    ]
-    .iter()
-    .any(|text| stderr.contains(text))
-    {
+    if permission_error_reported(&output.stdout, &output.stderr) {
         report
             .observations
             .issues
