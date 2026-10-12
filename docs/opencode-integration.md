@@ -20,6 +20,21 @@ dcg install --opencode --force      # refresh a dcg-owned plugin in place
 Restart OpenCode (start a new session) after installing — plugins are loaded
 at startup.
 
+## Sandboxed trials in Tom's fork
+
+The generated plugin must wait for [sandboxed trials](sandbox-trials.md)
+before interpreting dcg's verdict. Refresh it with the rebuilt fork's
+`dcg install --opencode --force` when deploying. With trials and
+`[heredoc] scan_script_files = true` enabled, its watchdog is sized for
+`trial.timeout_secs + 180` seconds: 780 seconds by
+default. A previously generated ten-second plugin cannot accommodate a trial.
+Regenerate after changing the trial timeout and restart OpenCode; the host's
+own tool timeout can still be shorter.
+
+Safe trials retain the explicit allow-verdict contract. Unsafe trials return
+their explanation as a denial. Inconclusive trials require the existing local
+desktop-review path; when it is unavailable, the plugin keeps blocking.
+
 ## How the plugin works
 
 The generated `dcg-guard.js`:
@@ -39,7 +54,7 @@ The generated `dcg-guard.js`:
    aborts the tool call by throwing an `Error` carrying dcg's full block
    message (reason, rule id, allow-once code, suggestions).
 4. **Blocks** when dcg ran but gave no verdict: it was killed by a signal
-   (including the plugin's 10-second timeout), exited non-zero, or exited 0
+   (including the plugin's configured watchdog timeout), exited non-zero, or exited 0
    without the allow line. The error says why. A deny dcg wrote before dying
    still stands with its own reason. Set `DCG_BRIDGE_CRASH_DECISION=allow` in
    OpenCode's environment to let such commands through instead.

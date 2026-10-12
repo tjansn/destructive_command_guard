@@ -7,6 +7,29 @@ explains how dcg distinguishes Codex from Claude-compatible hook payloads, why
 Codex denials use a minimal stdout JSON contract, how a user reviews a blocked
 command for a single retry, and how to diagnose the active hook.
 
+## Sandboxed trials in Tom's fork
+
+Eligible unverified-source commands can wait for a [sandboxed
+trial](sandbox-trials.md) before Codex receives its hook verdict. An unsafe
+trial remains a minimal Codex denial with the observation summary in
+`permissionDecisionReason`. An inconclusive trial uses the existing Touch ID
+review when `--desktop-review` is installed; cancellation or unavailable
+review keeps the command blocked. Definite destructive matches are never
+resolved by trial approval.
+
+Refresh registered hook timeouts using the rebuilt fork's `dcg install` during
+rollout, after enabling trials and `[heredoc] scan_script_files = true`.
+The hooks.json timeout must cover `trial.timeout_secs + 180` seconds, or
+780 seconds with the defaults. Any shorter timeout on Codex's calling shell
+tool or its host still applies. Reinstall after changing the configured trial
+timeout and restart Codex. Larger existing timeouts are preserved, and trials
+disabled in trusted configuration do not lower existing timeouts. The static
+`general.hook_timeout_ms` budget remains separate. No changes to `~/.codex`
+are made merely by building or testing.
+The installer preserves Codex's trust configuration. If Codex prompts you to
+approve the changed hook after its timeout is updated, review and approve it
+through Codex before expecting the hook to run.
+
 ## Protocol Detection
 
 Codex CLI 0.125.0+ sends the same basic hook payload shape as Claude Code for

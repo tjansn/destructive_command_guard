@@ -11,6 +11,21 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## Unreleased — Tom's sandbox-trial fork
+
+- Add opt-out macOS sandbox trials for eligible unverified-source commands,
+  isolated workspace/home/temp directories, localhost-only networking, bounded
+  execution and concise observation summaries. Definite destructive matches
+  remain blocking. Safe observations record exact-version approvals; unsafe
+  observations deny; inconclusive observations use the existing desktop review.
+- Add `[trial]` configuration, `dcg trial run` and `dcg trial show`, verified
+  trial entries in allowlist management, and hook timeouts sized for the trial
+  plus review. Document the separate Pi extension timeout and the conservative
+  project-manifest fingerprint fallback.
+- See [sandbox-trial usage and limits](docs/sandbox-trials.md) and the
+  [approved design](docs/design/sandbox-trials.md). Platform probe results and
+  measured overhead belong to the implementation report, not this release note.
+
 ## [v0.15.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.3) -- 2026-10-08 [Release]
 
 This release closes commands that ran unguarded (Claude Code's `Monitor`

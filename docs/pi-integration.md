@@ -5,6 +5,16 @@ use [integrations/pi/dcg-guard.ts](../integrations/pi/dcg-guard.ts) and the
 [desktop-review setup](script-file-inspection.md#one-request-desktop-approval-macos).
 The upstream recipe below does not implement this fork's desktop review.
 
+With [sandbox trials](sandbox-trials.md), the fork's hook waits for verification
+before Pi executes the command. The older installed extension has a
+`140_000` ms timer; raise it to `(trial.timeout_secs + 180) * 1000`, or
+`780_000` ms for the default ten-minute trial, and restart Pi. Keep
+`--desktop-review --agent pi` and the explicit allow-verdict check. Pi's own
+tool timeout can also terminate a request early. Updating the repository does
+not modify `~/.pi/agent/extensions/dcg-guard.ts`; apply this change deliberately
+when deploying the rebuilt fork. The repository extension now uses 780 seconds;
+increase its `GUARD_TIMEOUT_MS` too if configuring a longer trial.
+
 Last updated: 2026-08-26
 
 This document shows how to connect dcg to the [Pi coding agent](https://github.com/earendil-works/pi)

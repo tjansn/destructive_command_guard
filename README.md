@@ -7,6 +7,24 @@ See [setup, coverage and limits](docs/script-file-inspection.md).
 The upstream release installers below do not install this fork; build this
 checkout with Cargo and keep `general.update_pin = true`.
 
+### Sandboxed verification of dynamic scripts
+
+This fork can run commands blocked by `heredoc.script_files.unverified` in a
+temporary macOS workspace copy before the real command is allowed. Safe trials
+record an exact-version approval; destructive observations deny the command
+with an explanation. Network attempts, timeouts and incomplete observation
+require the existing local Touch ID review. Definite destructive rules remain
+blocking and are never cleared by a trial.
+
+Trials default to a 600-second limit, an empty home and localhost-only network
+access. Hooks wait for the trial; enable script-file inspection and refresh the
+installed hook timeouts before using this in an agent. With inspection enabled,
+the default host timeout is 780 seconds, including
+setup and desktop-review margin. Pi's separately installed extension also needs
+that timeout. See [configuration, commands and limits](docs/sandbox-trials.md)
+and the [approved design](docs/design/sandbox-trials.md). A successful observed
+run does not prove every future behaviour of an arbitrary program.
+
 <div align="center">
   <img src="illustration.webp" alt="Destructive Command Guard - Protecting your code from accidental destruction">
 </div>

@@ -3,7 +3,9 @@
 This fork inspects recognized file-backed invocations before keyword rejection
 can allow their opaque command lines. It reuses DCG's command evaluator,
 language AST rules, package.json extractor and Makefile recipe extractor.
-There is no LLM, cloud request, executable script invocation or filename cache.
+Static inspection uses no LLM, cloud request or script execution. When static
+inspection is incomplete, the optional [sandbox trial](sandbox-trials.md) can
+execute the command in a disposable copy and cache an exact-version approval.
 
 ## Enable globally
 
@@ -52,13 +54,16 @@ effect on the next invocation of an already loaded hook.
 ## One-request desktop approval (macOS)
 
 Set the trusted user hook command to `/absolute/path/dcg --desktop-review`
-and its host timeout to at least **150 seconds**. Keep `default_mode = "deny"`,
+and its host timeout to at least **150 seconds** for static review, or
+`trial.timeout_secs + 180` (**780 seconds** by default) with sandbox trials.
+Keep `default_mode = "deny"`,
 `unverified_decision = "deny"` and `scan_script_files = true`. Copy the fork's
 [Pi extension](../integrations/pi/dcg-guard.ts) to
 `~/.pi/agent/extensions/dcg-guard.ts`, adjusting its absolute executable path.
 Restart each agent after changing its hook/extension.
 Claude hook self-repair preserves an existing `--desktop-review` option and its
-host timeout, including when repairing a stale executable path. It never copies
+host timeout when large enough for enabled trials, including when repairing a
+stale executable path. It raises shorter deadlines to fit trials. It never copies
 arbitrary arguments from the previous hook command.
 
 After a verified rule-based denial, the hook waits for a compact local native
@@ -109,9 +114,15 @@ reusable allow-once grant and does not bypass the host's own permissions. Script
 hashes and execution-directory identity are checked before and after the dialog.
 All recognized sibling helpers/lifecycle sources are inspected even after the
 first destructive finding, so later helper edits also invalidate approval.
-Incomplete inspection, dynamic deletion operands, oversized reviews (over 5000 bytes),
+For this static review path, incomplete inspection, dynamic deletion operands, oversized reviews (over 5000 bytes),
 multi-entry tool batches, unsupported platforms and disabled script inspection
 never gain desktop approval. Revise ambiguous commands to use literal targets.
+
+Sandbox trials have a separate review contract: an inconclusive observed run can
+be approved for the fingerprinted command and source version. The dialog says
+that the evidence is incomplete and that the approval is reusable until that
+version changes. Unsafe trials are denied. Missing/unresolvable inputs cannot
+be bound to a version and therefore cannot receive that reusable approval.
 
 This avoids Codex's unsupported hook `ask` value: Codex receives an ordinary
 blocking verdict unless the human directly approves the local dialog. See
@@ -188,8 +199,10 @@ nonblocking opens prevent a FIFO from hanging the guard. Metadata is compared
 before and after reading and after analysis. Contents are read afresh on every
 tool request.
 
-This is a static guard, not an OS sandbox or a proof of arbitrary program
-safety. It does not follow every language import, compiler, generated script,
+Static inspection is not a proof of arbitrary program safety. The separate
+[sandbox-trial flow](sandbox-trials.md) can resolve its unverified rule with
+an observed run and an exact-version grant. Static inspection itself does not
+follow every language import, compiler, generated script,
 dependency install lifecycle, PATH executable, native binary or arbitrary
 framework runner. Language rules retain their existing detection limits.
 An attacker can still change a file after the final check and before execution
