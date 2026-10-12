@@ -507,6 +507,9 @@ pub struct Config {
     /// Heredoc/inline-script scanning configuration.
     pub heredoc: HeredocConfig,
 
+    /// Sandboxed trial settings for unverifiable file-backed commands.
+    pub trial: TrialConfig,
+
     /// Confidence scoring configuration for ambiguous matches.
     pub confidence: ConfidenceConfig,
 
@@ -729,6 +732,7 @@ struct ConfigLayer {
     overrides: Option<OverridesConfig>,
     allowlist: Option<AllowlistConfigLayer>,
     heredoc: Option<HeredocConfig>,
+    trial: Option<TrialConfigLayer>,
     confidence: Option<ConfidenceConfigLayer>,
     logging: Option<LoggingConfigLayer>,
     history: Option<HistoryConfigLayer>,
@@ -738,6 +742,82 @@ struct ConfigLayer {
     response: Option<ResponseConfigLayer>,
     projects: Option<std::collections::HashMap<String, ProjectConfig>>,
     rules: Option<std::collections::HashMap<String, RuleConfig>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct TrialConfigLayer {
+    enabled: Option<bool>,
+    timeout_secs: Option<u64>,
+    network: Option<TrialNetwork>,
+    max_copy_bytes: Option<u64>,
+    keep_artifacts: Option<bool>,
+}
+
+/// Network policy for sandboxed trials. Only loopback traffic is supported.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum TrialNetwork {
+    /// Permit loopback connections and Unix sockets inside the trial directory.
+    #[default]
+    Localhost,
+}
+
+/// Sandboxed trial settings for commands whose source cannot be verified statically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct TrialConfig {
+    /// Run trials for supported unverified-source decisions.
+    pub enabled: bool,
+    /// Maximum wall-clock time for a trial, in seconds.
+    #[schemars(range(min = 1))]
+    pub timeout_secs: u64,
+    /// Network access is restricted to localhost; other policies are unsupported.
+    pub network: TrialNetwork,
+    /// Maximum bytes copied when copy-on-write cloning is unavailable.
+    #[schemars(range(min = 1))]
+    pub max_copy_bytes: u64,
+    /// Retain trial directories for debugging instead of removing them afterwards.
+    pub keep_artifacts: bool,
+}
+
+impl Default for TrialConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout_secs: 600,
+            network: TrialNetwork::Localhost,
+            max_copy_bytes: 2_000_000_000,
+            keep_artifacts: false,
+        }
+    }
+}
+
+impl TrialConfig {
+    /// Additional hook time for trial setup and desktop review.
+    pub const HOOK_MARGIN_SECS: u64 = 180;
+
+    /// Hook timeout required while trials are enabled.
+    #[must_use]
+    pub const fn hook_timeout_secs(&self) -> u64 {
+        self.timeout_secs.saturating_add(Self::HOOK_MARGIN_SECS)
+    }
+
+    /// Validate trial resource limits before starting a trial.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a configured resource limit is zero.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.timeout_secs == 0 {
+            return Err("trial timeout_secs must be at least 1".to_string());
+        }
+        if self.max_copy_bytes == 0 {
+            return Err("trial max_copy_bytes must be at least 1".to_string());
+        }
+        Ok(())
+    }
 }
 
 impl ConfigLayer {
@@ -4421,6 +4501,10 @@ impl Config {
             self.merge_heredoc_layer(heredoc);
         }
 
+        if let Some(trial) = other.trial {
+            self.merge_trial_layer(trial);
+        }
+
         if let Some(confidence) = other.confidence {
             self.merge_confidence_layer(confidence);
         }
@@ -4458,6 +4542,24 @@ impl Config {
         // table for a rule it names (#284).
         if let Some(rules) = other.rules {
             self.rules.extend(rules);
+        }
+    }
+
+    const fn merge_trial_layer(&mut self, trial: TrialConfigLayer) {
+        if let Some(enabled) = trial.enabled {
+            self.trial.enabled = enabled;
+        }
+        if let Some(timeout_secs) = trial.timeout_secs {
+            self.trial.timeout_secs = timeout_secs;
+        }
+        if let Some(network) = trial.network {
+            self.trial.network = network;
+        }
+        if let Some(max_copy_bytes) = trial.max_copy_bytes {
+            self.trial.max_copy_bytes = max_copy_bytes;
+        }
+        if let Some(keep_artifacts) = trial.keep_artifacts {
+            self.trial.keep_artifacts = keep_artifacts;
         }
     }
 
@@ -5484,6 +5586,7 @@ impl Config {
             overrides: OverridesConfig::default(),
             allowlist: AllowlistConfig::default(),
             heredoc: HeredocConfig::default(),
+            trial: TrialConfig::default(),
             confidence: ConfidenceConfig::default(),
             logging: crate::logging::LoggingConfig::default(),
             history: HistoryConfig::default(),
@@ -5768,6 +5871,20 @@ fallback_on_parse_error = true
 fallback_on_timeout = true
 
 #─────────────────────────────────────────────────────────────
+# SANDBOXED TRIALS
+#─────────────────────────────────────────────────────────────
+
+[trial]
+# Verify supported unverified-source commands in an isolated macOS sandbox.
+enabled = true
+timeout_secs = 600
+# Only localhost is supported. Internet attempts require desktop review.
+network = "localhost"
+# Plain-copy fallback cap when copy-on-write cloning is unavailable.
+max_copy_bytes = 2_000_000_000
+keep_artifacts = false
+
+#─────────────────────────────────────────────────────────────
 # HISTORY
 #─────────────────────────────────────────────────────────────
 
@@ -5960,6 +6077,100 @@ fn parse_timestamp_as_utc(value: &str) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn trial_defaults_and_hook_timeout() {
+        let config = Config::default();
+        assert!(config.trial.enabled);
+        assert_eq!(config.trial.timeout_secs, 600);
+        assert_eq!(config.trial.network, TrialNetwork::Localhost);
+        assert_eq!(config.trial.max_copy_bytes, 2_000_000_000);
+        assert!(!config.trial.keep_artifacts);
+        assert_eq!(config.trial.hook_timeout_secs(), 780);
+        assert!(config.trial.validate().is_ok());
+    }
+
+    #[test]
+    fn trial_partial_config_preserves_defaults() {
+        let config: Config = toml::from_str("[trial]\nenabled = false\n").unwrap();
+        assert!(!config.trial.enabled);
+        assert_eq!(config.trial.timeout_secs, 600);
+        assert_eq!(config.trial.network, TrialNetwork::Localhost);
+        assert_eq!(config.trial.max_copy_bytes, 2_000_000_000);
+        assert!(!config.trial.keep_artifacts);
+    }
+
+    #[test]
+    fn trial_rejects_unsupported_network_policy() {
+        for policy in ["all", "none", "internet", "127.0.0.1"] {
+            let input = format!("[trial]\nnetwork = {policy:?}\n");
+            assert!(toml::from_str::<Config>(&input).is_err(), "{policy}");
+            assert!(toml::from_str::<ConfigLayer>(&input).is_err(), "{policy}");
+        }
+    }
+
+    #[test]
+    fn trial_validation_rejects_zero_resource_limits() {
+        let mut trial = TrialConfig {
+            timeout_secs: 0,
+            ..TrialConfig::default()
+        };
+        assert_eq!(
+            trial.validate().unwrap_err(),
+            "trial timeout_secs must be at least 1"
+        );
+        trial.timeout_secs = 1;
+        trial.max_copy_bytes = 0;
+        assert_eq!(
+            trial.validate().unwrap_err(),
+            "trial max_copy_bytes must be at least 1"
+        );
+        trial.max_copy_bytes = 1;
+        assert!(trial.validate().is_ok());
+    }
+
+    #[test]
+    fn trial_layer_merge_preserves_unset_and_explicit_defaults() {
+        let mut config = Config::default();
+        config.merge_layer(
+            toml::from_str(
+                "[trial]\nenabled = false\ntimeout_secs = 42\nmax_copy_bytes = 123\nkeep_artifacts = true\n",
+            )
+            .unwrap(),
+        );
+        config.merge_layer(toml::from_str("[trial]\nenabled = true\n").unwrap());
+        assert!(config.trial.enabled);
+        assert_eq!(config.trial.timeout_secs, 42);
+        assert_eq!(config.trial.max_copy_bytes, 123);
+        assert!(config.trial.keep_artifacts);
+        config.merge_layer(
+            toml::from_str(
+                "[trial]\ntimeout_secs = 600\nmax_copy_bytes = 2_000_000_000\nkeep_artifacts = false\nnetwork = 'localhost'\n",
+            )
+            .unwrap(),
+        );
+        assert_eq!(config.trial, TrialConfig::default());
+    }
+
+    #[test]
+    fn trial_automatic_project_layer_cannot_change_execution_policy() {
+        let layer: ConfigLayer = toml::from_str(
+            "[trial]\nenabled = false\ntimeout_secs = 9999\nmax_copy_bytes = 9999\nkeep_artifacts = true\n",
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.merge_layer(layer.into_restricted_project_policy());
+        assert_eq!(config.trial, TrialConfig::default());
+    }
+
+    #[test]
+    fn trial_hook_timeout_does_not_overflow() {
+        let trial = TrialConfig {
+            timeout_secs: u64::MAX,
+            ..TrialConfig::default()
+        };
+        assert_eq!(trial.hook_timeout_secs(), u64::MAX);
+    }
 
     #[test]
     fn system_config_dir_is_platform_correct() {

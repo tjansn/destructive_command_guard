@@ -85,6 +85,17 @@
         "allowlist": null
       }
     },
+    "trial": {
+      "description": "Sandboxed trial settings for unverifiable file-backed commands.",
+      "$ref": "#/$defs/TrialConfig",
+      "default": {
+        "enabled": true,
+        "timeout_secs": 600,
+        "network": "localhost",
+        "max_copy_bytes": 2000000000,
+        "keep_artifacts": false
+      }
+    },
     "confidence": {
       "description": "Confidence scoring configuration for ambiguous matches.",
       "$ref": "#/$defs/ConfidenceConfig",
@@ -762,6 +773,51 @@
       },
       "required": [
         "path"
+      ]
+    },
+    "TrialConfig": {
+      "description": "Sandboxed trial settings for commands whose source cannot be verified statically.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Run trials for supported unverified-source decisions.",
+          "type": "boolean",
+          "default": true
+        },
+        "timeout_secs": {
+          "description": "Maximum wall-clock time for a trial, in seconds.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1,
+          "default": 600
+        },
+        "network": {
+          "description": "Network access is restricted to localhost; other policies are unsupported.",
+          "$ref": "#/$defs/TrialNetwork",
+          "default": "localhost"
+        },
+        "max_copy_bytes": {
+          "description": "Maximum bytes copied when copy-on-write cloning is unavailable.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1,
+          "default": 2000000000
+        },
+        "keep_artifacts": {
+          "description": "Retain trial directories for debugging instead of removing them afterwards.",
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "TrialNetwork": {
+      "description": "Network policy for sandboxed trials. Only loopback traffic is supported.",
+      "oneOf": [
+        {
+          "description": "Permit loopback connections and Unix sockets inside the trial directory.",
+          "type": "string",
+          "const": "localhost"
+        }
       ]
     },
     "ConfidenceConfig": {
