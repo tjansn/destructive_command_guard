@@ -374,7 +374,8 @@ fn absolute_relative_and_home_paths_share_the_active_install_lifecycle() {
     }
 }
 
-#[cfg(unix)]
+// APFS rejects non-UTF-8 names, so this fixture cannot be created on macOS.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn non_utf8_override_is_not_discarded_in_favor_of_the_default() {
     use std::ffi::OsString;
