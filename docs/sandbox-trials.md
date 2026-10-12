@@ -1,5 +1,35 @@
 # Sandboxed trials for unverified commands
 
+## Static inspection outcomes and finite inputs
+
+Hook denials identify `definite-dangerous-operation`, `unsupported-dynamic`,
+`analysis-limit`, or `review-unavailable-or-cancelled`. Claude receives `outcomeCode`;
+strict protocols retain their schemas and carry `[dcg:<code>]` in the reason. Robot
+`dcg test` output includes `outcome_code`. Incomplete inspection does not advertise
+a command-only code or broad rule allowlist as a remedy.
+
+Interpreter argument roles distinguish executable, syntax-only and startup sources.
+Native Node `--check` and system shell `-n` do not scan their data operands for
+execution, but startup injection, shadowed commands, substitutions and siblings still
+require inspection. Query-only `command -v/-V` shares the heredoc wrapper model.
+
+Explicit Node test files and local single-level glob components are resolved with
+32-file, 8-level, 1-MiB-total and 256-KiB-per-file limits (glob enumeration: 1,024
+entries). Static local JS/TS imports, literal import/require calls, preloads, custom
+reporters and literal child entrypoints are inspected; npm pre/main/post scripts use
+separate shell contexts. Definite findings outrank unresolved siblings. External
+packages, computed sources, unsupported options, default test discovery, recursive
+globs and watch modes remain review/trial cases. Node CLI semantics were checked
+against [the official reference](https://nodejs.org/api/cli.html); older Node versions
+that do not support quoted test globs may reject them at runtime.
+
+Transient AST failures get one parse-only reading, capped at 200 ms and the remaining
+hook budget, with one concurrent reader, 64 content/language/policy/context cache
+entries and bounded source/match sizes. A clean second reading never authorizes a
+timed-out command: it can only supply a definite finding or preserve incompleteness.
+
+## Observational trials
+
 Sandboxed trials resolve supported file-backed commands whose static
 inspection is incomplete, starting with `heredoc.script_files.unverified`.
 They do not override definite destructive matches. The hook waits while dcg

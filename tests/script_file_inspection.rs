@@ -40,15 +40,20 @@ impl Fixture {
 
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_dcg"));
-        for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("DCG_")) {
-            command.env_remove(key);
-        }
         command
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .current_dir(&self.root)
             .env("HOME", self.root.join("home"))
+            .env("USERPROFILE", self.root.join("home"))
             .env("XDG_CONFIG_HOME", self.root.join("home/.config"))
+            .env("TMPDIR", &self.root)
+            .env("TEMP", &self.root)
+            .env("TMP", &self.root)
             .env("DCG_CONFIG", &self.config)
             .env("DCG_SELF_HEAL_HOOK", "0")
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .env("DCG_HISTORY_DISABLED", "1")
             .env("NO_COLOR", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -97,6 +102,27 @@ impl Fixture {
         let (output, result) = self.run(candidate);
         assert_eq!(result["decision"], "allow", "{candidate}: {result}");
         assert!(output.status.success(), "{candidate}: {result}");
+    }
+
+    fn unverified(&self, candidate: &str) {
+        let result = self.denied(candidate);
+        assert_eq!(
+            result["rule_id"], "heredoc.script_files:unverified",
+            "{candidate}: {result}"
+        );
+    }
+
+    fn destructive(&self, candidate: &str, source: &str) {
+        let result = self.denied(candidate);
+        let rule = result["rule_id"].as_str().expect("destructive rule id");
+        assert!(
+            !rule.is_empty() && rule != "heredoc.script_files:unverified",
+            "{candidate}: {result}"
+        );
+        assert!(
+            result["reason"].as_str().expect("reason").contains(source),
+            "missing source {source}: {candidate}: {result}"
+        );
     }
 }
 
@@ -554,6 +580,253 @@ fn preloads_and_runner_modes_cannot_skip_additional_sources() {
 }
 
 #[test]
+fn finite_node_tests_inspect_explicit_files_and_local_globs() {
+    let fixture = Fixture::new();
+    fixture.write("tests/first.test.js", "console.log('first');\n");
+    fixture.write("tests/second.test.js", "console.log('second');\n");
+    fixture.write("tests/nested/third.test.js", "console.log('third');\n");
+    // Discovery must only include the explicit finite selection.
+    fixture.write(
+        "tests/unselected.js",
+        "require('child_process').execSync('git reset --hard');\n",
+    );
+    for candidate in [
+        "node --test tests/first.test.js",
+        "node --test tests/first.test.js tests/second.test.js",
+        "node --test tests/*.test.js",
+        "node --test 'tests/*.test.js'",
+        "node --test tests/nested/*.test.js",
+    ] {
+        fixture.allowed(candidate);
+    }
+    fixture.unverified("node --test tests/missing*.test.js");
+}
+
+#[test]
+fn finite_node_test_selection_rechecks_changed_test_bytes() {
+    let fixture = Fixture::new();
+    fixture.write("tests/changed.test.js", "console.log('safe');\n");
+    for candidate in [
+        "node --test tests/changed.test.js",
+        "node --test 'tests/*.test.js'",
+    ] {
+        fixture.allowed(candidate);
+    }
+    fixture.write(
+        "tests/changed.test.js",
+        "require('child_process').execSync('git reset --hard');\n",
+    );
+    for candidate in [
+        "node --test tests/changed.test.js",
+        "node --test 'tests/*.test.js'",
+    ] {
+        fixture.destructive(candidate, "changed.test.js");
+    }
+}
+
+#[test]
+fn finite_node_imports_resolve_relative_to_the_importing_file() {
+    let fixture = Fixture::new();
+    // A safe cwd namesake must not replace the source next to the importer.
+    fixture.write("helper.js", "console.log('unrelated safe file');\n");
+    for source in [
+        "import './helper.js';\n",
+        "export { value } from './helper.js';\n",
+        "const helper = require('./helper.js');\n",
+        "import('./helper.js');\n",
+    ] {
+        fixture.write("tests/entry.test.js", source);
+        fixture.write("tests/helper.js", "export const value = 42;\n");
+        fixture.allowed("node --test tests/entry.test.js");
+        fixture.write(
+            "tests/helper.js",
+            "require('child_process').execSync('git reset --hard');\n",
+        );
+        fixture.destructive("node --test tests/entry.test.js", "helper.js");
+    }
+}
+
+#[test]
+fn finite_node_child_helpers_are_inspected_and_computed_children_are_unverified() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "entry.test.js",
+        "require('child_process').execFileSync('/bin/bash', ['./helper.sh']);\n",
+    );
+    fixture.write("helper.sh", "printf safe\n");
+    fixture.allowed("node --test entry.test.js");
+    fixture.write("helper.sh", "git reset --hard\n");
+    fixture.destructive("node --test entry.test.js", "helper.sh");
+    for source in [
+        "require('child_process').execFileSync(process.env.RUNNER, ['./helper.sh']);\n",
+        "require('child_process').execFileSync('/bin/bash', [process.env.HELPER]);\n",
+        "require('child_process').execSync(process.env.COMMAND);\n",
+    ] {
+        fixture.write("entry.test.js", source);
+        fixture.unverified("node --test entry.test.js");
+    }
+}
+
+#[test]
+fn finite_node_preloads_are_executable_in_separate_and_attached_forms() {
+    let fixture = Fixture::new();
+    fixture.write("entry.test.js", "console.log('safe');\n");
+    for candidate in [
+        "node --require ./preload.js --test entry.test.js",
+        "node --require=./preload.js --test entry.test.js",
+        "node -r ./preload.js --test entry.test.js",
+        "node -r./preload.js --test entry.test.js",
+        "node --import ./preload.js --test entry.test.js",
+        "node --import=./preload.js --test entry.test.js",
+    ] {
+        fixture.write("preload.js", "console.log('safe preload');\n");
+        fixture.allowed(candidate);
+        fixture.write(
+            "preload.js",
+            "require('child_process').execSync('git reset --hard');\n",
+        );
+        fixture.destructive(candidate, "preload.js");
+    }
+}
+
+#[test]
+fn finite_node_custom_reporters_are_executable_sources() {
+    let fixture = Fixture::new();
+    fixture.write("entry.test.js", "console.log('safe');\n");
+    for reporter in ["spec", "dot", "tap"] {
+        fixture.allowed(&format!(
+            "node --test --test-reporter {reporter} entry.test.js"
+        ));
+        fixture.allowed(&format!(
+            "node --test --test-reporter={reporter} entry.test.js"
+        ));
+    }
+    for candidate in [
+        "node --test --test-reporter ./reporter.js entry.test.js",
+        "node --test --test-reporter=./reporter.js entry.test.js",
+    ] {
+        fixture.write(
+            "reporter.js",
+            "export default async function* reporter(source) { for await (const event of source) { yield 'ok'; } }\n",
+        );
+        fixture.allowed(candidate);
+        fixture.write(
+            "reporter.js",
+            "require('child_process').execSync('git reset --hard');\n",
+        );
+        fixture.destructive(candidate, "reporter.js");
+    }
+    for candidate in [
+        "node --test --test-reporter dcg-fixture-reporter entry.test.js",
+        "node --test --test-reporter=dcg-fixture-reporter entry.test.js",
+    ] {
+        fixture.unverified(candidate);
+    }
+}
+
+#[test]
+fn npm_finite_tests_inspect_pre_main_and_post_lifecycle_sources() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "package.json",
+        r#"{"scripts":{"pretest":"bash before.sh","test":"node --test tests/entry.test.js","posttest":"bash after.sh"}}"#,
+    );
+    for changed in ["before.sh", "tests/entry.test.js", "after.sh"] {
+        fixture.write("before.sh", "printf before\n");
+        fixture.write("tests/entry.test.js", "console.log('test');\n");
+        fixture.write("after.sh", "printf after\n");
+        fixture.allowed("npm test");
+        fixture.allowed("npm run test");
+        fixture.write(
+            changed,
+            if std::path::Path::new(changed)
+                .extension()
+                .is_some_and(|extension| extension == "js")
+            {
+                "require('child_process').execSync('git reset --hard');\n"
+            } else {
+                "git reset --hard\n"
+            },
+        );
+        fixture.destructive("npm test", changed);
+        fixture.destructive("npm run test", changed);
+    }
+}
+
+#[test]
+fn unresolved_node_runner_modes_and_dependencies_remain_unverified() {
+    let fixture = Fixture::new();
+    fixture.write("entry.test.js", "console.log('safe');\n");
+    for candidate in [
+        "node --test",
+        "node --watch --test entry.test.js",
+        "node --test --watch entry.test.js",
+        "node --test --check entry.test.js",
+        "node --check --test entry.test.js",
+        "node --test --eval 'console.log(42)' entry.test.js",
+        "node --test --unknown-runner-option entry.test.js",
+    ] {
+        fixture.unverified(candidate);
+    }
+    for source in [
+        "import(process.env.MODULE);\n",
+        "require(process.env.MODULE);\n",
+        "import 'dcg-fixture-external-dependency';\n",
+        "require('dcg-fixture-external-dependency');\n",
+        "import 'https://invalid.example/helper.js';\n",
+    ] {
+        fixture.write("entry.test.js", source);
+        fixture.unverified("node --test entry.test.js");
+    }
+}
+
+#[test]
+fn definite_node_findings_take_precedence_over_an_unverified_sibling() {
+    let fixture = Fixture::new();
+    fixture.write("unknown.test.js", "import(process.env.MODULE);\n");
+    fixture.write(
+        "danger.test.js",
+        "require('child_process').execSync('git reset --hard');\n",
+    );
+    for candidate in [
+        "node --test unknown.test.js danger.test.js",
+        "node --test danger.test.js unknown.test.js",
+        "node --test '*.test.js'",
+    ] {
+        fixture.destructive(candidate, "danger.test.js");
+    }
+}
+
+#[test]
+fn finite_node_globs_still_obey_file_limits() {
+    let fixture = Fixture::new();
+    for index in 0..33 {
+        fixture.write(&format!("tests/{index}.test.js"), "console.log('safe');\n");
+    }
+    fixture.unverified("node --test 'tests/*.test.js'");
+}
+
+#[test]
+fn syntax_only_startup_sources_and_shadowed_queries_remain_inspected() {
+    let fixture = Fixture::new();
+    fixture.write("syntax.sh", "git reset --hard\n");
+    fixture.write("startup.sh", "git reset --hard\n");
+    for candidate in [
+        "BASH_ENV=./startup.sh /bin/bash -n syntax.sh",
+        "env BASH_ENV=./startup.sh /bin/bash -n syntax.sh",
+    ] {
+        fixture.destructive(candidate, "startup.sh");
+    }
+    for candidate in [
+        "command() { printf safe; }; command -v dcg",
+        "alias command='printf safe'; command -V orca",
+    ] {
+        fixture.unverified(candidate);
+    }
+    fixture.destructive("command -v \"$(bash startup.sh)\"", "startup.sh");
+}
+
+#[test]
 fn file_and_total_byte_limits_fail_closed() {
     let fixture = Fixture::new();
     fixture.write("safe.sh", "printf safe\n");
@@ -710,6 +983,87 @@ fn assert_version_review_denial(fixture: &Fixture, candidate: &str) {
 fn unverified_hook_offers_version_review_without_an_ineffective_code() {
     let fixture = version_review_fixture();
     assert_version_review_denial(&fixture, "python3 -m dcg_fixture_inspection");
+}
+
+#[test]
+fn hook_outcomes_distinguish_findings_limits_and_unavailable_review() {
+    let fixture = version_review_fixture();
+    fixture.write("oversized.sh", "#".repeat(256 * 1024 + 1));
+    for agent in ["claude-code", "codex-cli"] {
+        for (candidate, code, remediation, desktop_review) in [
+            (
+                "git reset --hard",
+                "definite-dangerous-operation",
+                "reported operation",
+                false,
+            ),
+            (
+                "bash missing.sh",
+                "unsupported-dynamic",
+                "unresolved",
+                false,
+            ),
+            (
+                "bash oversized.sh",
+                "analysis-limit",
+                "resource limit",
+                false,
+            ),
+            (
+                "git reset --hard",
+                "review-unavailable-or-cancelled",
+                "no approval was recorded",
+                true,
+            ),
+        ] {
+            let mut input = json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": candidate},
+                "cwd": fixture.root,
+            });
+            let mut command = fixture.command();
+            command.args(["--agent", agent]);
+            if agent == "codex-cli" {
+                input["turn_id"] = json!("inspection-outcome-fixture");
+            }
+            if desktop_review {
+                // An invalid cwd makes review structurally unavailable while
+                // retaining a single-command protocol payload. This fixture
+                // must never open a real dialog or authenticate.
+                input["cwd"] = json!("relative-directory");
+                command.arg("--desktop-review");
+            }
+            let mut child = command.spawn().expect("start isolated outcome hook");
+            child
+                .stdin
+                .take()
+                .expect("hook stdin")
+                .write_all(input.to_string().as_bytes())
+                .expect("candidate as inert hook data");
+            let output = child.wait_with_output().expect("outcome hook result");
+            assert!(output.status.success(), "{agent}: {code}");
+            let verdict: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "{agent}: {code}: {error}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+            let denial = &verdict["hookSpecificOutput"];
+            assert_eq!(denial["permissionDecision"], "deny", "{verdict}");
+            let reason = denial["permissionDecisionReason"].as_str().expect("reason");
+            assert!(reason.contains(remediation), "{agent}: {code}: {verdict}");
+            if agent == "claude-code" {
+                assert_eq!(denial["outcomeCode"], code, "{verdict}");
+            } else {
+                assert!(reason.contains(&format!("[dcg:{code}]")), "{verdict}");
+                assert!(denial.get("outcomeCode").is_none(), "{verdict}");
+            }
+            assert!(
+                !String::from_utf8_lossy(&output.stderr).contains("Warte auf"),
+                "fixture unexpectedly attempted desktop review: {agent}: {code}"
+            );
+        }
+    }
 }
 
 #[test]

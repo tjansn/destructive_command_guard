@@ -54,8 +54,22 @@ impl DenialBox {
     /// pack's "Use the hosted pipeline". The `BLOCKED` marker is never
     /// pack-authored.
     fn headline(&self) -> &str {
-        self.authored_banner()
-            .unwrap_or("Destructive Command Detected")
+        let (pack, pattern) = self
+            .pattern_id
+            .split_once(':')
+            .map_or((self.pattern_id.as_str(), None), |(pack, pattern)| {
+                (pack, Some(pattern))
+            });
+        let outcome = crate::inspection::outcome(
+            Some(pack),
+            pattern,
+            self.explanation.as_deref().unwrap_or_default(),
+        );
+        if outcome == crate::inspection::Outcome::Dangerous {
+            self.authored_banner().unwrap_or_else(|| outcome.headline())
+        } else {
+            outcome.headline()
+        }
     }
 
     /// The banner an external pack authored for this rule, if any (#416).

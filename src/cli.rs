@@ -1187,6 +1187,9 @@ pub struct TestOutput {
     pub command: String,
     /// The policy decision: "allow", "deny", "ask", "warn", "log", or "indeterminate"
     pub decision: String,
+    /// Stable inspection outcome for stopped commands, independent of rule IDs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome_code: Option<&'static str>,
     /// Resolved policy mode for a matched rule.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
@@ -5373,6 +5376,7 @@ fn test_command(
                     robot_mode,
                     command: command.to_string(),
                     decision: "allow".to_string(),
+                    outcome_code: None,
                     mode: None,
                     rule_id: None,
                     pack_id: None,
@@ -5433,6 +5437,14 @@ fn test_command(
                     dcg_version: env!("CARGO_PKG_VERSION").to_string(),
                     robot_mode,
                     command: command.to_string(),
+                    outcome_code: Some(
+                        crate::inspection::outcome(
+                            pack_id.as_deref(),
+                            pattern_name.as_deref(),
+                            reason.as_deref().unwrap_or_default(),
+                        )
+                        .code(),
+                    ),
                     decision: resolved_mode
                         .unwrap_or(DecisionMode::Deny)
                         .label()
@@ -5462,6 +5474,7 @@ fn test_command(
                 robot_mode,
                 command: command.to_string(),
                 decision: "indeterminate".to_string(),
+                outcome_code: Some(crate::inspection::Outcome::Limit.code()),
                 mode: None,
                 rule_id: None,
                 pack_id: None,
@@ -30077,6 +30090,7 @@ exclude = ["target/**"]
             robot_mode: false,
             command: "rm -rf /".to_string(),
             decision: "deny".to_string(),
+            outcome_code: Some(crate::inspection::Outcome::Dangerous.code()),
             mode: Some("deny".to_string()),
             rule_id: Some("core.filesystem:rm-rf-root".to_string()),
             pack_id: Some("core.filesystem".to_string()),

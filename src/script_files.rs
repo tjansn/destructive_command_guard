@@ -104,6 +104,8 @@ struct Reference {
 enum FileFormat {
     Script,
     SyntaxOnly(String),
+    TestGlob(String),
+    FiniteScript(String),
     PackageScript(String),
     Makefile,
 }
@@ -156,6 +158,7 @@ pub(crate) fn evaluate(
     };
     let mut first_warning = None;
     let mut first_denial = None;
+    let mut incomplete = None;
     for reference in references {
         if deadline.is_exceeded() {
             return Some(EvaluationResult::indeterminate_due_to_budget());
@@ -177,14 +180,18 @@ pub(crate) fn evaluate(
                         .as_ref()
                         .is_some_and(crate::trial::eligible) => {}
             Ok(Some(result)) if result.decision != EvaluationDecision::Allow => {
-                first_denial.get_or_insert(result);
+                if definite(&result) {
+                    first_denial.get_or_insert(result);
+                } else {
+                    incomplete.get_or_insert(result);
+                }
             }
             Ok(Some(result)) if result.effective_mode.is_some() => {
                 first_warning.get_or_insert(result);
             }
             Ok(_) => {}
             Err(reason) if !resolve_unverified => {
-                return first_denial.or_else(|| Some(unverified(&reason)));
+                incomplete.get_or_insert_with(|| unverified(&reason));
             }
             Err(_) => {}
         }
@@ -192,8 +199,19 @@ pub(crate) fn evaluate(
     if deadline.is_exceeded() {
         Some(EvaluationResult::indeterminate_due_to_budget())
     } else {
-        first_denial.or(first_warning)
+        first_denial.or(incomplete).or(first_warning)
     }
+}
+
+fn definite(result: &EvaluationResult) -> bool {
+    result.decision != EvaluationDecision::Allow
+        && result.pattern_info.as_ref().is_some_and(|info| {
+            crate::inspection::outcome(
+                info.pack_id.as_deref(),
+                info.pattern_name.as_deref(),
+                &info.reason,
+            ) == crate::inspection::Outcome::Dangerous
+        })
 }
 
 fn references(command: &str, deadline: &Deadline) -> Result<Vec<Reference>, String> {
@@ -212,7 +230,7 @@ fn references(command: &str, deadline: &Deadline) -> Result<Vec<Reference>, Stri
         }
         if node.kind().as_ref() == "command" {
             let text = node.text();
-            if query_only(&text) {
+            if crate::invocation::query_only(&text) {
                 if crate::heredoc::shell_name_overridden(command, "command") {
                     return Err("query builtin may be shadowed by shell state".to_owned());
                 }
@@ -272,19 +290,6 @@ fn references(command: &str, deadline: &Deadline) -> Result<Vec<Reference>, Stri
         pending.extend(node.children());
     }
     Ok(references)
-}
-
-fn query_only(source: &str) -> bool {
-    shell_words::split(source).is_ok_and(|words| {
-        words
-            .iter()
-            .find(|word| !assignment(word))
-            .is_some_and(|word| word == "command")
-            && crate::heredoc::effective_shell_command(&words).is_none()
-            && words
-                .iter()
-                .any(|word| matches!(word.as_str(), "-v" | "-V"))
-    })
 }
 
 fn static_word(raw: &str) -> Result<String, String> {
@@ -491,136 +496,25 @@ fn interpreter_references(
     args: &[&str],
     language: ScriptLanguage,
 ) -> Result<Vec<Reference>, String> {
-    let name = program.rsplit('/').next().unwrap_or(program);
-    let mut references = Vec::new();
-    let mut index = 0;
-    let mut syntax_only = false;
-    let syntax_requested = args.iter().any(|arg| matches!(*arg, "--check" | "-c"))
-        && matches!(name, "node" | "nodejs");
-    if matches!(name, "fish" | "pwsh" | "powershell") {
-        return Err("this interpreter's file syntax is not supported".to_string());
-    }
-    if name == "deno" {
-        if args.first() != Some(&"run") {
-            // Inline eval is handled by the existing embedded-code evaluator.
-            if args.first() == Some(&"eval") {
-                return Ok(references);
-            }
-            return Err("deno file launches require the run subcommand".to_string());
-        }
-        index += 1;
-    } else if name == "bun" && args.first() == Some(&"run") {
-        index += 1;
-    }
-    while let Some(raw) = args.get(index) {
-        let arg = static_word(raw)?;
-        index += 1;
-        if arg == "--" {
-            break;
-        }
-        if arg == "-" {
-            return Ok(references); // Existing stdin/heredoc inspection owns it.
-        }
-        if matches!(name, "node" | "nodejs") && matches!(arg.as_str(), "--check" | "-c") {
-            syntax_only = true;
-            continue;
-        }
-        if language == ScriptLanguage::Bash
-            && arg.starts_with(['-', '+'])
-            && !arg.starts_with("--")
-            && arg.contains('n')
-        {
-            syntax_only = arg.starts_with('-');
-        }
-        if matches!(
-            language,
-            ScriptLanguage::JavaScript | ScriptLanguage::TypeScript
-        ) {
-            if matches!(arg.as_str(), "--test" | "--watch") {
-                return Err("test/watch runners select additional sources dynamically".to_string());
-            }
-            if arg.starts_with("--require=")
-                || arg.starts_with("--import=")
-                || (arg.starts_with("-r") && arg.len() > 2)
-            {
-                return Err(
-                    "attached preload paths require an explicit separate operand".to_string(),
-                );
-            }
-        }
-        let inline = match language {
-            ScriptLanguage::Bash => {
-                arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c')
-            }
-            ScriptLanguage::Python => arg.starts_with("-c"),
-            ScriptLanguage::Php => arg.starts_with("-r"),
-            ScriptLanguage::Ruby | ScriptLanguage::Perl => {
-                arg.starts_with("-e") || arg.starts_with("-E")
-            }
-            _ => {
-                matches!(arg.as_str(), "--eval" | "--print")
-                    || arg.starts_with("-e")
-                    || arg.starts_with("-p")
-            }
-        };
-        if inline {
-            if syntax_only {
-                return Err("mixed syntax-only and inline options require review".to_owned());
-            }
-            return Ok(references);
-        }
-        if language == ScriptLanguage::Python && arg == "-m" {
-            return Err(
-                "Python module execution has no directly inspectable script operand".to_string(),
-            );
-        }
-        if matches!(
-            arg.as_str(),
-            "--rcfile" | "--init-file" | "--require" | "--import" | "-r"
-        ) {
-            let path = static_word(args.get(index).ok_or("preload option has no file")?)?;
-            index += 1;
-            references.push(Reference {
-                path,
-                language: Some(language),
-                sourced: true,
-                format: FileFormat::Script,
-            });
-            continue;
-        }
-        if (language == ScriptLanguage::Bash && matches!(arg.as_str(), "-o" | "+o" | "-O" | "+O"))
-            || (language == ScriptLanguage::Python && matches!(arg.as_str(), "-W" | "-X"))
-        {
-            index += 1;
-            if index > args.len() {
-                return Err("interpreter option has no value".to_string());
-            }
-            continue;
-        }
-        if arg.starts_with('-') || arg.starts_with('+') {
-            if syntax_requested
-                || (syntax_only && (arg.starts_with("--") || arg.contains(['i', 'l'])))
-            {
-                return Err("unmodeled syntax-check startup option requires review".to_owned());
-            }
-            continue;
-        }
-        index -= 1;
-        break;
-    }
-    if let Some(raw) = args.get(index) {
-        references.push(Reference {
-            path: static_word(raw)?,
+    let invocation = crate::invocation::classify(program, args, language)?;
+    Ok(invocation
+        .sources
+        .into_iter()
+        .map(|source| Reference {
+            path: source.path,
             language: Some(language),
-            sourced: false,
-            format: if syntax_only {
+            sourced: source.role == crate::invocation::SourceRole::Startup,
+            format: if source.role == crate::invocation::SourceRole::SyntaxData {
                 FileFormat::SyntaxOnly(program.to_owned())
+            } else if source.glob {
+                FileFormat::TestGlob(program.to_owned())
+            } else if invocation.finite_check {
+                FileFormat::FiniteScript(program.to_owned())
             } else {
                 FileFormat::Script
             },
-        });
-    }
-    Ok(references)
+        })
+        .collect())
 }
 
 fn package_reference(name: &str, args: &[&str]) -> Result<Vec<Reference>, String> {
@@ -706,9 +600,38 @@ fn inspect_reference(
     cwd: &Path,
     evaluate_source: &mut impl FnMut(&str, &Path, ScriptLanguage) -> EvaluationResult,
 ) -> Result<Option<EvaluationResult>, String> {
+    if let FileFormat::TestGlob(program) = &reference.format {
+        verify_syntax_interpreter(program, cwd)?;
+        let mut result = None;
+        let mut incomplete = None;
+        for path in test_glob(&reference.path, cwd)? {
+            let item = Reference {
+                path,
+                language: reference.language,
+                sourced: false,
+                format: FileFormat::Script,
+            };
+            match inspect_reference(&item, cwd, evaluate_source) {
+                Ok(Some(found)) if definite(&found) => {
+                    result.get_or_insert(found);
+                }
+                Ok(Some(found)) if found.decision != EvaluationDecision::Allow => {
+                    incomplete.get_or_insert(found);
+                }
+                Err(reason) => {
+                    incomplete.get_or_insert_with(|| unverified(&reason));
+                }
+                _ => {}
+            }
+        }
+        return Ok(result.or(incomplete));
+    }
     if let FileFormat::SyntaxOnly(program) = &reference.format {
         verify_syntax_interpreter(program, cwd)?;
         return Ok(None);
+    }
+    if let FileFormat::FiniteScript(program) = &reference.format {
+        verify_syntax_interpreter(program, cwd)?;
     }
     let default_makefile =
         if matches!(reference.format, FileFormat::Makefile) && reference.path.is_empty() {
@@ -789,8 +712,8 @@ fn inspect_reference(
     }
     crate::desktop_review::record_script(&path, &content, cwd, language);
     let sources = match &reference.format {
-        FileFormat::Script => vec![content],
-        FileFormat::SyntaxOnly(_) => {
+        FileFormat::Script | FileFormat::FiniteScript(_) => vec![content],
+        FileFormat::SyntaxOnly(_) | FileFormat::TestGlob(_) => {
             unreachable!("syntax operands were handled before source inspection")
         }
         FileFormat::PackageScript(task) => package_source(&content, task)?,
@@ -818,13 +741,32 @@ fn inspect_reference(
         }
         let candidate = evaluate_source(&source, cwd, language);
         if candidate.decision != EvaluationDecision::Allow {
-            if result.decision == EvaluationDecision::Allow {
+            if result.decision == EvaluationDecision::Allow
+                || (!definite(&result) && definite(&candidate))
+            {
                 result = candidate;
             }
-            continue;
-        }
-        if candidate.effective_mode.is_some() && result.decision == EvaluationDecision::Allow {
+        } else if candidate.effective_mode.is_some() && result.decision == EvaluationDecision::Allow
+        {
             result = candidate;
+        }
+        if matches!(
+            language,
+            ScriptLanguage::JavaScript | ScriptLanguage::TypeScript
+        ) && !definite(&result)
+        {
+            match inspect_js_inputs(
+                &source,
+                path.parent().unwrap_or(cwd),
+                cwd,
+                language,
+                evaluate_source,
+            ) {
+                Some(found) if result.decision == EvaluationDecision::Allow || definite(&found) => {
+                    result = found;
+                }
+                _ => {}
+            }
         }
     }
     verify_unchanged(&path, &before)?;
@@ -835,6 +777,265 @@ fn inspect_reference(
         info.matched_text_preview = None;
     }
     Ok(Some(result))
+}
+
+/// Expand a finite, local pattern without following directory symlinks or
+/// letting an unbounded directory enumeration consume the inspection budget.
+fn test_glob(pattern: &str, cwd: &Path) -> Result<Vec<String>, String> {
+    if Path::new(pattern).is_absolute() || pattern.contains("**") {
+        return Err("test globs must be finite local paths without **".to_owned());
+    }
+    let components: Vec<_> = pattern.split('/').filter(|p| *p != ".").collect();
+    if components.len() > MAX_DEPTH || components.iter().any(|p| matches!(*p, ".." | "")) {
+        return Err("test glob path/depth is unsupported".to_owned());
+    }
+    let mut paths = vec![cwd.to_path_buf()];
+    let mut visited = 0;
+    for component in components {
+        let matcher = glob::Pattern::new(component).map_err(|e| e.to_string())?;
+        let mut next = Vec::new();
+        for parent in paths {
+            for entry in fs::read_dir(&parent).map_err(|e| e.to_string())? {
+                visited += 1;
+                if visited > 1024 {
+                    return Err("test glob enumeration limit reached".to_owned());
+                }
+                let entry = entry.map_err(|e| e.to_string())?;
+                let name = entry.file_name();
+                let name = name.to_str().ok_or("non-UTF-8 test glob entry")?;
+                if matcher.matches_with(
+                    name,
+                    glob::MatchOptions {
+                        require_literal_leading_dot: true,
+                        ..glob::MatchOptions::new()
+                    },
+                ) {
+                    if entry.file_type().map_err(|e| e.to_string())?.is_symlink() {
+                        return Err("test glob contains symlink".to_owned());
+                    }
+                    next.push(entry.path());
+                    if next.len() > MAX_FILES {
+                        return Err("test source file limit reached".to_owned());
+                    }
+                }
+            }
+        }
+        paths = next;
+    }
+    if paths.is_empty() {
+        return Err("test glob matched no files".to_owned());
+    }
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|p| {
+            p.into_os_string()
+                .into_string()
+                .map_err(|_| "non-UTF-8 test source".to_owned())
+        })
+        .collect()
+}
+
+fn js_literal(source: &str) -> Result<String, String> {
+    let source = source.trim();
+    if source.len() >= 2
+        && source.starts_with(['\'', '"'])
+        && source.ends_with(source.chars().next().unwrap())
+        && !source[1..source.len() - 1].contains(['\\', '\n', '\r'])
+    {
+        Ok(source[1..source.len() - 1].to_owned())
+    } else {
+        Err("computed or escaped JavaScript input requires review".to_owned())
+    }
+}
+
+fn builtin_module(name: &str) -> bool {
+    // Explicit names only: an arbitrary `node:` URL is not evidence of a
+    // supported builtin. Unknown/bare package imports remain unresolved.
+    matches!(
+        name.strip_prefix("node:").unwrap_or(name),
+        "assert"
+            | "assert/strict"
+            | "async_hooks"
+            | "buffer"
+            | "child_process"
+            | "cluster"
+            | "console"
+            | "constants"
+            | "crypto"
+            | "dgram"
+            | "diagnostics_channel"
+            | "dns"
+            | "dns/promises"
+            | "events"
+            | "fs"
+            | "fs/promises"
+            | "http"
+            | "http2"
+            | "https"
+            | "module"
+            | "net"
+            | "os"
+            | "path"
+            | "path/posix"
+            | "path/win32"
+            | "perf_hooks"
+            | "process"
+            | "punycode"
+            | "querystring"
+            | "readline"
+            | "readline/promises"
+            | "repl"
+            | "stream"
+            | "stream/promises"
+            | "stream/web"
+            | "string_decoder"
+            | "sys"
+            | "test"
+            | "test/reporters"
+            | "timers"
+            | "timers/promises"
+            | "tls"
+            | "trace_events"
+            | "tty"
+            | "url"
+            | "util"
+            | "util/types"
+            | "v8"
+            | "vm"
+            | "wasi"
+            | "worker_threads"
+            | "zlib"
+    )
+}
+
+fn inspect_js_inputs(
+    source: &str,
+    source_dir: &Path,
+    cwd: &Path,
+    language: ScriptLanguage,
+    evaluate_source: &mut impl FnMut(&str, &Path, ScriptLanguage) -> EvaluationResult,
+) -> Option<EvaluationResult> {
+    let ast = AstGrep::new(
+        source,
+        if language == ScriptLanguage::TypeScript {
+            SupportLang::TypeScript
+        } else {
+            SupportLang::JavaScript
+        },
+    );
+    let mut pending = vec![ast.root()];
+    let mut imports = Vec::new();
+    let mut children = Vec::new();
+    let mut incomplete = None;
+    while let Some(node) = pending.pop() {
+        let kind = node.kind();
+        if matches!(kind.as_ref(), "import_statement" | "export_statement")
+            && let Some(value) = node.field("source")
+        {
+            imports.push(js_literal(&value.text()));
+        }
+        if kind.as_ref() == "call_expression"
+            && let (Some(function), Some(args)) = (node.field("function"), node.field("arguments"))
+        {
+            let function = function.text();
+            let name = function.rsplit('.').next().unwrap_or(&function);
+            let args: Vec<_> = args
+                .children()
+                .filter(|c| !matches!(c.kind().as_ref(), "(" | ")" | "," | "comment"))
+                .collect();
+            if matches!(function.as_ref(), "require" | "import") {
+                imports.push(if args.len() == 1 {
+                    js_literal(&args[0].text())
+                } else {
+                    Err("unresolved import arguments".to_owned())
+                });
+            } else if matches!(
+                name,
+                "exec" | "execSync" | "execFile" | "execFileSync" | "spawn" | "spawnSync" | "fork"
+            ) {
+                let child = (|| {
+                    let program = js_literal(&args.first().ok_or("child has no command")?.text())?;
+                    if matches!(name, "exec" | "execSync") {
+                        if args.len() != 1 {
+                            return Err("child options/callback require review".to_owned());
+                        }
+                        return Ok(program);
+                    }
+                    if args.len() != 2 || args[1].kind().as_ref() != "array" {
+                        return Err("child argv/options are unresolved".to_owned());
+                    }
+                    let mut words = vec![program];
+                    for arg in args[1]
+                        .children()
+                        .filter(|c| !matches!(c.kind().as_ref(), "[" | "]" | "," | "comment"))
+                    {
+                        words.push(js_literal(&arg.text())?);
+                    }
+                    if name == "fork" {
+                        words.insert(0, "node".to_owned());
+                    }
+                    Ok(shell_words::join(words))
+                })();
+                children.push(child);
+            }
+        }
+        pending.extend(node.children());
+    }
+    let mut result = None;
+    for import in imports {
+        let found = (|| {
+            let import = import?;
+            if builtin_module(&import) {
+                return Ok(None);
+            }
+            if !import.starts_with("./") && !import.starts_with("../") {
+                return Err("external or unresolved module source requires review".to_owned());
+            }
+            if !matches!(
+                script_extension(&import),
+                Some(ScriptLanguage::JavaScript | ScriptLanguage::TypeScript)
+            ) {
+                return Err("module extension/resolution requires review".to_owned());
+            }
+            let path = source_dir.join(&import);
+            let item = Reference {
+                path: path.to_str().ok_or("non-UTF-8 module path")?.to_owned(),
+                language: script_extension(&import),
+                sourced: false,
+                format: FileFormat::Script,
+            };
+            inspect_reference(&item, cwd, evaluate_source)
+        })();
+        match found {
+            Ok(Some(found)) if definite(&found) => {
+                result.get_or_insert(found);
+            }
+            Ok(Some(found)) if found.decision != EvaluationDecision::Allow => {
+                incomplete.get_or_insert(found);
+            }
+            Err(reason) => {
+                incomplete.get_or_insert_with(|| unverified(&reason));
+            }
+            _ => {}
+        }
+    }
+    for child in children {
+        match child {
+            Ok(command) => {
+                let found = evaluate_source(&command, cwd, ScriptLanguage::Bash);
+                if definite(&found) {
+                    result.get_or_insert(found);
+                } else if found.decision != EvaluationDecision::Allow {
+                    incomplete.get_or_insert(found);
+                }
+            }
+            Err(reason) => {
+                incomplete.get_or_insert_with(|| unverified(&reason));
+            }
+        }
+    }
+    result.or(incomplete)
 }
 
 fn verify_syntax_interpreter(program: &str, cwd: &Path) -> Result<(), String> {

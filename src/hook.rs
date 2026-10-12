@@ -3001,8 +3001,9 @@ pub fn format_denial_message(
     // An external pack may author the closing instruction (#416): for a
     // redirect-style rule, "have the user run it by hand" is the wrong
     // recovery. The `BLOCKED` header, rule and reason stay dcg's.
-    let trailer = if pack == Some("heredoc.script_files") && pattern == Some("unverified") {
-        "Retry through sandbox verification or desktop review for this exact version. The command remains blocked until verification succeeds."
+    let outcome = crate::inspection::outcome(pack, pattern, reason);
+    let trailer = if outcome != crate::inspection::Outcome::Dangerous {
+        outcome.remediation()
     } else {
         pack.and_then(|pack_id| crate::packs::external_denial_trailer(pack_id, pattern))
             .unwrap_or(
@@ -3010,7 +3011,7 @@ pub fn format_denial_message(
             )
     };
     let mut message = format_matched_message(
-        "BLOCKED by dcg",
+        &format!("BLOCKED by dcg [dcg:{}]", outcome.code()),
         command,
         reason,
         explanation,
@@ -3018,7 +3019,12 @@ pub fn format_denial_message(
         pattern,
         trailer,
     );
-    if let Some(code) = allow_once_code {
+    if outcome == crate::inspection::Outcome::Dangerous {
+        message.push_str("\n\n");
+        message.push_str(outcome.remediation());
+    }
+    if let Some(code) = allow_once_code.filter(|_| outcome == crate::inspection::Outcome::Dangerous)
+    {
         use std::fmt::Write as _;
         let _ = write!(
             message,
@@ -3103,7 +3109,7 @@ const MAX_SUGGESTIONS: usize = 4;
 pub(crate) fn print_colorful_warning_to(
     writer: &mut impl Write,
     command: &str,
-    _reason: &str,
+    reason: &str,
     pack: Option<&str>,
     pattern: Option<&str>,
     explanation: Option<&str>,
@@ -3115,6 +3121,7 @@ pub(crate) fn print_colorful_warning_to(
     audience: WarningAudience,
 ) {
     let theme = auto_theme();
+    let outcome = crate::inspection::outcome(pack, pattern, reason);
 
     let rule_id = build_rule_id(pack, pattern);
     let pattern_display = rule_id.as_deref().or(pack).unwrap_or("unknown pattern");
@@ -3152,8 +3159,16 @@ pub(crate) fn print_colorful_warning_to(
     if let Some(text) = explanation_text {
         denial = denial.with_explanation(text);
     }
+    if outcome != crate::inspection::Outcome::Dangerous {
+        denial = denial.with_explanation(format!(
+            "[dcg:{}] {}",
+            outcome.code(),
+            outcome.remediation()
+        ));
+    }
 
     if audience == WarningAudience::HumanOperator
+        && outcome == crate::inspection::Outcome::Dangerous
         && let Some(code) = allow_once_code
     {
         denial = denial.with_allow_once_code(code);
@@ -3182,11 +3197,16 @@ pub(crate) fn print_colorful_warning_to(
 
             // Advertise the scoped single-command remedy ahead of the
             // persistent allowlist widening (GH#332).
-            if let Some(code) = allow_once_code {
+            if let Some(code) =
+                allow_once_code.filter(|_| outcome == crate::inspection::Outcome::Dangerous)
+            {
                 let _ = writeln!(writer, "  $ {cyan}dcg allow-once {code}{reset}");
             }
 
-            if let Some(ref rule) = rule_id {
+            if outcome == crate::inspection::Outcome::Dangerous
+                && !reason.contains(crate::effects::SELF_PROTECTION)
+                && let Some(ref rule) = rule_id
+            {
                 let _ = writeln!(writer, "  $ {cyan}dcg allowlist add {rule} --user{reset}");
             }
 
@@ -3347,6 +3367,8 @@ pub fn write_denial_to(
     pattern_suggestions: &[PatternSuggestion],
     branch_context: Option<&crate::evaluator::BranchContext>,
 ) {
+    let outcome = crate::inspection::outcome(pack, pattern, reason);
+    let allow_once = allow_once.filter(|_| outcome == crate::inspection::Outcome::Dangerous);
     let allow_once_code = allow_once.map(|info| info.code.as_str());
 
     // Reasonix reads the exit status and shows stderr, verbatim, to the user
@@ -3420,7 +3442,10 @@ pub fn write_denial_to(
                 },
             };
 
-            let _ = serde_json::to_writer(&mut *stdout, &output);
+            if let Ok(mut output) = serde_json::to_value(output) {
+                output["hookSpecificOutput"]["outcomeCode"] = serde_json::json!(outcome.code());
+                let _ = serde_json::to_writer(&mut *stdout, &output);
+            }
             let _ = writeln!(stdout);
         }
         HookProtocol::Codex => {
@@ -3811,6 +3836,11 @@ pub fn write_indeterminate_to(
     reason: &str,
     deny: bool,
 ) {
+    let tagged = format!(
+        "[dcg:analysis-limit] {reason} {}",
+        crate::inspection::Outcome::Limit.remediation()
+    );
+    let reason = tagged.as_str();
     let _ = writeln!(stderr);
     let _ = writeln!(stderr, "{} {reason}", "dcg INDETERMINATE:".yellow().bold());
 
@@ -3846,7 +3876,11 @@ pub fn write_indeterminate_to(
                     remediation: None,
                 },
             };
-            let _ = serde_json::to_writer(&mut *stdout, &output);
+            if let Ok(mut output) = serde_json::to_value(output) {
+                output["hookSpecificOutput"]["outcomeCode"] =
+                    serde_json::json!(crate::inspection::Outcome::Limit.code());
+                let _ = serde_json::to_writer(&mut *stdout, &output);
+            }
             let _ = writeln!(stdout);
         }
         HookProtocol::Copilot => {

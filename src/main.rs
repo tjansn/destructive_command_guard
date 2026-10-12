@@ -1638,6 +1638,11 @@ fn publish_decisive_response(
             // Its early inspection gate cannot consume ordinary command-only
             // exceptions, so never issue a code that cannot resolve this denial.
             if !destructive_command_guard::trial::eligible(info)
+                && destructive_command_guard::inspection::outcome(
+                    info.pack_id.as_deref(),
+                    info.pattern_name.as_deref(),
+                    &info.reason,
+                ) == destructive_command_guard::inspection::Outcome::Dangerous
                 && !info
                     .reason
                     .contains(destructive_command_guard::effects::SELF_PROTECTION)
@@ -2464,7 +2469,11 @@ fn main() {
                 && matches!(resolved.mode, DecisionMode::Deny | DecisionMode::Ask)
                 && let Some(info) = resolved.result.pattern_info.as_mut()
             {
-                info.reason.push_str("\n\n");
+                info.reason.push_str(if cli.desktop_review {
+                    "\n\n[dcg:review-unavailable-or-cancelled] "
+                } else {
+                    "\n\n"
+                });
                 info.reason.push_str(reason);
             }
             publish_decisive_response(&eval_context, outcome, &mut history_writer)
@@ -2650,7 +2659,7 @@ fn attempt_sandbox_trial(
             let explanation = "Runtime inputs or environment are not reproduced by the sandbox. This request requires one-time desktop review; no reusable approval will be recorded.";
             if !desktop || !desktop_review::request_trial(&command, cwd, explanation, agent) {
                 return Err(format!(
-                    "{explanation}\nDesktop review unavailable, declined or expired."
+                    "{explanation}\n[dcg:review-unavailable-or-cancelled] Desktop review unavailable, declined or expired."
                 ));
             }
             let after = store
@@ -2712,7 +2721,7 @@ fn attempt_sandbox_trial(
             trial::Verdict::Inconclusive => {
                 if !desktop || !desktop_review::request_trial(&command, cwd, &summary, agent) {
                     return Err(format!(
-                        "{summary}\nDesktop review unavailable, declined or expired."
+                        "{summary}\n[dcg:review-unavailable-or-cancelled] Desktop review unavailable, declined or expired."
                     ));
                 }
                 "user-review"

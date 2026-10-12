@@ -699,17 +699,11 @@ impl EvaluationResult {
     #[must_use]
     pub fn denied_by_incomplete_analysis(reason: &str) -> Self {
         let (pack_id, pattern_name) = split_ast_rule_id(INCOMPLETE_ANALYSIS_RULE);
-        let explanation = format!(
-            "Embedded-code analysis did not finish, so dcg fell back to scanning the \
-             command text for destructive patterns and found one. The finding is real; \
-             its exact location and target are not established, because the body it \
-             would have been read from was never fully parsed. Re-running may succeed \
-             if the analyser ran out of budget on a loaded machine. If you have reviewed \
-             the command, allow it exactly with `dcg allowlist add-command '<command>' \
-             -r \"reviewed\" --user`, or allow this rule with \
-             `dcg allowlist add '{pack_id}:{pattern_name}' -r \"reviewed\" --user` — \
-             note that granting the rule waives the whole backstop, not one command."
-        );
+        let explanation = "Embedded-code inspection is incomplete. A conservative backstop \
+            cannot establish the executable operation and its target from this input. \
+            Use bounded literal inputs or request exact-version desktop review; an \
+            incomplete reading is not proof of a destructive operation or of safety."
+            .to_owned();
         Self {
             decision: EvaluationDecision::Deny,
             pattern_info: Some(PatternMatch {
@@ -31203,8 +31197,9 @@ fn unreadable_embedded_code_verdict(
 /// that says nothing about the code ([`MatchError::is_transient`]) gets one
 /// retry here, under the structural budget capped by the hook deadline, so the
 /// verdict follows the code. Deterministic failures (a parse error, an
-/// unsupported language) and the strict `fallback_on_timeout = false` policy
-/// are returned unchanged.
+/// unsupported language) are returned unchanged. A retry supplies definite
+/// findings only, including under strict policy; it can never authorize a
+/// command whose first reading exhausted its budget.
 ///
 /// [`MatchError::is_transient`]: crate::ast_matcher::MatchError::is_transient
 fn retry_transient_ast_failure(
@@ -31212,7 +31207,7 @@ fn retry_transient_ast_failure(
     content: &crate::heredoc::ExtractedContent,
     context: HeredocEvaluationContext<'_>,
 ) -> Result<Vec<crate::ast_matcher::PatternMatch>, crate::ast_matcher::MatchError> {
-    if !err.is_transient() || !context.heredoc_settings.fallback_on_timeout {
+    if !err.is_transient() {
         return Err(err);
     }
     let mut retry = std::time::Duration::from_millis(
@@ -31225,7 +31220,17 @@ fn retry_transient_ast_failure(
         retry = retry.min(remaining);
     }
     tracing::debug!(error = %err, retry_ms = retry.as_millis(), "AST matching cut short; retrying");
-    DEFAULT_MATCHER.find_matches_with_timeout(&content.content, content.language, retry)
+    crate::inspection::slow_findings(
+        &content.content,
+        content.language,
+        &format!(
+            "{:?}:{:?}:{:?}",
+            context.heredoc_settings, context.ordered_packs, context.compiled_overrides
+        ),
+        context.project_path,
+        retry,
+    )
+    .map_err(|_| err)
 }
 
 /// The exec-sink backstop's verdict on one extracted body.
@@ -47084,7 +47089,7 @@ mod tests {
             let mut strict = completed_extraction();
             strict.fallback_on_timeout = false;
             let strict_context = timeout_test_context(&strict, &allowlists, &compiled, None);
-            assert!(matches!(
+            assert!(
                 retry_transient_ast_failure(
                     MatchError::Timeout {
                         elapsed_ms: 21,
@@ -47092,9 +47097,10 @@ mod tests {
                     },
                     &content,
                     strict_context
-                ),
-                Err(MatchError::Timeout { .. })
-            ));
+                )
+                .is_ok(),
+                "strict policy still permits a definite parse-only finding"
+            );
 
             let spent = Deadline::new(std::time::Duration::ZERO);
             let spent_context =
