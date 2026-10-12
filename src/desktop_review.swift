@@ -39,6 +39,106 @@ struct ReviewRequest: Decodable {
     }
 }
 
+// UI-less state machine: an invalidated attempt can never approve a later one.
+@MainActor
+protocol BiometricAttempt: AnyObject {
+    func evaluate(_ reply: @escaping @MainActor (Bool) -> Void)
+    func cancel()
+}
+
+@MainActor
+final class ReviewAuthentication {
+    private let clock: () -> TimeInterval
+    private let focused: () -> Bool
+    private let makeAttempt: () -> BiometricAttempt?
+    private let waiting: () -> Void
+    private let reactivate: () -> Void
+    private let complete: (Bool) -> Void
+    private var appearedAt: TimeInterval?
+    private var attempt: BiometricAttempt?
+    private var generation: UInt64 = 0
+    private var reactivated = false
+    private(set) var finished = false
+
+    init(clock: @escaping () -> TimeInterval, focused: @escaping () -> Bool,
+         makeAttempt: @escaping () -> BiometricAttempt?, waiting: @escaping () -> Void,
+         reactivate: @escaping () -> Void, complete: @escaping (Bool) -> Void) {
+        self.clock = clock
+        self.focused = focused
+        self.makeAttempt = makeAttempt
+        self.waiting = waiting
+        self.reactivate = reactivate
+        self.complete = complete
+    }
+
+    func appeared() { if appearedAt == nil { appearedAt = clock() } }
+
+    func becameKey() {
+        guard !finished, attempt == nil, focused() else { return }
+        guard let fresh = makeAttempt() else { deny(); return }
+        generation += 1
+        let ticket = generation
+        attempt = fresh
+        fresh.evaluate { [weak self] success in
+            guard let self, !self.finished, self.generation == ticket else { return }
+            // The reply itself must observe both active app and key window.
+            guard self.focused() else { self.resignedKey(); return }
+            self.finish(success)
+        }
+    }
+
+    func resignedKey() {
+        guard !finished else { return }
+        cancelAttempt()
+        waiting()
+        if let appearedAt, clock() - appearedAt < 1.5, !reactivated {
+            reactivated = true
+            reactivate()
+        }
+    }
+
+    private func cancelAttempt() {
+        generation += 1
+        let old = attempt
+        attempt = nil
+        old?.cancel()
+    }
+
+    func deny() { finish(false) }
+
+    private func finish(_ approved: Bool) {
+        guard !finished else { return }
+        finished = true
+        cancelAttempt()
+        complete(approved)
+    }
+}
+
+@MainActor
+final class NativeBiometricAttempt: BiometricAttempt {
+    let context = LAContext()
+    private let reason: String
+
+    init?(reason: String) {
+        self.reason = reason
+        context.touchIDAuthenticationAllowableReuseDuration = 0
+        context.localizedFallbackTitle = ""
+        context.localizedCancelTitle = "Ablehnen"
+        var error: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error),
+              context.biometryType == .touchID else { return nil }
+    }
+
+    func evaluate(_ reply: @escaping @MainActor (Bool) -> Void) {
+        context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics,
+                               localizedReason: reason) { success, _ in
+            DispatchQueue.main.async { reply(success) }
+        }
+    }
+
+    func cancel() { context.invalidate() }
+}
+
 @MainActor
 final class ReviewWindow: NSWindow {
     var cancel: (() -> Void)?
@@ -70,14 +170,32 @@ final class ReviewController: NSObject, NSWindowDelegate {
     private static let width: CGFloat = 460
     private static let inset: CGFloat = 16
     private let request: ReviewRequest
-    private let context = LAContext()
     private var timer: Timer?
-    private var finished = false
-    private var authenticationStarted = false
+    private var authContainer: NSView?
+    private var authInstruction: NSTextField?
     private var window: ReviewWindow?
     private var details: NSScrollView?
     private var detailsButton: NSButton?
     private var stack: NSStackView?
+    private lazy var authentication: ReviewAuthentication = ReviewAuthentication(
+        clock: { ProcessInfo.processInfo.systemUptime },
+        focused: { [weak self] in
+            NSApp.isActive && self?.window?.isVisible == true && self?.window?.isKeyWindow == true
+        },
+        makeAttempt: { [weak self] in self?.makeAttempt() },
+        waiting: { [weak self] in
+            self?.authInstruction?.stringValue = "Klicke auf den Dialog, um mit Touch ID fortzufahren"
+            self?.resizeToFit()
+        },
+        reactivate: { [weak self] in
+            DispatchQueue.main.async {
+                guard let self, !self.authentication.finished else { return }
+                NSApp.activate(ignoringOtherApps: true)
+                self.window?.makeKeyAndOrderFront(nil)
+            }
+        },
+        complete: { [weak self] approved in self?.finish(approved) }
+    )
 
     init(_ request: ReviewRequest) {
         self.request = request
@@ -85,9 +203,7 @@ final class ReviewController: NSObject, NSWindowDelegate {
     }
 
     private func finish(_ approved: Bool) -> Never {
-        finished = true
         timer?.invalidate()
-        context.invalidate()
         print(approved ? "approved:\(request.nonce)" : "denied")
         exit(0)
     }
@@ -237,12 +353,15 @@ final class ReviewController: NSObject, NSWindowDelegate {
     }
 
     private func authenticationRow() -> NSView {
-        let auth = LAAuthenticationView(context: context, controlSize: .large)
+        let auth = NSView()
+        authContainer = auth
         auth.translatesAutoresizingMaskIntoConstraints = false
         auth.widthAnchor.constraint(equalToConstant: 48).isActive = true
         auth.heightAnchor.constraint(equalToConstant: 48).isActive = true
+        let prompt = label("Finger auflegen", size: 13, weight: .semibold)
+        authInstruction = prompt
         let instruction = vertical([
-            label("Finger auflegen", size: 13, weight: .semibold),
+            prompt,
             label("Diesen Vorgang einmal erlauben", size: 11, color: .secondaryLabelColor),
         ], spacing: 3)
         let cancel = NSButton(title: "Ablehnen", target: self, action: #selector(decline))
@@ -269,9 +388,9 @@ final class ReviewController: NSObject, NSWindowDelegate {
         window.hasShadow = true
         window.level = .floating
         window.isMovableByWindowBackground = true
-        window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.delegate = self
-        window.cancel = { [weak self] in self?.finish(false) }
+        window.cancel = { [weak self] in self?.authentication.deny() }
 
         let content = NSView()
         if #available(macOS 26.0, *) {
@@ -342,55 +461,45 @@ final class ReviewController: NSObject, NSWindowDelegate {
         resizeToFit()
     }
 
-    @objc private func decline() { finish(false) }
+    @objc private func decline() { authentication.deny() }
 
-    func windowWillClose(_ notification: Notification) { finish(false) }
+    func windowWillClose(_ notification: Notification) { authentication.deny() }
 
     func windowDidResignKey(_ notification: Notification) {
-        if authenticationStarted && !finished { finish(false) }
+        authentication.resignedKey()
     }
 
     func windowDidBecomeKey(_ notification: Notification) {
         // Wait until the populated window is on screen and the application is
         // active. No click, recent unlock or second system alert is required.
-        DispatchQueue.main.async { [weak self] in self?.beginAuthentication() }
+        DispatchQueue.main.async { [weak self] in self?.authentication.becameKey() }
     }
 
-    private func beginAuthentication() {
-        guard !finished, !authenticationStarted,
-              let window, window.isVisible, window.isKeyWindow, NSApp.isActive else { return }
-        authenticationStarted = true
-        context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics,
-            localizedReason: "\(request.description.agent): \(request.description.title)") { [weak self] success, _ in
-            DispatchQueue.main.async {
-                guard let self, !self.finished else { return }
-                // Switching to another application must never leave a hidden
-                // approval waiting for a fingerprint intended for that app.
-                self.finish(success && NSApp.isActive && self.window?.isKeyWindow == true)
-            }
+    private func makeAttempt() -> BiometricAttempt? {
+        guard let fresh = NativeBiometricAttempt(
+            reason: "\(request.description.agent): \(request.description.title)") else {
+            FileHandle.standardError.write(Data("Touch ID ist nicht verfügbar. Der Vorgang bleibt gestoppt.\n".utf8))
+            return nil
         }
+        if let container = authContainer {
+            for child in container.subviews { child.removeFromSuperview() }
+            let view = LAAuthenticationView(context: fresh.context, controlSize: .large)
+            view.frame = container.bounds
+            view.autoresizingMask = [.width, .height]
+            container.addSubview(view)
+        }
+        authInstruction?.stringValue = "Finger auflegen"
+        resizeToFit()
+        return fresh
     }
 
     func run() -> Never {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
 
-        // A new context for every request, with no reuse of a recent unlock
-        // and no code/password fallback. Only an actual Touch ID result allows.
-        context.touchIDAuthenticationAllowableReuseDuration = 0
-        context.localizedFallbackTitle = ""
-        context.localizedCancelTitle = "Ablehnen"
-        var error: NSError?
-        guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error),
-              context.biometryType == .touchID else {
-            FileHandle.standardError.write(Data("Touch ID ist nicht verfügbar. Der Vorgang bleibt gestoppt.\n".utf8))
-            finish(false)
-        }
-
         let timer = Timer(timeInterval: 120, repeats: false) { [weak self] _ in
             DispatchQueue.main.async {
-                guard let self, !self.finished else { return }
-                self.finish(false)
+                self?.authentication.deny()
             }
         }
         self.timer = timer
@@ -399,10 +508,12 @@ final class ReviewController: NSObject, NSWindowDelegate {
         self.window = window
         resizeToFit()
         window.center()
+        authentication.appeared()
         window.makeKeyAndOrderFront(nil)
         app.activate(ignoringOtherApps: true)
-        DispatchQueue.main.async { [weak self] in self?.beginAuthentication() }
+        DispatchQueue.main.async { [weak self] in self?.authentication.becameKey() }
         app.run()
+        authentication.deny()
         finish(false)
     }
 }

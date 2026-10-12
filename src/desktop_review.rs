@@ -902,6 +902,43 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn focus_controller_handles_cancelled_and_stale_biometric_attempts() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("controller-tests");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let compiled = Command::new("/usr/bin/swiftc")
+            .args([
+                "-swift-version",
+                "5",
+                "-parse-as-library",
+                "-warnings-as-errors",
+                "-D",
+                "DCG_UI_PREVIEW",
+            ])
+            .arg(source.join("src/desktop_review.swift"))
+            .arg(source.join("tests/desktop_review_controller.swift"))
+            .arg("-module-cache-path")
+            .arg(root.path().join("swift-modules"))
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let output = Command::new(binary).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("12 controller cases passed"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn native_helper_cache_refuses_modified_bytes_and_symlinks() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
