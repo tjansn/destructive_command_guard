@@ -89,6 +89,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.11"
 hmac = "0.13"  # HMAC for optional short-code hardening (ksk.1.10)
 fs2 = "0.4"
+tempfile = "3.14"            # RAII cleanup of isolated sandbox trial directories
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }  # Stable bundled SQLite for history telemetry
 ctrlc = "3.5.1"
 flate2 = "1.0"  # Gzip compression for history export
@@ -114,7 +115,7 @@ rich_rust = { version = "0.2.2", features = ["markdown"], optional = true }
 # Safe `gethostname()` for the history `hostname` column (#514). nix is already
 # compiled in through ctrlc; this only turns on its `hostname` feature, so no
 # new crate enters the graph and `#![forbid(unsafe_code)]` still holds here.
-nix = { version = "0.31", default-features = false, features = ["hostname"] }
+nix = { version = "0.31", default-features = false, features = ["hostname", "signal", "process"] }
 
 [build-dependencies]
 vergen-gix = { version = "10.0.0-beta.8", features = ["build", "cargo", "rustc"] }

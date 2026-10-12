@@ -95,6 +95,9 @@ pub mod stats;
 pub mod suggest;
 pub mod suggestions;
 pub mod trace;
+pub mod trial;
+pub mod trial_profile;
+pub mod trial_store;
 pub mod update;
 
 // #442 regressions against the real ast-grep bash parser. The declaration belongs
