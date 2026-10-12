@@ -9565,13 +9565,16 @@ fn literal_file_data_consumers_inner(
             }
             ancestor = parent.parent();
         }
+        // Bash gives a bare numeric argv value (for example `-P 2222`) its
+        // own `number` node. It is still literal data; the option-specific
+        // validators below decide whether that value is permitted.
         if node
             .children()
             .filter(ast_grep_core::Node::is_named)
             .any(|child| {
                 !matches!(
                     child.kind().as_ref(),
-                    "command_name" | "word" | "raw_string" | "string"
+                    "command_name" | "word" | "number" | "raw_string" | "string"
                 )
             })
         {
@@ -13100,6 +13103,48 @@ mod tests {
             assert!(
                 !mask_non_executing_heredocs(command).contains("rm -rf ~/a"),
                 "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_transfer_numeric_options_preserve_the_data_contract() {
+        let command = "scp -q -P 2222 m.txt host:/tmp/";
+        let arguments = shell_words::split("-q -P 2222 m.txt host:/tmp/").unwrap();
+        assert_eq!(
+            literal_transport_options_end(&arguments, 0, true),
+            Some((3, false))
+        );
+        assert!(literal_scp_file_transfer(&arguments).is_some());
+        let ast = AstGrep::new(command, SupportLang::Bash);
+        let node = ast
+            .root()
+            .dfs()
+            .find(|node| node.kind().as_ref() == "command")
+            .unwrap();
+        let kinds: Vec<_> = node
+            .children()
+            .map(|child| child.kind().into_owned())
+            .collect();
+        let proof = literal_file_data_consumers_inner(
+            command,
+            command,
+            Instant::now(),
+            Duration::from_secs(5),
+        );
+        assert_eq!(proof.len(), 1, "literal command children: {kinds:?}");
+        for unverified in [
+            "scp -P \"$PORT\" m.txt host:/tmp/",
+            "scp -P '22;22' m.txt host:/tmp/",
+        ] {
+            assert!(
+                literal_file_data_consumers_inner(
+                    unverified,
+                    unverified,
+                    Instant::now(),
+                    Duration::from_secs(5),
+                )
+                .is_empty()
             );
         }
     }
