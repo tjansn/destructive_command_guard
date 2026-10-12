@@ -29,7 +29,11 @@ enum Verdict {
     Deny(&'static str),
 }
 
-const RULES: &[&str] = &["redirect-truncate-root-home", "credential-file-write"];
+const RULES: &[&str] = &[
+    "redirect-truncate-root-home",
+    "redirect-truncate-git-internals-relative",
+    "credential-file-write",
+];
 
 /// Evaluate one shell command in hook mode with `home` as `$HOME`.
 fn verdict(command: &str, home: &Path) -> Verdict {
@@ -147,11 +151,11 @@ fn absent_literal_home_targets_are_creation_regardless_of_vcs() {
     );
     assert_eq!(
         verdict("echo hi > ~/repo/.git/HEAD-new", home),
-        Verdict::Deny("redirect-truncate-root-home")
+        Verdict::Deny("redirect-truncate-git-internals-relative")
     );
     assert_eq!(
         verdict("echo hi > ~/.claude/.git/config", home),
-        Verdict::Deny("redirect-truncate-root-home")
+        Verdict::Deny("redirect-truncate-git-internals-relative")
     );
     assert_eq!(
         verdict("echo hi > ~/.claude/absent.txt > ~/.vimrc", home),
