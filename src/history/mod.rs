@@ -810,6 +810,16 @@ fn recover_history_db(
         return false;
     };
 
+    // Failed COMMIT/ROLLBACK paths can retain a transaction and its writer
+    // lock. Release it before opening the replacement, otherwise recovery
+    // contends with its own old connection. Never commit partial failed work.
+    if !db.connection().is_autocommit() {
+        if let Err(error) = db.connection().execute("ROLLBACK;") {
+            error!(error = %error, "Cannot roll back history transaction before recovery");
+            return false;
+        }
+    }
+
     match HistoryDb::open(Some(path.clone())) {
         Ok(recovered_db) => match recovered_db.enforce_size_limit(max_size_bytes) {
             Ok(true) => {
@@ -958,6 +968,12 @@ fn flush_batch(db: &HistoryDb, batch: &mut Vec<CommandEntry>) -> FlushOutcome {
     if batch.is_empty() {
         return FlushOutcome::Success;
     }
+    if !db.connection().is_autocommit() {
+        // An INSERT inside a leftover transaction can return Ok without
+        // committing anything. Do not retire entries on that false success.
+        error!("History connection retained an unfinished transaction; recovery required");
+        return FlushOutcome::Fatal;
+    }
 
     let batch_len = batch.len();
     trace!(batch_size = batch_len, "Flushing history batch");
@@ -972,6 +988,13 @@ fn flush_batch(db: &HistoryDb, batch: &mut Vec<CommandEntry>) -> FlushOutcome {
                 return FlushOutcome::Success;
             }
             Err(e) => {
+                // The schema layer attempts rollback on error, but cannot
+                // guarantee that rollback succeeds after a storage failure.
+                // Retain the entire batch until that transaction is aborted.
+                if !db.connection().is_autocommit() {
+                    error!(error = %e, "Failed history batch left an active transaction");
+                    return FlushOutcome::Fatal;
+                }
                 if is_contention_error(&e) {
                     debug!(
                         batch_size = batch_len,
@@ -1017,7 +1040,7 @@ fn flush_individual_entries(
     let mut error_count = 0;
     let mut outcome = FlushOutcome::Success;
 
-    for entry in batch.iter() {
+    for (index, entry) in batch.iter().enumerate() {
         match insert(entry) {
             Ok(_id) => trace!("Inserted history entry"),
             Err(e) => {
@@ -1042,7 +1065,7 @@ fn flush_individual_entries(
                 }
             }
         }
-        processed += 1;
+        processed = index + 1;
     }
 
     // Mutate only after the iteration borrow ends, and shift the suffix once
@@ -1161,6 +1184,79 @@ mod tests {
     }
 
     #[test]
+    fn unfinished_transaction_is_rolled_back_before_recovery_replays_batch() {
+        for commands in [&["only"][..], &["prefix", "tail"][..]] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("unfinished-transaction.db");
+            let mut db = HistoryDb::open(Some(path.clone())).unwrap();
+            let mut batch = recovery_test_entries(commands);
+            db.connection().execute("BEGIN IMMEDIATE;").unwrap();
+            db.log_command(&batch[0]).unwrap();
+            assert!(!db.connection().is_autocommit());
+            assert!(persisted_test_commands(&path).is_empty());
+
+            assert_eq!(flush_batch(&db, &mut batch), FlushOutcome::Fatal);
+            assert_eq!(batch.len(), commands.len(), "uncommitted entries must remain queued");
+            assert_eq!(db.count_commands().unwrap(), 1);
+
+            // Exercise the production recovery path, not a simulated reopen.
+            // It must release its own old lock and discard the uncommitted
+            // prefix before retrying the full batch exactly once.
+            let mut disabled = false;
+            flush_batch_with_recovery(
+                &mut db,
+                &mut batch,
+                Some(&path),
+                &mut disabled,
+                WorkerConfig::default().max_size_bytes,
+            );
+            assert!(!disabled, "recovery must not contend with its own transaction");
+            assert!(db.connection().is_autocommit());
+            assert!(batch.is_empty());
+            assert_eq!(persisted_test_commands(&path), commands);
+            for command in commands {
+                assert_fts_probe_count(&path, command, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_bulk_commit_rolls_back_without_replaying_contended_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("commit-contention.db");
+        let mut db = HistoryDb::open(Some(path.clone())).unwrap();
+        // A rollback-journal reader permits BEGIN IMMEDIATE and the INSERTs,
+        // but prevents COMMIT. This tests a different boundary from a competing
+        // writer that rejects BEGIN before any entry has been attempted.
+        db.connection().execute("PRAGMA journal_mode=DELETE;").unwrap();
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN;").unwrap();
+        let before: i64 = reader
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, 0);
+        let mut batch = recovery_test_entries(&["droppedfirst", "droppedsecond"]);
+        let mut disabled = false;
+        let max_size = WorkerConfig::default().max_size_bytes;
+        flush_batch_with_recovery(&mut db, &mut batch, Some(&path), &mut disabled, max_size);
+        assert!(!disabled, "ordinary commit contention must not disable the writer");
+        assert!(db.connection().is_autocommit(), "failed COMMIT must be rolled back");
+        assert!(batch.is_empty(), "contended telemetry remains best-effort");
+        reader.execute_batch("ROLLBACK;").unwrap();
+        drop(reader);
+        assert!(persisted_test_commands(&path).is_empty());
+
+        batch = recovery_test_entries(&["afterunlock"]);
+        flush_batch_with_recovery(&mut db, &mut batch, Some(&path), &mut disabled, max_size);
+        assert!(!disabled);
+        assert!(batch.is_empty());
+        assert_eq!(persisted_test_commands(&path), vec!["afterunlock"]);
+        assert_fts_probe_count(&path, "droppedfirst", 0);
+        assert_fts_probe_count(&path, "droppedsecond", 0);
+        assert_fts_probe_count(&path, "afterunlock", 1);
+    }
+
+    #[test]
     fn batch_fallback_keeps_good_rows_and_legitimate_repeated_commands() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("fallback-repeated.db");
@@ -1171,6 +1267,7 @@ mod tests {
         // The first row must be rolled back when the bulk insert hits the
         // trigger. Fallback then commits the two distinct, identical events.
         assert!(db.log_commands_batch(&batch).is_err());
+        assert!(db.connection().is_autocommit());
         assert!(persisted_test_commands(&path).is_empty());
         assert_eq!(flush_batch(&db, &mut batch), FlushOutcome::Success);
         assert!(batch.is_empty());
@@ -1206,7 +1303,10 @@ mod tests {
             assert_eq!(attempted, fail_at + 1);
             assert_eq!(persisted_test_commands(&path), commands[..fail_at]);
             assert_eq!(
-                batch.iter().map(|entry| entry.command.as_str()).collect::<Vec<_>>(),
+                batch
+                    .iter()
+                    .map(|entry| entry.command.as_str())
+                    .collect::<Vec<_>>(),
                 commands[fail_at..]
             );
 
@@ -1240,7 +1340,10 @@ mod tests {
         assert_eq!(result, FlushOutcome::Fatal);
         assert_eq!(persisted_test_commands(&path), vec!["committed"]);
         assert_eq!(
-            batch.iter().map(|entry| entry.command.as_str()).collect::<Vec<_>>(),
+            batch
+                .iter()
+                .map(|entry| entry.command.as_str())
+                .collect::<Vec<_>>(),
             vec!["pending", "tail"]
         );
 
@@ -1283,7 +1386,10 @@ mod tests {
             assert_eq!(attempted, 2);
             assert_eq!(db.count_commands().unwrap(), 1);
             assert_eq!(
-                batch.iter().map(|entry| entry.command.as_str()).collect::<Vec<_>>(),
+                batch
+                    .iter()
+                    .map(|entry| entry.command.as_str())
+                    .collect::<Vec<_>>(),
                 vec!["pending", "unattempted"]
             );
         }
@@ -1300,7 +1406,10 @@ mod tests {
         reject_recovery_test_entry(&db);
         let mut batch = recovery_test_entries(&["rejected"]);
         assert_eq!(flush_batch(&db, &mut batch), FlushOutcome::Success);
-        assert!(batch.is_empty(), "permanently rejected entries are not retried");
+        assert!(
+            batch.is_empty(),
+            "permanently rejected entries are not retried"
+        );
         assert_eq!(db.count_commands().unwrap(), 0);
     }
 

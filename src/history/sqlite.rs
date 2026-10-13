@@ -40,6 +40,13 @@ impl Connection {
         rusqlite::Connection::open(path).map(|inner| Self { inner })
     }
 
+    /// Whether standalone inserts can commit independently of an earlier
+    /// transaction. A failed SQL statement does not necessarily restore this.
+    #[must_use]
+    pub(crate) fn is_autocommit(&self) -> bool {
+        self.inner.is_autocommit()
+    }
+
     /// Execute one or more SQL statements without bind parameters.
     pub fn execute(&self, sql: &str) -> Result<(), Error> {
         self.inner.execute_batch(sql)
@@ -100,6 +107,35 @@ fn materialize_row(row: &rusqlite::Row<'_>, column_count: usize) -> Result<Row, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autocommit_state_distinguishes_statement_failure_from_rollback() {
+        let connection = Connection::open(":memory:").unwrap();
+        assert!(connection.is_autocommit());
+        connection
+            .execute(
+                "CREATE TABLE transaction_probe(value TEXT UNIQUE);
+                 BEGIN IMMEDIATE;
+                 INSERT INTO transaction_probe VALUES ('first');",
+            )
+            .unwrap();
+        assert!(!connection.is_autocommit());
+        assert!(
+            connection
+                .execute("INSERT INTO transaction_probe VALUES ('first');")
+                .is_err()
+        );
+        assert!(
+            !connection.is_autocommit(),
+            "a constraint error alone does not roll back the transaction"
+        );
+        connection.execute("ROLLBACK;").unwrap();
+        assert!(connection.is_autocommit());
+        let row = connection
+            .query_row("SELECT COUNT(*) FROM transaction_probe")
+            .unwrap();
+        assert_eq!(row.values(), &[SqliteValue::Integer(0)]);
+    }
 
     #[test]
     fn query_rows_are_owned_and_parameter_binding_is_native() {
