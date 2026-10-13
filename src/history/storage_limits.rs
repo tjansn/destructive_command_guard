@@ -478,4 +478,120 @@ mod tests {
             "in-memory writes remain uncapped"
         );
     }
+
+    #[test]
+    fn running_writer_stops_after_another_connection_outgrows_its_cap() {
+        use crate::history::HistoryEnqueueOutcome;
+        use std::time::Duration;
+
+        for batch_size in [1, 50] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("running-writer-cap.db");
+            let other = HistoryDb::open(Some(path.clone())).unwrap();
+            let writer = HistoryWriter::new(
+                Some(path),
+                &HistoryConfig {
+                    enabled: true,
+                    auto_prune: false,
+                    max_size_mb: 1,
+                    batch_size,
+                    redaction_mode: HistoryRedactionMode::None,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                writer.try_log(CommandEntry {
+                    command: "positivecontrol".to_string(),
+                    ..Default::default()
+                }),
+                HistoryEnqueueOutcome::Queued
+            );
+            // Synchronize startup and prove a real write before external
+            // growth. The watchdog is not a throughput/latency requirement.
+            assert!(
+                writer.flush_sync_with_timeout(Duration::from_secs(30)),
+                "startup flush did not complete within the test watchdog"
+            );
+            assert_eq!(other.count_commands().unwrap(), 1);
+            add_payload(&other);
+            assert!(
+                pragma_integer(&other, "PRAGMA main.page_count").unwrap()
+                    * history_page_size(&other).unwrap()
+                    > CAP
+            );
+            for command in ["aftergrowthfirst", "aftergrowthsecond"] {
+                assert_eq!(
+                    writer.try_log(CommandEntry {
+                        command: command.to_string(),
+                        ..Default::default()
+                    }),
+                    HistoryEnqueueOutcome::Queued
+                );
+            }
+            // Normal library shutdown is the persistence barrier, not a sleep.
+            drop(writer);
+            let rows = other
+                .connection()
+                .query("SELECT command FROM commands ORDER BY id")
+                .unwrap();
+            assert_eq!(rows.len(), 1, "only the pre-growth event may persist");
+            assert_eq!(
+                rows[0].values(),
+                &[SqliteValue::Text("positivecontrol".to_string())]
+            );
+            let unexpected = other
+                .connection()
+                .query(
+                    "SELECT rowid FROM commands_fts WHERE commands_fts MATCH 'aftergrowthfirst OR aftergrowthsecond'",
+                )
+                .unwrap();
+            assert!(unexpected.is_empty());
+        }
+    }
+
+    #[test]
+    fn recovered_worker_rechecks_the_limit_before_its_next_batch() {
+        use crate::history::{flush_batch_with_recovery, recover_history_db};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("recovered-writer-cap.db");
+        let mut db = HistoryDb::open(Some(path.clone())).unwrap();
+        let other = HistoryDb::open(Some(path.clone())).unwrap();
+        db.log_command(&CommandEntry {
+            command: "beforerecovery".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(recover_history_db(&mut db, Some(&path), CAP));
+        // Recovery installed a valid cap, then a different connection grew
+        // the file. The retry/write path must not trust the recovered cap.
+        add_payload(&other);
+        let mut batch = vec![
+            CommandEntry {
+                command: "recoveryfirst".to_string(),
+                ..Default::default()
+            },
+            CommandEntry {
+                command: "recoverysecond".to_string(),
+                ..Default::default()
+            },
+        ];
+        let mut disabled = false;
+        flush_batch_with_recovery(&mut db, &mut batch, Some(&path), &mut disabled, CAP);
+        assert!(
+            disabled,
+            "a newly over-cap database must disable further writes"
+        );
+        assert!(batch.is_empty());
+        assert!(db.connection().is_autocommit());
+        let rows = other
+            .connection()
+            .query("SELECT command FROM commands ORDER BY id")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].values(),
+            &[SqliteValue::Text("beforerecovery".to_string())]
+        );
+    }
 }
