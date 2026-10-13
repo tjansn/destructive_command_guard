@@ -35,14 +35,16 @@
 //! })?;
 //! ```
 
+mod queue_budget;
 mod schema;
 mod sqlite;
 
 use crate::config::{HistoryConfig, HistoryRedactionMode, resolve_config_path_value};
 use crate::logging::{RedactionConfig, RedactionMode};
+use queue_budget::{QueueBudget, Reservation, ReserveError};
 use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, trace, warn};
@@ -71,6 +73,34 @@ pub const ENV_HISTORY_DISABLED: &str = "DCG_HISTORY_DISABLED";
 /// They also let subprocess persistence tests distinguish a known best-effort
 /// omission from unexplained data loss. Normal robot/hook output stays silent.
 pub const ENV_HISTORY_DIAGNOSTICS: &str = "DCG_HISTORY_DIAGNOSTICS";
+
+/// Maximum admitted entries per writer, including entries in its active batch.
+pub const MAX_PENDING_HISTORY_ENTRIES: usize = 4096;
+
+/// Maximum retained entry payload per writer (16 MiB), including string
+/// capacities and entry structures. This is not a cap on SQLite's page cache,
+/// allocator overhead, or the caller's input allocation.
+pub const MAX_PENDING_HISTORY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Flush requests have separate capacity; timeout does not release a queued
+/// request's slot. Shutdown never needs either an entry or a flush slot.
+pub const MAX_PENDING_HISTORY_FLUSHES: usize = 64;
+
+/// Admission result, not a durability acknowledgement. Accepted entries may
+/// still be dropped by the existing best-effort storage policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryEnqueueOutcome {
+    /// Admitted to the asynchronous writer.
+    Queued,
+    /// Collection is disabled for this writer.
+    Disabled,
+    /// Outstanding entries or their retained bytes exhausted the budget.
+    QueueFull,
+    /// This entry alone exceeds the retained-payload budget.
+    EntryTooLarge,
+    /// The worker's receiver has disconnected.
+    WorkerUnavailable,
+}
 
 /// The machine's hostname for the history `hostname` column (#514).
 ///
@@ -300,10 +330,94 @@ fn state_db_path_from(
         .join(DEFAULT_DB_FILENAME)
 }
 
+struct QueuedHistoryEntry {
+    // Drop the payload before releasing its admission capacity.
+    entry: Box<CommandEntry>,
+    reservation: Reservation,
+}
+
+struct ReservedFlush {
+    ack: mpsc::Sender<()>,
+    reservation: Reservation,
+}
+
+impl ReservedFlush {
+    fn acknowledge(self) {
+        // A caller awakened by the ack must be able to reserve a new flush.
+        drop(self.reservation);
+        let _ = self.ack.send(());
+    }
+}
+
 enum HistoryMessage {
-    Entry(Box<CommandEntry>),
-    Flush(mpsc::Sender<()>),
+    Entry(QueuedHistoryEntry),
+    Flush(ReservedFlush),
     Shutdown(mpsc::Sender<()>),
+}
+
+fn retained_entry_bytes(entry: &CommandEntry) -> usize {
+    [
+        Some(&entry.agent_type),
+        Some(&entry.working_dir),
+        Some(&entry.command),
+        entry.pack_id.as_ref(),
+        entry.pattern_name.as_ref(),
+        entry.rule_id.as_ref(),
+        entry.session_id.as_ref(),
+        entry.hostname.as_ref(),
+        entry.allowlist_layer.as_ref(),
+        entry.bypass_code.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .fold(
+        std::mem::size_of::<CommandEntry>() + std::mem::size_of::<QueuedHistoryEntry>(),
+        |total, value| total.saturating_add(value.capacity()),
+    )
+}
+
+/// Keep reservations with the storage batch, not merely the channel messages.
+/// Fields are ordered so unwinding frees entries before returning capacity.
+struct PendingHistoryBatch {
+    entries: Vec<CommandEntry>,
+    reservations: Vec<Reservation>,
+}
+
+impl PendingHistoryBatch {
+    fn new(batch_size: usize) -> Self {
+        let capacity = batch_size.min(MAX_PENDING_HISTORY_ENTRIES);
+        Self {
+            entries: Vec::with_capacity(capacity),
+            reservations: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push(&mut self, queued: QueuedHistoryEntry) {
+        self.entries.push(*queued.entry);
+        self.reservations.push(queued.reservation);
+    }
+
+    fn flush(
+        &mut self,
+        db: &mut HistoryDb,
+        db_path: Option<&PathBuf>,
+        history_disabled: &mut bool,
+        max_size_bytes: u64,
+    ) {
+        flush_batch_with_recovery(
+            db,
+            &mut self.entries,
+            db_path,
+            history_disabled,
+            max_size_bytes,
+        );
+        // All current outcomes empty the batch, including best-effort drops.
+        // If a future recovery path retains entries, retain their reservations
+        // too rather than allowing unaccounted payloads to accumulate.
+        if self.entries.is_empty() {
+            self.reservations.clear();
+        }
+    }
 }
 
 /// Configuration for the history worker thread.
@@ -333,7 +447,7 @@ impl Default for WorkerConfig {
 impl From<&HistoryConfig> for WorkerConfig {
     fn from(config: &HistoryConfig) -> Self {
         Self {
-            batch_size: config.batch_size.max(1) as usize,
+            batch_size: (config.batch_size.max(1) as usize).min(MAX_PENDING_HISTORY_ENTRIES),
             flush_interval: Duration::from_millis(u64::from(config.batch_flush_interval_ms.max(1))),
             auto_prune: config.auto_prune,
             retention_days: config
@@ -350,9 +464,22 @@ impl From<&HistoryConfig> for WorkerConfig {
 #[derive(Clone)]
 pub struct HistoryFlushHandle {
     sender: mpsc::Sender<HistoryMessage>,
+    budget: Arc<QueueBudget>,
 }
 
 impl HistoryFlushHandle {
+    fn request_flush(&self) -> Option<mpsc::Receiver<()>> {
+        let reservation = self.budget.try_reserve(1).ok()?;
+        let (ack_tx, ack_rx) = mpsc::channel();
+        self.sender
+            .send(HistoryMessage::Flush(ReservedFlush {
+                ack: ack_tx,
+                reservation,
+            }))
+            .ok()?;
+        Some(ack_rx)
+    }
+
     /// Request a flush and wait up to the hook-safe bounded timeout.
     ///
     /// History is best-effort telemetry, so lock contention or a stalled
@@ -366,18 +493,25 @@ impl HistoryFlushHandle {
     /// Returns `true` only when the worker acknowledged that every entry
     /// queued before this request was processed. Processing can intentionally
     /// drop best-effort telemetry; this is not a durability acknowledgement.
+    /// Returns `false` on timeout, worker disconnection, or a full flush-request
+    /// budget. Entry saturation does not consume the separate flush budget.
     #[must_use]
     pub fn flush_sync_with_timeout(&self, timeout: Duration) -> bool {
-        let (ack_tx, ack_rx) = mpsc::channel();
-        self.sender.send(HistoryMessage::Flush(ack_tx)).is_ok()
-            && ack_rx.recv_timeout(timeout).is_ok()
+        self.request_flush()
+            .is_some_and(|ack_rx| ack_rx.recv_timeout(timeout).is_ok())
     }
 }
 
 /// Asynchronous history writer with write batching support.
+///
+/// Entry admission is bounded by count and retained bytes across both the
+/// channel and active batch. Saturation drops telemetry without waiting for
+/// storage; use [`Self::try_log`] to inspect that admission result.
 pub struct HistoryWriter {
     sender: Option<mpsc::Sender<HistoryMessage>>,
     handle: Option<thread::JoinHandle<()>>,
+    entry_budget: Option<Arc<QueueBudget>>,
+    flush_budget: Option<Arc<QueueBudget>>,
     redaction_mode: HistoryRedactionMode,
     session_id: String,
     wait_for_worker_on_drop: bool,
@@ -418,7 +552,7 @@ impl HistoryWriter {
                             "storage_error"
                         };
                         history_diagnostic(status, format_args!("phase=open"));
-                        // Drain the receiver so senders don't block
+                        // Dropping the queued messages also releases their reservations.
                         drop(receiver);
                     }
                 }
@@ -439,6 +573,14 @@ impl HistoryWriter {
         Self {
             sender: Some(sender),
             handle: Some(handle),
+            entry_budget: Some(Arc::new(QueueBudget::new(
+                MAX_PENDING_HISTORY_ENTRIES,
+                MAX_PENDING_HISTORY_BYTES,
+            ))),
+            flush_budget: Some(Arc::new(QueueBudget::new(
+                MAX_PENDING_HISTORY_FLUSHES,
+                MAX_PENDING_HISTORY_FLUSHES,
+            ))),
             redaction_mode: config.redaction_mode,
             session_id,
             wait_for_worker_on_drop: true,
@@ -451,6 +593,8 @@ impl HistoryWriter {
         Self {
             sender: None,
             handle: None,
+            entry_budget: None,
+            flush_budget: None,
             redaction_mode: HistoryRedactionMode::Pattern,
             session_id: String::new(),
             wait_for_worker_on_drop: true,
@@ -466,40 +610,70 @@ impl HistoryWriter {
 
     #[must_use]
     pub fn flush_handle(&self) -> Option<HistoryFlushHandle> {
-        self.sender.as_ref().map(|sender| HistoryFlushHandle {
-            sender: sender.clone(),
-        })
+        self.sender
+            .as_ref()
+            .zip(self.flush_budget.as_ref())
+            .map(|(sender, budget)| HistoryFlushHandle {
+                sender: sender.clone(),
+                budget: Arc::clone(budget),
+            })
     }
 
-    /// Log a command entry asynchronously.
-    pub fn log(&self, mut entry: CommandEntry) {
+    /// Log a command entry asynchronously, dropping it on admission failure.
+    pub fn log(&self, entry: CommandEntry) {
+        let _ = self.try_log(entry);
+    }
+
+    /// Redact and attempt to admit an entry without waiting for the worker.
+    ///
+    /// Capacity covers the retained, redacted entry and every metadata string's
+    /// allocated capacity. A queued result is not a persistence guarantee.
+    #[must_use]
+    pub fn try_log(&self, mut entry: CommandEntry) -> HistoryEnqueueOutcome {
         let _phase = crate::perf::PhaseTimer::start("history_enqueue_redact");
+        let (Some(sender), Some(budget)) = (&self.sender, &self.entry_budget) else {
+            return HistoryEnqueueOutcome::Disabled;
+        };
         entry.command = redact_for_history(&entry.command, self.redaction_mode);
-        // Set session ID if not already set
         if entry.session_id.is_none() && !self.session_id.is_empty() {
             entry.session_id = Some(self.session_id.clone());
         }
-        if let Some(sender) = &self.sender {
-            // Every writer path used to leave this NULL, so rows from several
-            // machines could not be told apart once merged (#514).
-            if entry.hostname.is_none() {
-                entry.hostname = local_hostname().map(str::to_string);
-            }
-            if let Err(e) = sender.send(HistoryMessage::Entry(Box::new(entry))) {
-                // Channel disconnected - worker thread likely crashed or shutdown
-                warn!(
-                    error = %e,
-                    "Failed to send history entry - worker thread unavailable"
+        // Every writer path used to leave this NULL, so rows from several
+        // machines could not be told apart once merged (#514).
+        if entry.hostname.is_none() {
+            entry.hostname = local_hostname().map(str::to_string);
+        }
+        let bytes = retained_entry_bytes(&entry);
+        let reservation = match budget.try_reserve(bytes) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                history_diagnostic(
+                    "queue_drop",
+                    format_args!("phase=admission reason={error:?} bytes={bytes}"),
                 );
+                return match error {
+                    ReserveError::Full => HistoryEnqueueOutcome::QueueFull,
+                    ReserveError::Oversized => HistoryEnqueueOutcome::EntryTooLarge,
+                };
+            }
+        };
+        match sender.send(HistoryMessage::Entry(QueuedHistoryEntry {
+            entry: Box::new(entry),
+            reservation,
+        })) {
+            Ok(()) => HistoryEnqueueOutcome::Queued,
+            Err(error) => {
+                warn!(error = %error, "Failed to send history entry - worker thread unavailable");
+                HistoryEnqueueOutcome::WorkerUnavailable
             }
         }
     }
 
-    /// Request a flush without waiting for completion.
+    /// Request a flush without waiting for completion. Repeated requests use
+    /// bounded control capacity; a saturated request queue drops the request.
     pub fn flush(&self) {
-        if let Some(sender) = &self.sender {
-            let (ack_tx, _ack_rx) = mpsc::channel();
-            let _ = sender.send(HistoryMessage::Flush(ack_tx));
+        if let Some(handle) = self.flush_handle() {
+            let _ = handle.request_flush();
         }
     }
 
@@ -546,6 +720,8 @@ impl Drop for HistoryWriter {
         let _phase = crate::perf::PhaseTimer::start("history_shutdown_wait");
         if let Some(sender) = self.sender.take() {
             let (ack_tx, ack_rx) = mpsc::channel();
+            // There is only one shutdown producer. This control message bypasses
+            // admission budgets so saturation cannot discard normal shutdown.
             if sender.send(HistoryMessage::Shutdown(ack_tx)).is_ok() && self.wait_for_worker_on_drop
             {
                 if let Some(deadline) = self.drop_wait_deadline {
@@ -658,7 +834,7 @@ fn run_history_worker(
     config: WorkerConfig,
     mut receive: impl FnMut(Option<Duration>) -> Result<HistoryMessage, mpsc::RecvTimeoutError>,
 ) {
-    let mut batch: Vec<CommandEntry> = Vec::with_capacity(config.batch_size);
+    let mut batch = PendingHistoryBatch::new(config.batch_size);
     let mut last_flush = Instant::now();
     let mut last_prune_check = Instant::now();
     let db_path = db.path().map(std::path::Path::to_path_buf);
@@ -695,7 +871,7 @@ fn run_history_worker(
     loop {
         let timeout = history_receive_timeout(
             &config,
-            batch.is_empty(),
+            batch.entries.is_empty(),
             history_disabled,
             last_flush,
             last_prune_check,
@@ -714,17 +890,16 @@ fn run_history_worker(
                 if history_disabled {
                     continue;
                 }
-                if batch.is_empty() {
+                if batch.entries.is_empty() {
                     // Measure batch age from its first entry, not worker
                     // startup, and do not postpone it for subsequent entries.
                     last_flush = Instant::now();
                 }
-                batch.push(*entry);
+                batch.push(entry);
 
-                if batch.len() >= config.batch_size {
-                    flush_batch_with_recovery(
+                if batch.entries.len() >= config.batch_size {
+                    batch.flush(
                         &mut db,
-                        &mut batch,
                         db_path.as_ref(),
                         &mut history_disabled,
                         config.max_size_bytes,
@@ -732,27 +907,25 @@ fn run_history_worker(
                     last_flush = Instant::now();
                 }
             }
-            Ok(HistoryMessage::Flush(ack)) => {
+            Ok(HistoryMessage::Flush(request)) => {
                 // mpsc is FIFO: every entry queued before this marker has
                 // already been handled. Draining *later* messages here makes
                 // the barrier a moving target under sustained producers.
-                flush_batch_with_recovery(
+                batch.flush(
                     &mut db,
-                    &mut batch,
                     db_path.as_ref(),
                     &mut history_disabled,
                     config.max_size_bytes,
                 );
                 last_flush = Instant::now();
-                let _ = ack.send(());
+                request.acknowledge();
             }
             Ok(HistoryMessage::Shutdown(ack)) => {
                 // HistoryWriter is the only entry producer, and queues this
                 // marker after its final entry. Retained flush handles cannot
                 // extend shutdown by submitting requests after the marker.
-                flush_batch_with_recovery(
+                batch.flush(
                     &mut db,
-                    &mut batch,
                     db_path.as_ref(),
                     &mut history_disabled,
                     config.max_size_bytes,
@@ -764,10 +937,9 @@ fn run_history_worker(
                 return;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if !batch.is_empty() && last_flush.elapsed() >= config.flush_interval {
-                    flush_batch_with_recovery(
+                if !batch.entries.is_empty() && last_flush.elapsed() >= config.flush_interval {
+                    batch.flush(
                         &mut db,
-                        &mut batch,
                         db_path.as_ref(),
                         &mut history_disabled,
                         config.max_size_bytes,
@@ -785,9 +957,8 @@ fn run_history_worker(
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 debug!("History channel disconnected, performing final flush");
-                flush_batch_with_recovery(
+                batch.flush(
                     &mut db,
-                    &mut batch,
                     db_path.as_ref(),
                     &mut history_disabled,
                     config.max_size_bytes,
@@ -1139,6 +1310,23 @@ fn redact_for_history(command: &str, mode: HistoryRedactionMode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_entry_message(entry: CommandEntry) -> HistoryMessage {
+        let budget = Arc::new(QueueBudget::new(1, MAX_PENDING_HISTORY_BYTES));
+        let reservation = budget.try_reserve(retained_entry_bytes(&entry)).unwrap();
+        HistoryMessage::Entry(QueuedHistoryEntry {
+            entry: Box::new(entry),
+            reservation,
+        })
+    }
+
+    fn test_flush_message(ack: mpsc::Sender<()>) -> HistoryMessage {
+        let budget = Arc::new(QueueBudget::new(1, 1));
+        HistoryMessage::Flush(ReservedFlush {
+            ack,
+            reservation: budget.try_reserve(1).unwrap(),
+        })
+    }
 
     fn recovery_test_entries(commands: &[&str]) -> Vec<CommandEntry> {
         commands
@@ -1532,25 +1720,25 @@ mod tests {
         // but neither a later entry nor a later control message.
         for index in 0..257 {
             sender
-                .send(HistoryMessage::Entry(Box::new(CommandEntry {
+                .send(test_entry_message(CommandEntry {
                     command: format!("before-{index}"),
                     ..Default::default()
-                })))
+                }))
                 .unwrap();
         }
         let (first_tx, first_rx) = mpsc::channel();
         let (empty_tx, empty_rx) = mpsc::channel();
         let (last_tx, last_rx) = mpsc::channel();
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
-        sender.send(HistoryMessage::Flush(first_tx)).unwrap();
-        sender.send(HistoryMessage::Flush(empty_tx)).unwrap();
+        sender.send(test_flush_message(first_tx)).unwrap();
+        sender.send(test_flush_message(empty_tx)).unwrap();
         sender
-            .send(HistoryMessage::Entry(Box::new(CommandEntry {
+            .send(test_entry_message(CommandEntry {
                 command: "after-marker".to_string(),
                 ..Default::default()
-            })))
+            }))
             .unwrap();
-        sender.send(HistoryMessage::Flush(last_tx)).unwrap();
+        sender.send(test_flush_message(last_tx)).unwrap();
         sender.send(HistoryMessage::Shutdown(shutdown_tx)).unwrap();
         drop(sender);
 
@@ -1595,10 +1783,10 @@ mod tests {
         let db = HistoryDb::open(Some(path.clone())).unwrap();
         let (sender, receiver) = mpsc::channel();
         sender
-            .send(HistoryMessage::Entry(Box::new(CommandEntry {
+            .send(test_entry_message(CommandEntry {
                 command: "timer-flush".to_string(),
                 ..Default::default()
-            })))
+            }))
             .unwrap();
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         sender.send(HistoryMessage::Shutdown(shutdown_tx)).unwrap();
@@ -1631,15 +1819,15 @@ mod tests {
         let db = HistoryDb::open(Some(path.clone())).unwrap();
         let (sender, receiver) = mpsc::channel();
         sender
-            .send(HistoryMessage::Entry(Box::new(CommandEntry {
+            .send(test_entry_message(CommandEntry {
                 command: "final-entry".to_string(),
                 ..Default::default()
-            })))
+            }))
             .unwrap();
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let (late_tx, late_rx) = mpsc::channel();
         sender.send(HistoryMessage::Shutdown(shutdown_tx)).unwrap();
-        sender.send(HistoryMessage::Flush(late_tx)).unwrap();
+        sender.send(test_flush_message(late_tx)).unwrap();
         // Retaining this sender models a cloned flush handle at writer drop.
         history_worker(db, receiver, WorkerConfig::default());
         shutdown_rx.try_recv().expect("shutdown completed");
@@ -1667,10 +1855,10 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         for index in 0..3 {
             sender
-                .send(HistoryMessage::Entry(Box::new(CommandEntry {
+                .send(test_entry_message(CommandEntry {
                     command: format!("last-{index}"),
                     ..Default::default()
-                })))
+                }))
                 .unwrap();
         }
         drop(sender);
@@ -1686,12 +1874,13 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let flush = HistoryFlushHandle {
             sender: sender.clone(),
+            budget: Arc::new(QueueBudget::new(1, 1)),
         };
         sender
-            .send(HistoryMessage::Entry(Box::new(CommandEntry {
+            .send(test_entry_message(CommandEntry {
                 command: "queued exactly once".to_string(),
                 ..Default::default()
-            })))
+            }))
             .unwrap();
 
         // No worker is running: this must time out, regardless of host speed.
@@ -1699,11 +1888,11 @@ mod tests {
         let HistoryMessage::Entry(entry) = receiver.try_recv().unwrap() else {
             panic!("timing out must leave the original entry queued");
         };
-        assert_eq!(entry.command, "queued exactly once");
-        let HistoryMessage::Flush(ack) = receiver.try_recv().unwrap() else {
+        assert_eq!(entry.entry.command, "queued exactly once");
+        let HistoryMessage::Flush(request) = receiver.try_recv().unwrap() else {
             panic!("flush request must follow the entry");
         };
-        assert!(ack.send(()).is_err(), "expired waiter must be disconnected");
+        assert!(request.ack.send(()).is_err(), "expired waiter must be disconnected");
         assert!(matches!(
             receiver.try_recv(),
             Err(mpsc::TryRecvError::Empty)
@@ -1724,8 +1913,8 @@ mod tests {
         for canary in [
             "AKIAABCDEFGHIJKLMNOP",
             "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-            "sk_live_ABCDEFGHIJKLMNOPQRSTUVWXYZ",
             "sk_live_QUOTEDLONGTOKEN",
+            "sk_live_ABCDEFGHIJKLMNOPQRSTUVWXYZ",
         ] {
             assert!(
                 !stored.contains(canary),
@@ -1780,6 +1969,8 @@ mod tests {
         let mut writer = HistoryWriter {
             sender: None,
             handle: Some(handle),
+            entry_budget: None,
+            flush_budget: None,
             redaction_mode: HistoryRedactionMode::Pattern,
             session_id: String::new(),
             wait_for_worker_on_drop: true,
