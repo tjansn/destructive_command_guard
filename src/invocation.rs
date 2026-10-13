@@ -11,6 +11,11 @@ pub(crate) fn leading_cd(
 ) -> Option<(std::path::PathBuf, String)> {
     use crate::normalize::{NormalizeTokenKind, tokenize_for_normalization};
     let source = source.trim();
+    // The normalization tokenizer and shell_words disagree about comments.
+    // Reject even quoted '#' here instead of reviving a commented-out suffix.
+    if source.contains('#') {
+        return None;
+    }
     let tokens = tokenize_for_normalization(source);
     let separator = tokens
         .iter()
@@ -246,6 +251,9 @@ mod literal_environment_tests {
             "cd . || node --test",
             "cd",
             "cd . &&",
+            "cd . # && node --test",
+            "cd . # comment\n&& node --test",
+            "cd . && node --test # comment",
         ] {
             assert!(
                 leading_cd(command, temp.path(), None).is_none(),

@@ -385,6 +385,29 @@ mod tests {
     }
 
     #[test]
+    fn comments_cannot_create_a_confined_command_that_the_shell_does_not_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let sub = temp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(
+            sub.join("package.json"),
+            r#"{"scripts":{"test":"node --test"}}"#,
+        )
+        .unwrap();
+        assert!(eligible("cd sub && npm test", temp.path()));
+        for command in [
+            "cd sub # && npm test",
+            "cd sub # comment\n&& npm test",
+            "cd sub && npm test # comment",
+        ] {
+            assert!(!eligible(command, temp.path()), "{command}");
+            assert!(execution(command, temp.path()).is_none(), "{command}");
+            let request = Request::new(command, temp.path(), Path::new("/bin/sh"), 5);
+            assert!(request.validate().is_err(), "{command}");
+        }
+    }
+
+    #[test]
     fn finite_contract_rejects_services_chains_and_dynamic_operands() {
         let dir = tempfile::tempdir().unwrap();
         for source in [
