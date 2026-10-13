@@ -64,6 +64,10 @@ impl BoundEnvironment {
         if self.preload {
             Err("inherited preload or command-local startup state cannot be approved by literal-environment review".to_owned())
         } else {
+            let stripped = crate::normalize::strip_wrapper_prefixes(&self.command);
+            if stripped.wrapper_limit_reached || !stripped.stripped_wrappers.is_empty() {
+                return Err("nested environment or execution wrappers cannot be bound for literal-environment review".to_owned());
+            }
             Ok(())
         }
     }
@@ -92,6 +96,15 @@ pub(crate) fn preload_variable(name: &str) -> bool {
 }
 
 fn absolute_search_path(path: &std::ffi::OsStr) -> Result<(), String> {
+    // POSIX command data can also be inspected on Windows (e.g. git-bash).
+    // Keep slash-rooted POSIX PATH syntax separate from native guard paths.
+    if cfg!(windows)
+        && path
+            .to_str()
+            .is_some_and(|value| value.split(':').all(|entry| entry.starts_with('/')))
+    {
+        return Ok(());
+    }
     if path.is_empty() || std::env::split_paths(path).any(|entry| !entry.is_absolute()) {
         return Err(
             "PATH must contain only non-empty absolute directories; desktop review unavailable"

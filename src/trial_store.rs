@@ -1289,6 +1289,18 @@ fn resolved_executables(
     let mut local_environment = false;
     while let Some(node) = pending.pop() {
         pending.extend(node.children());
+        if node.kind().as_ref() == "variable_assignment"
+            && node
+                .parent()
+                .is_none_or(|parent| parent.kind().as_ref() != "command")
+            && node.text().split_once('=').is_some_and(|(name, _)| {
+                name == "PATH" || crate::invocation::preload_variable(name)
+            })
+        {
+            return Err(io::Error::other(
+                "standalone execution environment changes cannot be bound for review",
+            ));
+        }
         if node.kind().as_ref() == "command" {
             let text = node.text();
             let words = shell_words::split(&text).map_err(io::Error::other)?;
@@ -1540,6 +1552,9 @@ mod tests {
             "PATH=$PATH cargo test",
             "env -i PATH=$(pwd) cargo test",
             "timeout 10 env PATH=/unresolved cargo test",
+            "PATH=/bin; cargo test",
+            "NODE_OPTIONS=--require=./startup.js; node check.js",
+            "/usr/bin/env -i /usr/bin/env NODE_OPTIONS=--require=./startup.js node check.js",
         ] {
             assert!(resolved_executables(command, &project, &BTreeMap::new()).is_err());
         }
