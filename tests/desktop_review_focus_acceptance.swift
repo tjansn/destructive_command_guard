@@ -14,7 +14,15 @@ struct FocusAcceptance {
         }
         let appearance = CommandLine.arguments[1]
         let output = URL(fileURLWithPath: CommandLine.arguments[2]).standardizedFileURL.resolvingSymlinksInPath()
-        precondition(output.path.hasPrefix("/private/tmp/") || output.path.hasPrefix(URL(fileURLWithPath: NSTemporaryDirectory()).resolvingSymlinksInPath().path))
+        // Foundation may spell a resolved /private/tmp path as /tmp. Resolve
+        // both sides identically and compare components, not string prefixes.
+        let temporaryRoots = ["/private/tmp", NSTemporaryDirectory()].map {
+            URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        }
+        let outputComponents = output.pathComponents
+        precondition(temporaryRoots.contains {
+            outputComponents.count > $0.count && outputComponents.starts(with: $0)
+        }, "Screenshots must be inside a temporary directory")
         var directory: ObjCBool = false
         precondition(FileManager.default.fileExists(atPath: output.path, isDirectory: &directory) && directory.boolValue)
         NSApplication.shared.appearance = NSAppearance(named: appearance == "dark" ? .darkAqua : .aqua)
