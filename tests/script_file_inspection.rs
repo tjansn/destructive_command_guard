@@ -755,7 +755,13 @@ fn ordinary_assignment_prefixes_preserve_static_decisions_with_script_scanning()
     // These are tom.10's static allow cases. Exercise the full evaluator with
     // scan_script_files=true, including an unusable PATH in the hook process.
     // The candidates remain data; no npm, Swift, Git or grep command is run.
-    for path in ["/usr/bin:/bin", "", ".:/usr/bin", ":/usr/bin", "bin:/usr/bin"] {
+    for path in [
+        "/usr/bin:/bin",
+        "",
+        ".:/usr/bin",
+        ":/usr/bin",
+        "bin:/usr/bin",
+    ] {
         for (candidate, plain) in [
             ("CI=1 npm test", "npm test"),
             ("GIT_PAGER=cat git log", "git log"),
@@ -777,7 +783,10 @@ fn ordinary_assignment_prefixes_preserve_static_decisions_with_script_scanning()
                 result["decision"], baseline["decision"],
                 "{candidate}: {result}"
             );
-            assert_eq!(result["rule_id"], baseline["rule_id"], "{candidate}: {result}");
+            assert_eq!(
+                result["rule_id"], baseline["rule_id"],
+                "{candidate}: {result}"
+            );
             assert_eq!(output.status.code(), baseline_output.status.code());
         }
     }
@@ -798,7 +807,10 @@ fn local_preload_prefixes_keep_trial_diagnostics_with_script_scanning() {
             "CI=1 env CI=1 env PYTHONPATH=src pytest",
         ] {
             let (_, result) = fixture.run_with_path(candidate, path.as_ref());
-            assert_eq!(result["rule_id"], "heredoc.script_files:unverified", "{result}");
+            assert_eq!(
+                result["rule_id"], "heredoc.script_files:unverified",
+                "{result}"
+            );
             let text = result.to_string();
             assert!(text.contains("dcg trial run"), "{candidate}: {text}");
             assert!(!text.contains("bound-input-review"), "{candidate}: {text}");
@@ -852,7 +864,11 @@ fn disabled_trials_use_one_time_review_without_opening_the_approval_store() {
     use std::os::unix::fs::PermissionsExt;
     let fixture = Fixture::new();
     let policy = std::fs::read_to_string(&fixture.config).unwrap();
-    std::fs::write(&fixture.config, format!("{policy}\n[trial]\nenabled = false\n")).unwrap();
+    std::fs::write(
+        &fixture.config,
+        format!("{policy}\n[trial]\nenabled = false\n"),
+    )
+    .unwrap();
     // Unreadable approval data must not affect the disabled-trial path. The
     // oversized review text guarantees no native dialog opens in this test.
     fixture.write(
@@ -867,7 +883,10 @@ fn disabled_trials_use_one_time_review_without_opening_the_approval_store() {
         std::fs::Permissions::from_mode(0o700),
     )
     .unwrap();
-    let candidate = format!("PATH=/usr/bin:/bin ./review-fixture.sh {}", "x".repeat(6_000));
+    let candidate = format!(
+        "PATH=/usr/bin:/bin ./review-fixture.sh {}",
+        "x".repeat(6_000)
+    );
     let input = json!({"tool_name":"Bash", "tool_input":{"command":candidate}, "cwd":fixture.root});
     let mut child = fixture
         .command()
@@ -890,7 +909,8 @@ fn disabled_trials_use_one_time_review_without_opening_the_approval_store() {
     assert!(text.contains("Sandbox trials are disabled"), "{text}");
     assert!(text.contains("one-time desktop review"), "{text}");
     assert_eq!(
-        std::fs::read_to_string(fixture.root.join("home/.config/dcg/verified_trials.json")).unwrap(),
+        std::fs::read_to_string(fixture.root.join("home/.config/dcg/verified_trials.json"))
+            .unwrap(),
         "invalid fixture store"
     );
     assert!(
@@ -936,7 +956,8 @@ fn agents_cannot_forge_confined_receipts_or_redirect_their_trusted_config() {
         let candidate = format!("{prefix}{runner}");
         let result = fixture.denied(&candidate);
         assert_eq!(result["rule_id"], "dcg.internal:confined-runner");
-        let input = json!({"tool_name":"Bash", "tool_input":{"command":candidate}, "cwd":fixture.root});
+        let input =
+            json!({"tool_name":"Bash", "tool_input":{"command":candidate}, "cwd":fixture.root});
         let mut child = fixture
             .command()
             .args(["--agent", "claude-code", "--desktop-review"])
@@ -952,7 +973,10 @@ fn agents_cannot_forge_confined_receipts_or_redirect_their_trusted_config() {
         let verdict: Value = serde_json::from_slice(&output.stdout).unwrap();
         let decision = &verdict["hookSpecificOutput"];
         assert_eq!(decision["permissionDecision"], "deny", "{verdict}");
-        assert_eq!(decision["ruleId"], "dcg.internal:confined-runner", "{verdict}");
+        assert_eq!(
+            decision["ruleId"], "dcg.internal:confined-runner",
+            "{verdict}"
+        );
         assert!(decision.get("allowOnceCode").is_none(), "{verdict}");
         assert!(decision.get("updatedInput").is_none(), "{verdict}");
         assert!(verdict.to_string().contains("internal-hook-command"));

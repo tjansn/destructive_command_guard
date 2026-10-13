@@ -446,7 +446,10 @@ fn runtime_home_credentials_are_guarded_across_tmp_and_private_tmp_spellings() {
         .expect("private temp home");
     let private = home.path().to_path_buf();
     let short = Path::new("/").join(private.strip_prefix("/private").unwrap());
-    assert_eq!(private.canonicalize().unwrap(), short.canonicalize().unwrap());
+    assert_eq!(
+        private.canonicalize().unwrap(),
+        short.canonicalize().unwrap()
+    );
     fs::create_dir_all(private.join("xdg_config/dcg")).expect("fixture dir");
     // Pass both HOME spellings to real, separate hooks; candidate writers are
     // only protocol data and must never create the named credential files.
@@ -455,7 +458,10 @@ fn runtime_home_credentials_are_guarded_across_tmp_and_private_tmp_spellings() {
             for file in [".netrc", ".npmrc", ".pypirc", ".zshrc"] {
                 let path = target.join(file);
                 let command = format!("echo x >> {}", shell_words::quote(path.to_str().unwrap()));
-                assert_eq!(verdict(&command, root), Verdict::Deny("credential-file-write"));
+                assert_eq!(
+                    verdict(&command, root),
+                    Verdict::Deny("credential-file-write")
+                );
                 assert!(!path.exists());
             }
             let command = format!("echo x >> {}/notes.txt", target.display());

@@ -2497,9 +2497,10 @@ fn home_components(home: &str) -> Option<Vec<String>> {
 /// the target, which may not exist yet. Only the runtime home gets this alias;
 /// unrelated temporary directories do not become home roots.
 fn home_spellings(home: Vec<String>) -> Vec<Vec<String>> {
-    let alias = if home.first().is_some_and(|part| {
-        part.eq_ignore_ascii_case("tmp") || part.eq_ignore_ascii_case("var")
-    }) {
+    let alias = if home
+        .first()
+        .is_some_and(|part| part.eq_ignore_ascii_case("tmp") || part.eq_ignore_ascii_case("var"))
+    {
         Some(
             std::iter::once("private".to_owned())
                 .chain(home.iter().cloned())

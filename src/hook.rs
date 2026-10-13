@@ -862,18 +862,16 @@ pub fn confined_rewrite(
     updated
         .as_object_mut()?
         .insert("command".to_owned(), serde_json::json!(rewritten));
-    Some(
-        serde_json::json!({
-            "dcg_verdict": "confined",
-            "dcg_confined_loopback": loopback,
-            "dcg_approval_scope": crate::desktop_review::ApprovalScope::Confined,
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse", "permissionDecision": "allow",
-                "permissionDecisionReason": format!("Run once under continuing confinement; no unconfined approval or learned grant. {}", loopback.receipt()),
-                "updatedInput": updated
-            }
-        }),
-    )
+    Some(serde_json::json!({
+        "dcg_verdict": "confined",
+        "dcg_confined_loopback": loopback,
+        "dcg_approval_scope": crate::desktop_review::ApprovalScope::Confined,
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "permissionDecision": "allow",
+            "permissionDecisionReason": format!("Run once under continuing confinement; no unconfined approval or learned grant. {}", loopback.receipt()),
+            "updatedInput": updated
+        }
+    }))
 }
 
 pub fn output_confined_rewrite(

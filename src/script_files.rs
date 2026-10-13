@@ -1309,7 +1309,12 @@ mod tests {
                     },
                 );
                 assert!(inspected, "{command}, relaxed={relaxed}");
-                assert!(capture.snapshot().resolved_paths().contains(&cwd.join("check.sh")));
+                assert!(
+                    capture
+                        .snapshot()
+                        .resolved_paths()
+                        .contains(&cwd.join("check.sh"))
+                );
                 if relaxed {
                     assert!(result.is_none(), "{command}: {result:?}");
                 } else {

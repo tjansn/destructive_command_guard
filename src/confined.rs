@@ -11,7 +11,10 @@ const COMMAND_CAP: usize = 64 * 1024;
 /// The runner is an internal hook replacement, never an agent request. Check
 /// real command nodes so quoted diagnostic data does not become a false hit.
 pub(crate) fn agent_runner_command(command: &str) -> bool {
-    if !command.bytes().any(|byte| matches!(byte, b'c' | b'C' | b'\\')) {
+    if !command
+        .bytes()
+        .any(|byte| matches!(byte, b'c' | b'C' | b'\\'))
+    {
         return false;
     }
     let ast = ast_grep_core::AstGrep::new(command, ast_grep_language::SupportLang::Bash);

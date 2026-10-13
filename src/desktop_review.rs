@@ -171,7 +171,7 @@ pub struct ReviewDescription {
 impl ReviewDescription {
     pub fn set_scope(&mut self, scope: ApprovalScope) {
         self.scope = scope;
-        self.scope_text = scope.sentence().to_owned();
+        scope.sentence().clone_into(&mut self.scope_text);
     }
 
     /// Add effect evidence. The persistence decision separately supplies scope;
@@ -888,7 +888,10 @@ mod tests {
     #[test]
     fn approval_scope_has_one_truthful_localized_persistence_sentence() {
         assert_eq!(ApprovalScope::trial(true, false), ApprovalScope::OneTime);
-        assert_eq!(ApprovalScope::trial(true, true), ApprovalScope::ExactVersion);
+        assert_eq!(
+            ApprovalScope::trial(true, true),
+            ApprovalScope::ExactVersion
+        );
         assert_eq!(ApprovalScope::trial(false, true), ApprovalScope::OneTime);
         assert_eq!(ApprovalScope::trial(false, false), ApprovalScope::OneTime);
         let sentences = [
