@@ -139,6 +139,29 @@ pub fn eligible(command: &str, cwd: &Path) -> bool {
     execution(command, cwd).is_some()
 }
 
+/// Re-evaluate dependency findings only for a hook that will emit a confined
+/// replacement. This scope never applies to observational trials or ordinary
+/// approvals. Failure to discover the real writable set preserves the denial.
+pub fn inspect_for_rewrite<T>(
+    command: &str,
+    cwd: &Path,
+    inspect: impl FnOnce() -> T,
+) -> Result<T, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let (cwd, _) = execution(command, cwd).ok_or("not a finite confined command")?;
+        let (_, writable, protected) = native::boundaries(&cwd).map_err(|e| e.to_string())?;
+        Ok(crate::script_files::with_confined_dependencies(
+            writable, protected, inspect,
+        ))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (command, cwd, inspect);
+        Err("continuing confinement requires macOS Seatbelt".to_owned())
+    }
+}
+
 fn execution(command: &str, cwd: &Path) -> Option<(PathBuf, String)> {
     if finite(command, cwd, 0) {
         return Some((cwd.to_path_buf(), command.to_owned()));
@@ -720,7 +743,7 @@ mod native {
         Ok(())
     }
 
-    fn boundaries(cwd: &Path) -> io::Result<(PathBuf, Vec<PathBuf>, Vec<PathBuf>)> {
+    pub(super) fn boundaries(cwd: &Path) -> io::Result<(PathBuf, Vec<PathBuf>, Vec<PathBuf>)> {
         let root = git(cwd, &["rev-parse", "--show-toplevel"])?;
         let root = PathBuf::from(
             std::str::from_utf8(&root)

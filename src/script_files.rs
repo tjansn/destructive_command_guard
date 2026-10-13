@@ -30,6 +30,210 @@ struct InspectionBudget {
 
 thread_local! {
     static BUDGET: RefCell<Option<InspectionBudget>> = const { RefCell::new(None) };
+    static CONFINED: RefCell<Option<ConfinedPaths>> = const { RefCell::new(None) };
+}
+
+struct ConfinedPaths {
+    writable: Vec<PathBuf>,
+    protected: Vec<PathBuf>,
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+pub(crate) fn with_confined_dependencies<T>(
+    writable: Vec<PathBuf>,
+    protected: Vec<PathBuf>,
+    inspect: impl FnOnce() -> T,
+) -> T {
+    struct Scope(Option<ConfinedPaths>);
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            CONFINED.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let paths = ConfinedPaths {
+        writable,
+        protected,
+    };
+    let _scope = Scope(CONFINED.with(|slot| slot.replace(Some(paths))));
+    inspect()
+}
+
+impl ConfinedPaths {
+    fn writable_target(&self, literal: &str, cwd: &Path) -> bool {
+        use std::path::Component;
+        // Resolve existing ancestors, including symlinks, before appending a
+        // new leaf. A lexical in-bounds spelling must not conceal an escape.
+        let mut target = PathBuf::new();
+        for component in cwd.join(literal).components() {
+            match component {
+                Component::ParentDir => {
+                    target.pop();
+                }
+                Component::CurDir => {}
+                other => target.push(other.as_os_str()),
+            }
+            match fs::canonicalize(&target) {
+                Ok(real) => target = real,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return false,
+            }
+        }
+        self.writable.iter().any(|root| target.starts_with(root))
+            && !self
+                .protected
+                .iter()
+                .any(|root| target.starts_with(root) || root.starts_with(&target))
+    }
+}
+
+/// Only findings in resolved Node dependency files can defer to the kernel.
+/// This is scoped to the hook's second reading; it cannot produce a host allow.
+fn dependency_result(
+    path: &Path,
+    source: &str,
+    cwd: &Path,
+    language: ScriptLanguage,
+    original: EvaluationResult,
+) -> EvaluationResult {
+    if !path.components().any(|part| part.as_os_str() == "node_modules")
+        || original.pattern_info.as_ref().is_some_and(|info| {
+            info.source == crate::evaluator::MatchSource::ConfigOverride
+                || info.pack_id.as_deref() == Some("dcg.internal")
+                || info.pack_id.as_deref() == Some("core.git")
+                || info.pattern_name.as_deref() == Some("credential-file-write")
+        })
+    {
+        return original;
+    }
+    CONFINED.with(|slot| {
+        let paths = slot.borrow();
+        let Some(paths) = paths.as_ref() else {
+            return original;
+        };
+        match language {
+            ScriptLanguage::JavaScript | ScriptLanguage::TypeScript => {
+                match dependency_target(source, cwd, language, paths) {
+                    Ok(Some(target)) => EvaluationResult::denied_by_embedded_sink(
+                        "heredoc.script_files.confined-target",
+                        &format!("Dependency operation targets a path outside the confined writable set: {target}"),
+                    ),
+                    Ok(None) => EvaluationResult::allowed(),
+                    Err(()) => original,
+                }
+            }
+            ScriptLanguage::Bash => {
+                // Explicit child command strings still run through the normal
+                // evaluator. Only a literal filesystem command whose targets
+                // are all writable can lose its static finding here.
+                if dependency_shell_targets(source).is_some_and(|targets| {
+                    targets.iter().all(|target| paths.writable_target(target, cwd))
+                }) {
+                    EvaluationResult::allowed()
+                } else {
+                    original
+                }
+            }
+            _ => original,
+        }
+    })
+}
+
+fn dependency_shell_targets(command: &str) -> Option<Vec<String>> {
+    let ast = AstGrep::new(command, SupportLang::Bash);
+    let root = ast.root();
+    let mut commands = root.children().filter(ast_grep_core::Node::is_named);
+    if ast.root().get_inner_node().has_error()
+        || commands.next()?.kind().as_ref() != "command"
+        || commands.next().is_some()
+    {
+        return None;
+    }
+    let words = shell_words::split(command).ok()?;
+    let tool = words.first()?.rsplit('/').next()?;
+    if !matches!(tool, "rm" | "rmdir" | "unlink") {
+        return None;
+    }
+    let mut targets = Vec::new();
+    for word in words.iter().skip(1) {
+        if word == "--" {
+            continue;
+        }
+        if let Some(flags) = word.strip_prefix('-') {
+            if flags.is_empty() || !flags.chars().all(|flag| "rRfivd".contains(flag)) {
+                return None;
+            }
+            continue;
+        }
+        if word.contains(['$', '`', '*', '?', '[', '{', '~']) {
+            return None;
+        }
+        targets.push(word.clone());
+    }
+    (!targets.is_empty()).then_some(targets)
+}
+
+fn dependency_target(
+    source: &str,
+    cwd: &Path,
+    language: ScriptLanguage,
+    paths: &ConfinedPaths,
+) -> Result<Option<String>, ()> {
+    let ast = AstGrep::new(
+        source,
+        if language == ScriptLanguage::TypeScript {
+            SupportLang::TypeScript
+        } else {
+            SupportLang::JavaScript
+        },
+    );
+    if ast.root().get_inner_node().has_error() {
+        return Err(());
+    }
+    for (index, node) in ast.root().dfs().enumerate() {
+        if index >= 100_000 {
+            return Err(());
+        }
+        if node.kind().as_ref() != "call_expression" {
+            continue;
+        }
+        let (Some(function), Some(arguments)) = (node.field("function"), node.field("arguments"))
+        else {
+            continue;
+        };
+        let function = function.text();
+        let name = function.rsplit('.').next().unwrap_or(&function);
+        let args: Vec<_> = arguments
+            .children()
+            .filter(|child| child.is_named() && child.kind().as_ref() != "comment")
+            .collect();
+        let operands: &[usize] = match name {
+            "rm" | "rmSync" | "rmdir" | "rmdirSync" | "unlink" | "unlinkSync" | "writeFile"
+            | "writeFileSync" | "appendFile" | "appendFileSync" | "truncate" | "truncateSync"
+            | "chmod" | "chmodSync" | "chown" | "chownSync" => &[0],
+            "rename" | "renameSync" => &[0, 1],
+            "copyFile" | "copyFileSync" | "cp" | "cpSync" => &[1],
+            _ => &[],
+        };
+        for &operand in operands {
+            if let Some(argument) = args.get(operand)
+                && let Ok(target) = js_literal(&argument.text())
+                && !paths.writable_target(&target, cwd)
+            {
+                return Ok(Some(target));
+            }
+        }
+        if matches!(name, "exec" | "execSync")
+            && let Some(argument) = args.first()
+            && let Ok(command) = js_literal(&argument.text())
+            && let Some(targets) = dependency_shell_targets(&command)
+            && let Some(target) = targets
+                .into_iter()
+                .find(|target| !paths.writable_target(target, cwd))
+        {
+            return Ok(Some(target));
+        }
+    }
+    Ok(None)
 }
 
 struct InspectionScope(bool);
@@ -832,7 +1036,13 @@ fn inspect_reference(
         }) {
             return Err("script source could not be parsed completely".to_string());
         }
-        let candidate = evaluate_source(&source, cwd, language);
+        let candidate = dependency_result(
+            &path,
+            &source,
+            cwd,
+            language,
+            evaluate_source(&source, cwd, language),
+        );
         if candidate.decision != EvaluationDecision::Allow {
             if result.decision == EvaluationDecision::Allow
                 || (!definite(&result) && definite(&candidate))
@@ -1119,7 +1329,13 @@ fn inspect_js_inputs(
     for child in children {
         match child {
             Ok(command) => {
-                let found = evaluate_source(&command, cwd, ScriptLanguage::Bash);
+                let found = dependency_result(
+                    source_dir,
+                    &command,
+                    cwd,
+                    ScriptLanguage::Bash,
+                    evaluate_source(&command, cwd, ScriptLanguage::Bash),
+                );
                 if definite(&found) {
                     result.get_or_insert(found);
                 } else if found.decision != EvaluationDecision::Allow {
@@ -1298,6 +1514,60 @@ fn native_binary(magic: &[u8; 4]) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dependency_deferral_is_scoped_and_keeps_resolved_targets_outside_outputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let dependency = cwd.join("node_modules/loader/entry.js");
+        let original = || {
+            EvaluationResult::denied_by_embedded_sink(
+                "heredoc.shell.incomplete-analysis",
+                "bounded fallback found rm",
+            )
+        };
+        let dynamic = "export function cleanup(path) { fs.rmSync(path, {recursive:true}); }";
+        let inspect = |path: &Path, source: &str| {
+            dependency_result(path, source, &cwd, ScriptLanguage::JavaScript, original())
+        };
+        assert_eq!(
+            inspect(&dependency, dynamic).decision,
+            EvaluationDecision::Deny
+        );
+        with_confined_dependencies(vec![cwd.join("build")], vec![cwd.join(".git")], || {
+            assert_eq!(
+                inspect(&dependency, dynamic).decision,
+                EvaluationDecision::Allow
+            );
+            assert_eq!(
+                inspect(&cwd.join("own.test.js"), dynamic).decision,
+                EvaluationDecision::Deny
+            );
+            assert_eq!(
+                inspect(&dependency, "fs.rmSync('build/cache', {recursive:true});").decision,
+                EvaluationDecision::Allow
+            );
+            for target in ["tracked.txt", ".git", "../outside", "build/../../outside"] {
+                let source = format!("fs.rmSync('{target}', {{recursive:true}});");
+                let found = inspect(&dependency, &source);
+                assert_eq!(found.decision, EvaluationDecision::Deny, "{source}");
+                assert_eq!(
+                    found.pattern_info.unwrap().pattern_name.as_deref(),
+                    Some("confined-target")
+                );
+            }
+            fs::create_dir(cwd.join("build")).unwrap();
+            std::os::unix::fs::symlink(&cwd, cwd.join("build/escape")).unwrap();
+            assert_eq!(
+                inspect(&dependency, "fs.rmSync('build/escape/tracked.txt');").decision,
+                EvaluationDecision::Deny
+            );
+        });
+        assert_eq!(
+            inspect(&dependency, dynamic).decision,
+            EvaluationDecision::Deny
+        );
+    }
 
     #[test]
     fn local_preload_marker_is_resolved_only_by_the_trial_pass() {

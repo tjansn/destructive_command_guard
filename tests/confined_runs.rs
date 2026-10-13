@@ -162,6 +162,214 @@ mod macos {
         );
     }
 
+    fn hook_request(
+        cwd: &Path,
+        runtime: &Path,
+        command: &str,
+        agent: &str,
+        capable: bool,
+    ) -> serde_json::Value {
+        let home = runtime.join("hook-home");
+        fs::create_dir_all(&home).unwrap();
+        let config = runtime.join("hook-policy.toml");
+        fs::write(
+            &config,
+            "[general]\nself_heal_hook = false\nfail_closed = true\nunverified_decision = 'deny'\n\
+             [policy]\ndefault_mode = 'deny'\n\
+             [heredoc]\nenabled = true\nscan_script_files = true\n\
+             [trial]\nenabled = true\ntimeout_secs = 600\nconfined_loopback = 'all'\n",
+        )
+        .unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_dcg"))
+            .args(["--agent", agent])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("TMPDIR", runtime)
+            .env("TEMP", runtime)
+            .env("TMP", runtime)
+            .env("DCG_CONFIG", &config)
+            .env("DCG_SELF_HEAL_HOOK", "0")
+            .env("DCG_HISTORY_DISABLED", "1")
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", runtime.join("no-system.toml"))
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let input = serde_json::json!({
+            "tool_name": "Bash", "cwd": cwd,
+            "tool_input": {"command": command, "timeout": if capable { 600 } else { 600_000 }},
+            "dcg_input_rewrite": capable, "dcg_explicit_verdict": true,
+        });
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "hook output: {error}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+    }
+
+    fn rewritten_request(output: &serde_json::Value) -> Request {
+        assert_eq!(output["dcg_verdict"], "confined", "{output}");
+        let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        let words = shell_words::split(command).unwrap();
+        assert_eq!(words[0], env!("CARGO_BIN_EXE_dcg"));
+        assert_eq!(&words[1..4], ["run", "--confined", "--request"]);
+        Request::decode(&words[4]).unwrap()
+    }
+
+    #[test]
+    fn dependency_cleanup_runs_only_after_a_capable_hook_confines_it() {
+        let fixture = Fixture::new(
+            "fs.mkdirSync('build', {recursive: true}); fs.writeFileSync('build/once', 'once');",
+        );
+        let package = fixture.project.join("node_modules/fixture-loader");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"exports":{".":"./loader.mjs"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            package.join("loader.mjs"),
+            "import fs from 'node:fs';\n\
+             export function cleanup(path) { fs.rmSync(path, {recursive:true, force:true}); }\n\
+             cleanup('build/cache');\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.project.join("package.json"),
+            r#"{"scripts":{"test":"node --import fixture-loader --test case.test.cjs"}}"#,
+        )
+        .unwrap();
+        for command in [
+            "npm test",
+            "node --import ./node_modules/fixture-loader/loader.mjs --test case.test.cjs",
+        ] {
+            for (agent, capable) in [("claude-code", false), ("pi", true)] {
+                let output = hook_request(
+                    &fixture.project,
+                    &fixture.runtime,
+                    command,
+                    agent,
+                    capable,
+                );
+                let request = rewritten_request(&output);
+                assert_eq!(request.command, command);
+                assert!(
+                    !fixture.project.join("build/once").exists(),
+                    "hook must not execute the candidate"
+                );
+            }
+        }
+        // These protocols cannot rewrite, so their static dependency decision
+        // remains in force and no observational trial may erase the finding.
+        for agent in ["pi", "opencode"] {
+            let output = hook_request(&fixture.project, &fixture.runtime, "npm test", agent, false);
+            assert!(
+                output["hookSpecificOutput"].get("updatedInput").is_none(),
+                "{output}"
+            );
+            assert_eq!(
+                output["hookSpecificOutput"]["permissionDecision"], "deny",
+                "{output}"
+            );
+        }
+        let output = hook_request(
+            &fixture.project,
+            &fixture.runtime,
+            "npm test",
+            "claude-code",
+            false,
+        );
+        let result = confined::run(
+            &rewritten_request(&output),
+            &fixture.runtime,
+            ConfinedLoopback::All,
+        )
+        .unwrap();
+        assert_eq!(result.exit_code, 0, "{}", details(&result));
+        assert_eq!(
+            fs::read_to_string(fixture.project.join("build/once")).unwrap(),
+            "once"
+        );
+    }
+
+    #[test]
+    fn dependency_literal_targets_outside_outputs_and_direct_commands_stay_denied() {
+        let fixture = Fixture::new("console.log('must not execute');");
+        let package = fixture.project.join("node_modules/fixture-loader");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("package.json"), r#"{"exports":"./loader.mjs"}"#).unwrap();
+        fs::write(
+            fixture.project.join("package.json"),
+            r#"{"scripts":{"test":"node --import fixture-loader --test case.test.cjs"}}"#,
+        )
+        .unwrap();
+        for source in [
+            "import fs from 'node:fs'; fs.rmSync('tracked.txt', {recursive:true, force:true});",
+            "import fs from 'node:fs'; fs.rmSync('.git', {recursive:true, force:true});",
+            "import fs from 'node:fs'; fs.rmSync('../outside', {recursive:true, force:true});",
+        ] {
+            fs::write(package.join("loader.mjs"), source).unwrap();
+            let output = hook_request(
+                &fixture.project,
+                &fixture.runtime,
+                "npm test",
+                "claude-code",
+                false,
+            );
+            assert_eq!(
+                output["hookSpecificOutput"]["permissionDecision"], "deny",
+                "{source}: {output}"
+            );
+            assert!(output["hookSpecificOutput"].get("updatedInput").is_none());
+        }
+        fs::write(
+            package.join("loader.mjs"),
+            "export function cleanup(path) { require('fs').rmSync(path, {recursive:true}); }",
+        )
+        .unwrap();
+        for command in [
+            "npm test && git reset --hard",
+            "node --eval 'require(\"fs\").rmSync(\"tracked.txt\")' --test case.test.cjs",
+        ] {
+            let output = hook_request(
+                &fixture.project,
+                &fixture.runtime,
+                command,
+                "claude-code",
+                false,
+            );
+            assert!(
+                output["hookSpecificOutput"].get("updatedInput").is_none(),
+                "{output}"
+            );
+            assert_eq!(
+                output["hookSpecificOutput"]["permissionDecision"], "deny",
+                "{output}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(fixture.project.join("tracked.txt")).unwrap(),
+            "original tracked source"
+        );
+        assert!(!fixture.root.join("outside").exists());
+    }
+
     #[test]
     fn ignored_build_output_is_real_and_the_fixture_executes_once() {
         let body = "fs.mkdirSync('build', { recursive: true });\n\
@@ -523,9 +731,14 @@ mod macos {
         assert!(output_parent.starts_with(&temporary) && output_parent != temporary);
         let temp_root = std::env::temp_dir().canonicalize().unwrap();
         assert!(temp_root.starts_with(&temporary) && temp_root != temporary);
+        // Exercise the real Claude Code hook first, with the package script
+        // unchanged. Calling Request::new directly missed both F3 regressions.
+        let receipt = hook_request(&cwd, &temp_root, "npm test", "claude-code", false);
+        let request = rewritten_request(&receipt);
+        assert_eq!(request.command, "npm test");
+        assert_eq!(request.timeout_secs, 595);
         let result = confined::run(
-            &Request::new("npm test", &cwd, Path::new("/bin/sh"), 595)
-                .with_loopback(ConfinedLoopback::All),
+            &request,
             &temp_root,
             ConfinedLoopback::All,
         )

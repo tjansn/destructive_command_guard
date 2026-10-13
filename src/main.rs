@@ -2555,34 +2555,27 @@ fn confined_invocation(
         return None;
     }
     if let Some(outcome) = outcome {
-        let ResolvedCommandOutcome::DenyFamily(resolved) = outcome else {
+        let ResolvedCommandOutcome::DenyFamily(_) = outcome else {
             return None;
         };
-        if !resolved.result.pattern_info.as_ref().is_some_and(|info| {
-            trial::eligible(info)
-                && destructive_command_guard::inspection::outcome(
-                    info.pack_id.as_deref(),
-                    info.pattern_name.as_deref(),
-                    &info.reason,
-                ) == destructive_command_guard::inspection::Outcome::Dynamic
-        }) {
-            return None;
-        }
         let relaxed = ctx.allowlists.with_rule_grants(
             trial::TRIAL_RULES,
             "resolve only unverified scripts under confinement",
             "confined-run",
         );
-        let deadline = Deadline::new(Duration::from_millis(
-            ctx.config.effective_hook_timeout_ms(),
-        ));
-        let residual = HookEvalContext {
-            allowlists: &relaxed,
-            deadline: &deadline,
-            ..*ctx
-        };
         if !matches!(
-            resolve_hook_command(&residual, command, dialect, None),
+            confined::inspect_for_rewrite(command, cwd, || {
+                let deadline = Deadline::new(Duration::from_millis(
+                    ctx.config.effective_hook_timeout_ms(),
+                ));
+                let residual = HookEvalContext {
+                    allowlists: &relaxed,
+                    deadline: &deadline,
+                    ..*ctx
+                };
+                resolve_hook_command(&residual, command, dialect, None)
+            })
+            .ok()?,
             ResolvedCommandOutcome::Allow(_)
         ) {
             return None;
