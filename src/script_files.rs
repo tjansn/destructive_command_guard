@@ -35,6 +35,7 @@ thread_local! {
 
 struct ConfinedPaths {
     project: PathBuf,
+    cwd: PathBuf,
     writable: Vec<PathBuf>,
     protected: Vec<PathBuf>,
 }
@@ -42,6 +43,7 @@ struct ConfinedPaths {
 #[cfg(any(target_os = "macos", all(test, unix)))]
 pub(crate) fn with_confined_dependencies<T>(
     project: PathBuf,
+    cwd: PathBuf,
     writable: Vec<PathBuf>,
     protected: Vec<PathBuf>,
     inspect: impl FnOnce() -> T,
@@ -54,6 +56,7 @@ pub(crate) fn with_confined_dependencies<T>(
     }
     let paths = ConfinedPaths {
         project,
+        cwd,
         writable,
         protected,
     };
@@ -62,12 +65,14 @@ pub(crate) fn with_confined_dependencies<T>(
 }
 
 impl ConfinedPaths {
-    fn deferrable_target(&self, literal: &str, cwd: &Path) -> bool {
+    fn deferrable_target(&self, literal: &str) -> bool {
         use std::path::Component;
         // Resolve existing ancestors, including symlinks, before appending a
         // new leaf. A lexical in-bounds spelling must not conceal an escape.
         let mut target = PathBuf::new();
-        for component in cwd.join(literal).components() {
+        // Source discovery can retain the hook/package cwd. Filesystem calls
+        // run in the runner's canonical effective cwd, including leading cd.
+        for component in self.cwd.join(literal).components() {
             match component {
                 Component::ParentDir => {
                     target.pop();
@@ -117,7 +122,6 @@ impl ConfinedPaths {
 fn dependency_result(
     path: &Path,
     source: &str,
-    cwd: &Path,
     language: ScriptLanguage,
     original: EvaluationResult,
 ) -> EvaluationResult {
@@ -138,7 +142,7 @@ fn dependency_result(
         };
         match language {
             ScriptLanguage::JavaScript | ScriptLanguage::TypeScript => {
-                match dependency_target(source, cwd, language, paths) {
+                match dependency_target(source, language, paths) {
                     Ok(Some(target)) => EvaluationResult::denied_by_embedded_sink(
                         "heredoc.script_files.confined-target",
                         &format!("Dependency operation targets a path outside approved confined build/cache outputs: {target}"),
@@ -152,7 +156,7 @@ fn dependency_result(
                 // evaluator. Only a literal filesystem command whose targets
                 // are all approved writable outputs can lose its finding.
                 if dependency_shell_targets(source).is_some_and(|targets| {
-                    targets.iter().all(|target| paths.deferrable_target(target, cwd))
+                    targets.iter().all(|target| paths.deferrable_target(target))
                 }) {
                     EvaluationResult::allowed()
                 } else {
@@ -200,7 +204,6 @@ fn dependency_shell_targets(command: &str) -> Option<Vec<String>> {
 
 fn dependency_target(
     source: &str,
-    cwd: &Path,
     language: ScriptLanguage,
     paths: &ConfinedPaths,
 ) -> Result<Option<String>, ()> {
@@ -243,7 +246,7 @@ fn dependency_target(
         for &operand in operands {
             if let Some(argument) = args.get(operand)
                 && let Ok(target) = js_literal(&argument.text())
-                && !paths.deferrable_target(&target, cwd)
+                && !paths.deferrable_target(&target)
             {
                 return Ok(Some(target));
             }
@@ -254,7 +257,7 @@ fn dependency_target(
             && let Some(targets) = dependency_shell_targets(&command)
             && let Some(target) = targets
                 .into_iter()
-                .find(|target| !paths.deferrable_target(target, cwd))
+                .find(|target| !paths.deferrable_target(target))
         {
             return Ok(Some(target));
         }
@@ -1065,7 +1068,6 @@ fn inspect_reference(
         let candidate = dependency_result(
             &path,
             &source,
-            cwd,
             language,
             evaluate_source(&source, cwd, language),
         );
@@ -1358,7 +1360,6 @@ fn inspect_js_inputs(
                 let found = dependency_result(
                     source_dir,
                     &command,
-                    cwd,
                     ScriptLanguage::Bash,
                     evaluate_source(&command, cwd, ScriptLanguage::Bash),
                 );
@@ -1554,13 +1555,14 @@ mod tests {
         };
         let dynamic = "export function cleanup(path) { fs.rmSync(path, {recursive:true}); }";
         let inspect = |path: &Path, source: &str| {
-            dependency_result(path, source, &cwd, ScriptLanguage::JavaScript, original())
+            dependency_result(path, source, ScriptLanguage::JavaScript, original())
         };
         assert_eq!(
             inspect(&dependency, dynamic).decision,
             EvaluationDecision::Deny
         );
         with_confined_dependencies(
+            cwd.clone(),
             cwd.clone(),
             vec![cwd.join("build")],
             vec![cwd.join(".git")],
@@ -1618,7 +1620,6 @@ mod tests {
             dependency_result(
                 &dependency,
                 source,
-                &cwd,
                 language,
                 EvaluationResult::denied_by_embedded_sink(
                     "heredoc.javascript.fs-rm",
@@ -1627,7 +1628,8 @@ mod tests {
             )
             .decision
         };
-        with_confined_dependencies(cwd.clone(), writable, vec![cwd.join(".git")], || {
+        let protected = vec![cwd.join(".git")];
+        with_confined_dependencies(cwd.clone(), cwd.clone(), writable, protected, || {
             for name in outputs {
                 let source = format!("fs.rmSync('{name}/x', {{recursive:true}});");
                 assert_eq!(
@@ -1667,6 +1669,42 @@ mod tests {
                 inspect("fs.rmSync('dist');", ScriptLanguage::JavaScript),
                 EvaluationDecision::Deny
             );
+        });
+    }
+
+    #[test]
+    fn dependency_deferral_resolves_literals_and_child_targets_from_execution_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().canonicalize().unwrap();
+        let cwd = project.join("sub");
+        fs::create_dir(&cwd).unwrap();
+        let dependency = project.join("node_modules/loader/entry.js");
+        let writable = vec![project.join("dist")];
+        with_confined_dependencies(project, cwd, writable, Vec::new(), || {
+            for (target, expected) in [
+                ("../dist/x", EvaluationDecision::Allow),
+                ("dist/x", EvaluationDecision::Deny),
+            ] {
+                for (source, language) in [
+                    (format!("fs.rmSync('{target}');"), ScriptLanguage::JavaScript),
+                    (
+                        format!("execSync('rm -rf {target}');"),
+                        ScriptLanguage::JavaScript,
+                    ),
+                    (format!("rm -rf {target}"), ScriptLanguage::Bash),
+                ] {
+                    let result = dependency_result(
+                        &dependency,
+                        &source,
+                        language,
+                        EvaluationResult::denied_by_embedded_sink(
+                            "heredoc.shell.incomplete-analysis",
+                            "filesystem deletion",
+                        ),
+                    );
+                    assert_eq!(result.decision, expected, "{source}");
+                }
+            }
         });
     }
 

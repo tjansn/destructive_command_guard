@@ -364,6 +364,62 @@ mod macos {
     }
 
     #[test]
+    fn dependency_relative_targets_follow_the_leading_cd_directory() {
+        let fixture = Fixture::new("console.log('must not execute');");
+        let sub = fixture.project.join("node-harness");
+        let package = sub.join("node_modules/fixture-loader");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("package.json"), r#"{"exports":"./loader.mjs"}"#).unwrap();
+        fs::write(
+            sub.join("package.json"),
+            r#"{"scripts":{"test":"node --import fixture-loader --test case.test.cjs"}}"#,
+        )
+        .unwrap();
+        fs::write(sub.join("case.test.cjs"), "console.log('must not execute');").unwrap();
+        for cwd in [&fixture.project, &sub] {
+            fs::create_dir(cwd.join("dist")).unwrap();
+            fs::write(cwd.join("dist/x"), "preserve fixture contents").unwrap();
+        }
+        // Opposite layouts catch both mistakes: rejecting a valid subdirectory
+        // output and accepting a subdirectory source because the parent's
+        // identically spelled target is writable.
+        for (ignore, deferred) in [("/node-harness/dist/\n", true), ("/dist/\n", false)] {
+            fs::write(fixture.project.join(".gitignore"), ignore).unwrap();
+            for source in [
+                "import fs from 'node:fs'; fs.rmSync('dist/x', {recursive:true, force:true});",
+                "import {execSync} from 'node:child_process'; execSync('rm -rf dist/x');",
+            ] {
+                fs::write(package.join("loader.mjs"), source).unwrap();
+                let command = "cd ./node-harness/../node-harness && npm test";
+                let output = hook_request(
+                    &fixture.project,
+                    &fixture.runtime,
+                    command,
+                    "claude-code",
+                    false,
+                );
+                if deferred {
+                    let request = rewritten_request(&output);
+                    assert_eq!(request.command, command);
+                    assert_eq!(request.cwd, fixture.project);
+                } else {
+                    assert_eq!(
+                        output["hookSpecificOutput"]["permissionDecision"], "deny",
+                        "{source}: {output}"
+                    );
+                    assert!(output["hookSpecificOutput"].get("updatedInput").is_none());
+                }
+            }
+        }
+        for cwd in [&fixture.project, &sub] {
+            assert_eq!(
+                fs::read_to_string(cwd.join("dist/x")).unwrap(),
+                "preserve fixture contents"
+            );
+        }
+    }
+
+    #[test]
     fn dependency_literal_targets_outside_outputs_and_direct_commands_stay_denied() {
         let fixture = Fixture::new("console.log('must not execute');");
         let package = fixture.project.join("node_modules/fixture-loader");

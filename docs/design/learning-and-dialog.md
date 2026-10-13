@@ -185,6 +185,12 @@ so the hook does not equate any inherited home/temp literal with those private
 directories. Dynamic runtime accesses to the actual run temp/home remain under
 kernel enforcement; no host temp/home prefix is added to the literal exception.
 
+Literal targets (including explicit deletion child commands) are resolved from
+the runner's canonical effective cwd after any accepted leading `cd ... &&`.
+The hook's original cwd and a dependency's source directory cannot substitute
+for that runtime directory. Tests use opposite parent/subdirectory ignore
+layouts to catch both false denials and mistaken deferrals.
+
 This scope can only produce a confined replacement. It creates no ordinary
 allow, observed-safe trial result, learned approval or exception. Failed scope
 setup or re-evaluation preserves the original denial. Non-capable protocols,
