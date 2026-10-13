@@ -261,6 +261,11 @@ fn package_entry(
 }
 
 pub(crate) fn resolve(specifier: &str, cwd: &Path, mode: Mode) -> Result<PathBuf, String> {
+    if std::env::var_os("NODE_OPTIONS").is_some_and(|options| !options.is_empty()) {
+        return Err(
+            "inherited Node options can change preload resolution; review is required".to_owned(),
+        );
+    }
     if specifier.is_empty()
         || specifier.len() > 4096
         || specifier.contains(['\\', '%', '?', '#', ':'])

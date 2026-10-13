@@ -1079,6 +1079,32 @@ fn bare_node_preloads_inspect_the_export_for_each_cli_spelling() {
             "{result}"
         );
     }
+    fixture.write(
+        "node_modules/loader/package.json",
+        r#"{"exports":{"custom":"./danger.cjs","default":"./entry.cjs"}}"#,
+    );
+    fixture.write("node_modules/loader/entry.cjs", "console.log('safe default');");
+    fixture.write(
+        "node_modules/loader/danger.cjs",
+        "require('child_process').execSync('git reset --hard');",
+    );
+    // The candidate remains data. NODE_OPTIONS must not let the static reader
+    // bind the default export while the actual runtime selects custom code.
+    let mut child = fixture
+        .command()
+        .env("NODE_OPTIONS", "--conditions=custom")
+        .args(["--robot", "test", "--dialect", "posix", "--stdin"])
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"node --import loader ./case.test.js")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["rule_id"], "heredoc.script_files:unverified");
 }
 
 #[test]
