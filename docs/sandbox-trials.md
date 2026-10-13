@@ -160,7 +160,9 @@ only, `confined_loopback` accepts `none` or `all`. To opt in after validated
 installation, Tom may add **`confined_loopback = "all"`** under `[trial]` in trusted
 user config. This task does not change that live file.
 The timeout and fallback copy cap must be positive. Set `enabled = false` to
-keep the previous static decision and desktop-review path. Automatically
+keep the static decision and one-time desktop-review path. With trials disabled,
+stored exact-version approvals are ignored and desktop review neither reads nor
+writes the trial approval store or its hash cache. Automatically
 discovered repository configuration cannot alter these execution settings;
 trusted user, system and explicitly selected configuration layers can.
 

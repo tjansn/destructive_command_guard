@@ -2765,13 +2765,29 @@ fn attempt_sandbox_trial(
         .unwrap_or_default();
     let resolve = || -> Result<bool, String> {
         let store = TrialStore::user().map_err(|e| format!("Trial store unavailable: {e}"))?;
-        let before = store
-            .fingerprint(&command, cwd, &shell, &sources)
+        let fingerprint = || {
+            if ctx.config.trial.enabled {
+                store.fingerprint(&command, cwd, &shell, &sources)
+            } else {
+                store.fingerprint_for_review(&command, cwd, &shell, &sources)
+            }
+        };
+        let before = fingerprint()
             .map_err(|e| format!("Die Prüfung ist unvollständig. Cannot bind an exact trial version; desktop approval unavailable: {e}"))?;
-        let scope = desktop_review::ApprovalScope::trial(before.reproducible);
+        let scope =
+            desktop_review::ApprovalScope::trial(ctx.config.trial.enabled, before.reproducible);
         if scope == desktop_review::ApprovalScope::OneTime {
-            let explanation = "Runtime inputs or environment are not reproduced by the sandbox. This request requires one-time desktop review; no reusable approval will be recorded.";
-            let german = "Laufzeiteingaben oder Umgebung können in der Sandbox nicht vollständig nachgebildet werden. Bitte prüfe den genauen Aufruf und seine Folgen.";
+            let (explanation, german) = if ctx.config.trial.enabled {
+                (
+                    "Runtime inputs or environment are not reproduced by the sandbox. This request requires one-time desktop review; no reusable approval will be recorded.",
+                    "Laufzeiteingaben oder Umgebung können in der Sandbox nicht vollständig nachgebildet werden. Bitte prüfe den genauen Aufruf und seine Folgen.",
+                )
+            } else {
+                (
+                    "Sandbox trials are disabled. Existing exact-version approvals are ignored; this request requires one-time desktop review and stores no approval.",
+                    "Sandbox-Tests sind deaktiviert. Gespeicherte Freigaben werden nicht verwendet. Bitte prüfe den genauen Aufruf und seine Folgen für diese einmalige Freigabe.",
+                )
+            };
             if !desktop
                 || !desktop_review::request_trial(
                     &command,
@@ -2787,9 +2803,7 @@ fn attempt_sandbox_trial(
                     "{explanation}\n[dcg:review-unavailable-or-cancelled] Desktop review unavailable, declined or expired."
                 ));
             }
-            let after = store
-                .fingerprint(&command, cwd, &shell, &sources)
-                .map_err(|e| e.to_string())?;
+            let after = fingerprint().map_err(|e| e.to_string())?;
             if before != after {
                 return Err("Runtime inputs changed during review; approval rejected.".to_owned());
             }
@@ -2809,14 +2823,14 @@ fn attempt_sandbox_trial(
         }
         let shell_supported = matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
             && matches!(shell.to_str(), Some("/bin/zsh" | "/bin/bash" | "/bin/sh"));
-        let report = if interactive || !shell_supported || !ctx.config.trial.enabled {
+        let report = if interactive || !shell_supported {
             trial::TrialReport {
                 id: format!("{:032x}", rand::random::<u128>()),
                 command: command.clone(),
                 project_root: before.project_root.clone(),
                 observations: trial::Observations {
                     issues: vec![
-                        "Trial disabled, TTY/user interaction required or shell unsupported; trial not started"
+                        "TTY/user interaction required or shell unsupported; trial not started"
                             .to_owned(),
                     ],
                     ..trial::Observations::default()

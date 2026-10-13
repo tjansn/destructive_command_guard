@@ -122,8 +122,8 @@ pub enum ApprovalScope {
 }
 
 impl ApprovalScope {
-    pub const fn trial(reproducible: bool) -> Self {
-        if reproducible {
+    pub const fn trial(enabled: bool, reproducible: bool) -> Self {
+        if enabled && reproducible {
             Self::ExactVersion
         } else {
             Self::OneTime
@@ -887,8 +887,10 @@ mod tests {
 
     #[test]
     fn approval_scope_has_one_truthful_localized_persistence_sentence() {
-        assert_eq!(ApprovalScope::trial(false), ApprovalScope::OneTime);
-        assert_eq!(ApprovalScope::trial(true), ApprovalScope::ExactVersion);
+        assert_eq!(ApprovalScope::trial(true, false), ApprovalScope::OneTime);
+        assert_eq!(ApprovalScope::trial(true, true), ApprovalScope::ExactVersion);
+        assert_eq!(ApprovalScope::trial(false, true), ApprovalScope::OneTime);
+        assert_eq!(ApprovalScope::trial(false, false), ApprovalScope::OneTime);
         let sentences = [
             ApprovalScope::OneTime,
             ApprovalScope::ExactVersion,

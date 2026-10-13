@@ -775,6 +775,52 @@ fn relative_and_empty_literal_path_entries_cannot_reach_bound_review() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn disabled_trials_use_one_time_review_without_opening_the_approval_store() {
+    let fixture = Fixture::new();
+    let policy = std::fs::read_to_string(&fixture.config).unwrap();
+    std::fs::write(&fixture.config, format!("{policy}\n[trial]\nenabled = false\n")).unwrap();
+    // Unreadable approval data must not affect the disabled-trial path. The
+    // oversized review text guarantees no native dialog opens in this test.
+    fixture.write(
+        "home/.config/dcg/verified_trials.json",
+        "invalid fixture store",
+    );
+    let candidate = format!("DCG_FIXTURE=1 /bin/true {}", "x".repeat(6_000));
+    let input = json!({"tool_name":"Bash", "tool_input":{"command":candidate}, "cwd":fixture.root});
+    let mut child = fixture
+        .command()
+        .args(["--agent", "claude-code", "--desktop-review"])
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.to_string().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let verdict: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        verdict["hookSpecificOutput"]["permissionDecision"], "deny",
+        "{verdict}"
+    );
+    let text = verdict.to_string();
+    assert!(text.contains("Sandbox trials are disabled"), "{text}");
+    assert!(text.contains("one-time desktop review"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("home/.config/dcg/verified_trials.json")).unwrap(),
+        "invalid fixture store"
+    );
+    assert!(
+        !fixture
+            .root
+            .join("home/.config/dcg/verified_trials.lock")
+            .exists()
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn definite_findings_cannot_be_hidden_by_a_finite_rewrite() {

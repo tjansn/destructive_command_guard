@@ -157,6 +157,17 @@ impl TrialStore {
         self.fingerprint_inner(command, cwd, shell, resolved_sources, true)
     }
 
+    /// Bind a one-time review without reading or writing the approval store.
+    pub fn fingerprint_for_review(
+        &self,
+        command: &str,
+        cwd: &Path,
+        shell: &Path,
+        resolved_sources: &[PathBuf],
+    ) -> io::Result<Fingerprint> {
+        self.fingerprint_inner(command, cwd, shell, resolved_sources, false)
+    }
+
     fn fingerprint_inner(
         &self,
         command: &str,
@@ -199,7 +210,7 @@ impl TrialStore {
             && public_config.complete;
         runtime.files.extend(startup.files);
         runtime.files.extend(public_config.files);
-        self.with_data(|data| {
+        let calculate = |data: &mut StoreData| {
             let mut hasher = Sha256::new();
             hash_field(&mut hasher, b"dcg-verified-trial-v2");
             hash_field(&mut hasher, path_text(&project_root)?.as_bytes());
@@ -285,7 +296,12 @@ impl TrialStore {
                 },
                 dirty && persist_cache,
             ))
-        })
+        };
+        if persist_cache {
+            self.with_data(calculate)
+        } else {
+            calculate(&mut StoreData::default()).map(|(fingerprint, _)| fingerprint)
+        }
     }
 
     pub fn lookup(&self, current_version: &Fingerprint) -> io::Result<Option<VerifiedTrial>> {
@@ -1482,7 +1498,7 @@ mod tests {
         let first = capture(&command);
         assert!(!first.reproducible);
         assert_eq!(
-            crate::desktop_review::ApprovalScope::trial(first.reproducible),
+            crate::desktop_review::ApprovalScope::trial(true, first.reproducible),
             crate::desktop_review::ApprovalScope::OneTime
         );
         assert!(
@@ -1527,6 +1543,48 @@ mod tests {
         ] {
             assert!(resolved_executables(command, &project, &BTreeMap::new()).is_err());
         }
+    }
+
+    #[test]
+    fn one_time_fingerprint_ignores_existing_grants_and_never_touches_the_store() {
+        let (temp, project, store) = fixture();
+        let mut version = fingerprint(&store, &project);
+        // The fixture grant models an existing approval even when this test
+        // process has extra environment inputs that cannot be reproduced.
+        version.reproducible = true;
+        store
+            .approve(&version, "user-review", "existing exact approval")
+            .unwrap();
+        assert!(store.lookup(&version).unwrap().is_some());
+        let path = temp.path().join("trusted/verified_trials.json");
+        let saved = fs::read(&path).unwrap();
+        let shell = temp.path().join("shell");
+        let reviewed = store
+            .fingerprint_for_review("echo safe", &project, &shell, &[])
+            .unwrap();
+        assert_eq!(reviewed.digest, version.digest);
+        assert_eq!(
+            crate::desktop_review::ApprovalScope::trial(false, reviewed.reproducible),
+            crate::desktop_review::ApprovalScope::OneTime
+        );
+        assert_eq!(fs::read(&path).unwrap(), saved);
+        // Even unavailable/corrupt state must not prevent a one-time review.
+        fs::write(&path, "invalid fixture store").unwrap();
+        assert_eq!(
+            store
+                .fingerprint_for_review("echo safe", &project, &shell, &[])
+                .unwrap(),
+            reviewed
+        );
+        let absent = temp.path().join("absent-store");
+        let transient = TrialStore::new(absent.clone());
+        assert_eq!(
+            transient
+                .fingerprint_for_review("echo safe", &project, &shell, &[])
+                .unwrap(),
+            reviewed
+        );
+        assert!(!absent.exists());
     }
 
     #[test]
