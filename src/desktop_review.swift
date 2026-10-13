@@ -21,6 +21,16 @@ struct ReviewDescription: Decodable {
     let scope: String
     let scope_text: String
 
+    static func inlineCommand(_ source: String) -> String {
+        source.replacingOccurrences(of: "\r\n", with: "\n")
+            .components(separatedBy: .newlines).joined(separator: " ⏎ ")
+            .replacingOccurrences(of: "\t", with: " ⇥ ")
+    }
+
+    var commandHeading: String {
+        command.contains(where: { $0.isNewline }) ? "Aufruf · mehrere Zeilen (Details)" : "Aufruf"
+    }
+
     var valid: Bool {
         let required = [agent, project, cwd, title, effect, command, text, scope_text]
         let fields = required + targets + executables + [host ?? "", repository ?? "", warning ?? ""]
@@ -344,7 +354,7 @@ final class ReviewController: NSObject, NSWindowDelegate {
     }
 
     private func commandSummary(_ info: ReviewDescription) -> NSView {
-        let command = label(info.command, size: 12)
+        let command = label(ReviewDescription.inlineCommand(info.command), size: 12)
         let cwd = label(info.cwd, size: 11)
         for field in [command, cwd] {
             field.font = .monospacedSystemFont(ofSize: field === command ? 12 : 11, weight: .regular)
@@ -352,9 +362,10 @@ final class ReviewController: NSObject, NSWindowDelegate {
             field.lineBreakMode = .byTruncatingMiddle
             field.toolTip = field.stringValue
         }
+        command.toolTip = info.command
         command.setAccessibilityLabel("Genauer Aufruf: \(info.command)")
         cwd.setAccessibilityLabel("Arbeitsordner: \(info.cwd)")
-        let result = vertical([label("Aufruf", size: 11, weight: .semibold), command,
+        let result = vertical([label(info.commandHeading, size: 11, weight: .semibold), command,
                                label("Arbeitsordner", size: 11, weight: .semibold), cwd,
                                label(info.scope_text, size: 12)], spacing: 5)
         if !info.executables.isEmpty {

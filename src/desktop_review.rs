@@ -1200,7 +1200,7 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(String::from_utf8_lossy(&output.stdout).contains("12 controller cases passed"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("13 controller cases passed"));
     }
 
     #[cfg(target_os = "macos")]

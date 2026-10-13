@@ -25,8 +25,8 @@ struct FocusAcceptance {
             agent: "Claude Code", host: "Orca", project: "Harmloser Dialogtest",
             repository: nil, cwd: NSTemporaryDirectory(), title: "Unvollständigen Sandbox-Test prüfen",
             effect: "Kein Befehl wird ausgeführt. Der Test schließt diesen Dialog selbst.",
-            warning: nil, command: "cd '/temporary/literal preview directory/node-harness' && npm test", executables: ["/opt/homebrew/bin/npm"], targets: [],
-            text: "Test: Orca übernimmt zweimal den Fokus. Keine Dateien oder Freigaben werden geändert.\n\nGenauer Aufruf (nur Anzeigedaten):\ncd '/temporary/literal preview directory/node-harness' && npm test\n\nArbeitsordner:\n\(NSTemporaryDirectory())",
+            warning: nil, command: "cd '/temporary/literal preview directory/node-harness' &&\nnpm test", executables: ["/opt/homebrew/bin/npm"], targets: [],
+            text: "Test: Orca übernimmt zweimal den Fokus. Keine Dateien oder Freigaben werden geändert.\n\nGenauer Aufruf (nur Anzeigedaten):\ncd '/temporary/literal preview directory/node-harness' &&\nnpm test\n\nArbeitsordner:\n\(NSTemporaryDirectory())",
             scope: "one_time", scope_text: "Die Freigabe gilt nur für diesen harmlosen Dialogtest.")
         let controller = ReviewController(ReviewRequest(description: info, nonce: String(repeating: "0", count: 32)))
 
@@ -45,6 +45,10 @@ struct FocusAcceptance {
             precondition(NSApp.isActive == key)
             panel.contentView?.layoutSubtreeIfNeeded()
             let views = descendants(panel.contentView!)
+            let labels = views.compactMap { ($0 as? NSTextField)?.stringValue }
+            precondition(labels.contains(info.commandHeading))
+            precondition(labels.contains(ReviewDescription.inlineCommand(info.command)))
+            precondition(labels.contains("/opt/homebrew/bin/npm"))
             let glyphs = views.compactMap { $0 as? LAAuthenticationView }
             if key {
                 precondition(glyphs.count == 1, "one fresh biometric view per attempt")
