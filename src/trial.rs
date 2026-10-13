@@ -168,6 +168,45 @@ fn display_text(text: &str, home: Option<&Path>) -> String {
 }
 
 impl TrialReport {
+    /// Localized consent prose; the agent-facing diagnostic retains its full
+    /// English details in `summary`. Paths and operation identifiers are data.
+    pub fn review_details(&self) -> String {
+        let mut lines = vec![
+            "Der Sandbox-Test konnte die Sicherheit nicht vollständig feststellen.".to_owned(),
+        ];
+        for violation in self.observations.violations.iter().take(ITEM_CAP) {
+            lines.push(format!(
+                "Blockierter Zugriff ({}):\n{}",
+                violation.operation, violation.target
+            ));
+        }
+        for (label, paths) in [
+            ("Gelöschte Quelldatei", &self.observations.deleted),
+            ("Geänderte Quelldatei", &self.observations.modified),
+        ] {
+            for path in paths.iter().take(ITEM_CAP) {
+                lines.push(format!("{label}:\n{path}"));
+            }
+        }
+        if self.observations.timed_out {
+            lines.push("Das Zeitlimit wurde erreicht; die Prozessgruppe wurde beendet.".to_owned());
+        }
+        if !self.observations.observation_complete {
+            lines.push("Die Beobachtung der Sandbox war unvollständig.".to_owned());
+        }
+        if !self.observations.issues.is_empty() {
+            lines.push(format!("{} Laufzeitbedingungen konnten nicht vollständig geprüft werden. Der Test ist kein Sicherheitsnachweis.", self.observations.issues.len()));
+        }
+        lines.push(format!(
+            "Kopie: {} ms; Ausführung: {} ms; Rückgabecode: {}.",
+            self.clone_ms,
+            self.run_ms,
+            self.exit_code
+                .map_or_else(|| "nicht verfügbar".to_owned(), |code| code.to_string())
+        ));
+        lines.join("\n\n")
+    }
+
     pub fn summary(&self, home: Option<&Path>) -> String {
         let mut lines = vec![format!(
             "dcg trial {}: {}. Sandboxed copy of {}. Command: {}",
@@ -1191,6 +1230,10 @@ mod tests {
         assert!(summary.contains("~/file0"));
         assert!(summary.contains("4 additional"));
         assert!(!summary.contains("file8"));
+        let german = report.review_details();
+        assert!(german.contains("Gelöschte Quelldatei:\n/Users/test/file0"));
+        assert!(german.contains("Rückgabecode: 0"));
+        assert!(!german.contains("Sandboxed copy"));
     }
 
     #[test]

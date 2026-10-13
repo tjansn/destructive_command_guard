@@ -2417,7 +2417,7 @@ fn main() {
         "hook request resolved"
     );
     let exit_code = if let Some(mut outcome) = decisive {
-        let trial_handled = trial_eligible
+        let trial_handled = (trial_eligible || desktop_review_eligible)
             && attempt_sandbox_trial(
                 &eval_context,
                 &mut outcome,
@@ -2470,7 +2470,11 @@ fn main() {
             emit_stderr!("[dcg] Warte auf deine Freigabe im macOS-Dialog (maximal 120 Sekunden).");
             let accepted = filesystem_effect.as_ref().map_or_else(
                 || snapshot.request(&description, cwd),
-                |assessment| assessment.review_with(store.as_ref(), || snapshot.request(&description, cwd)),
+                |assessment| assessment.review_with(store.as_ref(), |scope| {
+                    let mut scoped = description.clone();
+                    scoped.set_scope(scope);
+                    snapshot.request(&scoped, cwd)
+                }),
             );
             if !accepted {
                 review_unavailable = Some("Nicht per Fingerabdruck freigegeben: abgelehnt, abgelaufen, Dialog nicht verfügbar oder geprüfte Dateien geändert.");
@@ -2760,9 +2764,11 @@ fn attempt_sandbox_trial(
         let before = store
             .fingerprint(&command, cwd, &shell, &sources)
             .map_err(|e| format!("Die Prüfung ist unvollständig. Cannot bind an exact trial version; desktop approval unavailable: {e}"))?;
-        if !before.reproducible {
+        let scope = desktop_review::ApprovalScope::trial(before.reproducible);
+        if scope == desktop_review::ApprovalScope::OneTime {
             let explanation = "Runtime inputs or environment are not reproduced by the sandbox. This request requires one-time desktop review; no reusable approval will be recorded.";
-            if !desktop || !desktop_review::request_trial(&command, cwd, explanation, agent) {
+            let german = "Laufzeiteingaben oder Umgebung können in der Sandbox nicht vollständig nachgebildet werden. Bitte prüfe den genauen Aufruf und seine Folgen.";
+            if !desktop || !desktop_review::request_trial(&command, cwd, german, agent, scope) {
                 return Err(format!(
                     "{explanation}\n[dcg:review-unavailable-or-cancelled] Desktop review unavailable, declined or expired."
                 ));
@@ -2789,14 +2795,14 @@ fn attempt_sandbox_trial(
         }
         let shell_supported = matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
             && matches!(shell.to_str(), Some("/bin/zsh" | "/bin/bash" | "/bin/sh"));
-        let report = if interactive || !shell_supported {
+        let report = if interactive || !shell_supported || !ctx.config.trial.enabled {
             trial::TrialReport {
                 id: format!("{:032x}", rand::random::<u128>()),
                 command: command.clone(),
                 project_root: before.project_root.clone(),
                 observations: trial::Observations {
                     issues: vec![
-                        "TTY/user interaction required or shell unsupported; trial not started"
+                        "Trial disabled, TTY/user interaction required or shell unsupported; trial not started"
                             .to_owned(),
                     ],
                     ..trial::Observations::default()
@@ -2824,7 +2830,15 @@ fn attempt_sandbox_trial(
             trial::Verdict::Safe => "trial",
             trial::Verdict::Unsafe => return Err(summary),
             trial::Verdict::Inconclusive => {
-                if !desktop || !desktop_review::request_trial(&command, cwd, &summary, agent) {
+                if !desktop
+                    || !desktop_review::request_trial(
+                        &command,
+                        cwd,
+                        &report.review_details(),
+                        agent,
+                        scope,
+                    )
+                {
                     return Err(format!(
                         "{summary}\n[dcg:review-unavailable-or-cancelled] Desktop review unavailable, declined or expired."
                     ));

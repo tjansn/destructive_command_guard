@@ -13,12 +13,35 @@ attempts are ignored. A successful reply is accepted only while DCG is active an
 window is visible and key. The original 120-second deadline continues across attempts;
 Escape, Ablehnen, closing, and timeout still deny.
 
+The main panel shows the command and cwd in bounded, middle-truncated monospace
+fields. Details retain the full bounded command. Prose is German and uses the system
+font; paths, commands and script excerpts use monospace. A single typed approval
+scope supplies both the displayed sentence and the decision to store an approval:
+
+- `one_time`: this invocation only; no reusable entry.
+- `exact_version`: exact command and project inputs; changes require review again.
+- `learned_filesystem`: command, rule and unchanged filesystem operands.
+- `confined`: one execution under continuing confinement; no stored approval.
+
+Learning storage failure cannot silently convert a consented learned entry into a
+one-time approval. The request stays blocked. Changes to dcg remain one-time.
+
+Each fresh Touch ID view is constrained to a clipped 48×48 container. Focus loss
+removes the cancelled view and shows **Prüfung pausiert** with a click-to-continue
+instruction and opaque readable backing. Layout, resizing and attempt changes
+invalidate the window shadow. Native light/dark acceptance is still required.
+
 `cargo test desktop_review -- --test-threads=1` includes a UI-less Swift controller
 suite with fake biometric evaluators and delayed replies. The native acceptance entry
 in `tests/desktop_review_focus_acceptance.swift` uses the production window and real
-LocalAuthentication, brings Orca forward twice, and closes without approving or
-executing a command. Compile it with `src/desktop_review.swift` and
-`-D DCG_UI_PREVIEW`; it requires an interactive macOS session with Orca running.
+LocalAuthentication, brings Orca forward twice, checks first/recreated glyph bounds,
+and captures key/paused states before closing without executing a command. Compile
+it with `src/desktop_review.swift` and
+`-D DCG_UI_PREVIEW`; run with `light|dark` and an existing absolute temporary
+screenshot directory. It requires an interactive macOS session with Orca running,
+available Touch ID and screen-recording permission. Do not authenticate during the
+preview. Eight screenshots (four per appearance) must be inspected for clipping,
+contrast and the rectangular shadow; layout assertions alone cannot prove these.
 
 On 2026-10-12 the native acceptance entry compiled, but the installed guard denied
 launching the temporary helper because its `/tmp` path contains a symlink. It was not

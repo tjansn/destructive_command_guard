@@ -111,6 +111,43 @@ pub struct ReviewSnapshot {
     incomplete: bool,
 }
 
+/// The authorization scope controls both consent wording and persistence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalScope {
+    OneTime,
+    ExactVersion,
+    LearnedFilesystem,
+    Confined,
+}
+
+impl ApprovalScope {
+    pub const fn trial(reproducible: bool) -> Self {
+        if reproducible {
+            Self::ExactVersion
+        } else {
+            Self::OneTime
+        }
+    }
+
+    pub const fn sentence(self) -> &'static str {
+        match self {
+            Self::OneTime => {
+                "Die Freigabe gilt nur für diesen Aufruf. Es wird keine wiederverwendbare Ausnahme gespeichert."
+            }
+            Self::ExactVersion => {
+                "Die Freigabe gilt für diese exakte Befehls- und Projektversion. Geänderte geprüfte Eingaben erfordern erneut eine Prüfung."
+            }
+            Self::LearnedFilesystem => {
+                "Touch ID merkt sich diesen Aufruf, diese Regel und die unveränderten Dateisystemobjekte. Änderungen erfordern erneut eine Prüfung."
+            }
+            Self::Confined => {
+                "Der Befehl läuft einmal unter fortlaufender Sandbox-Begrenzung. Es wird keine Freigabe gespeichert."
+            }
+        }
+    }
+}
+
 /// Separate display fields prevent command/source text from posing as an
 /// agent, folder or action heading. Full evidence remains available in details.
 #[derive(Clone, serde::Serialize)]
@@ -126,11 +163,18 @@ pub struct ReviewDescription {
     command: String,
     targets: Vec<String>,
     text: String,
+    scope: ApprovalScope,
+    scope_text: String,
 }
 
 impl ReviewDescription {
-    /// Replace the one-request footer only when complete operand evidence can
-    /// earn a version-bound approval. Self-protection always stays one-request.
+    pub fn set_scope(&mut self, scope: ApprovalScope) {
+        self.scope = scope;
+        self.scope_text = scope.sentence().to_owned();
+    }
+
+    /// Add effect evidence. The persistence decision separately supplies scope;
+    /// an available manifest alone does not promise a remembered approval.
     pub fn filesystem_effect(&mut self, assessment: &crate::effects::Assessment) {
         if let Some(summary) = &assessment.summary {
             self.effect = visible(summary);
@@ -139,12 +183,6 @@ impl ReviewDescription {
         }
         if assessment.self_protected {
             self.warning = Some(crate::effects::SELF_PROTECTION.to_owned());
-        } else if assessment.version.is_some() {
-            self.text = self.text.replace(
-                "Die Freigabe gilt einmal für den gesamten Aufruf oben, einschließlich weiterer Skriptschritte. Es wird keine dauerhafte Ausnahme angelegt. Bei unklaren Zielen ablehnen.",
-                "Touch ID merkt sich ausschließlich diesen Aufruf, diese Regel und die unveränderten Dateisystemobjekte. Änderungen erfordern erneut eine Prüfung. Bei unklaren Zielen ablehnen.",
-            );
-            self.warning = Some("Freigabe wird für unveränderte Ziele gemerkt.".to_owned());
         }
     }
 }
@@ -231,7 +269,7 @@ impl ReviewSnapshot {
             ),
             visible(&cwd.display().to_string()),
             visible(command),
-            visible(&info.reason),
+            effect,
             visible(pack),
             visible(pattern),
         );
@@ -261,7 +299,6 @@ impl ReviewSnapshot {
                 }
             }
         }
-        text.push_str("\nDie Freigabe gilt einmal für den gesamten Aufruf oben, einschließlich weiterer Skriptschritte. Es wird keine dauerhafte Ausnahme angelegt. Bei unklaren Zielen ablehnen.");
         (text.len() <= MAX_REVIEW_TEXT).then(|| ReviewDescription {
             agent,
             host,
@@ -279,6 +316,8 @@ impl ReviewSnapshot {
                 .map(|target| visible_inline(target))
                 .collect(),
             text,
+            scope: ApprovalScope::OneTime,
+            scope_text: ApprovalScope::OneTime.sentence().to_owned(),
         })
     }
 
@@ -315,35 +354,62 @@ impl ReviewSnapshot {
 /// Unlike a static
 /// review this explicitly asks the user to accept incomplete evidence. The
 /// caller must revalidate the exact-version fingerprint after authentication.
-pub fn request_trial(command: &str, cwd: &Path, summary: &str, agent: &str) -> bool {
+pub fn request_trial(
+    command: &str,
+    cwd: &Path,
+    summary: &str,
+    agent: &str,
+    scope: ApprovalScope,
+) -> bool {
     let Some(_lock) = review_lock() else {
         return false;
     };
     let Some(before) = directory_identity(cwd) else {
         return false;
     };
+    let Some(description) = trial_description(command, cwd, summary, agent, scope) else {
+        return false;
+    };
+    native_dialog(&description, &format!("{:032x}", rand::random::<u128>()))
+        && directory_identity(cwd).as_ref() == Some(&before)
+}
+
+fn trial_description(
+    command: &str,
+    cwd: &Path,
+    summary: &str,
+    agent: &str,
+    scope: ApprovalScope,
+) -> Option<ReviewDescription> {
     let text = format!(
-        "{}\n\nFreigabe trotz unvollständiger Sandbox-Prüfung? Die Freigabe gilt für diese exakte Befehls- und Projektversion bis eine geprüfte Datei geändert wird. Bei unklaren Folgen ablehnen.",
+        "Arbeitsordner:\n{}\n\nGenauer Aufruf:\n{}\n\n{}\n\nFreigabe trotz unvollständiger Sandbox-Prüfung? Bei unklaren Folgen ablehnen.",
+        visible(&cwd.display().to_string()),
+        visible(command),
         visible(summary)
     );
     if text.len() > MAX_REVIEW_TEXT {
-        return false;
+        return None;
     }
-    let description = ReviewDescription {
+    Some(ReviewDescription {
         agent: agent_label(agent),
         host: None,
         project: visible_inline(&cwd.file_name().unwrap_or_default().to_string_lossy()),
         repository: repository_root(cwd).map(|p| visible_inline(&p.display().to_string())),
         cwd: visible(&cwd.display().to_string()),
-        title: "Unvollständigen Sandbox-Test prüfen".to_owned(),
+        title: if scope == ApprovalScope::OneTime {
+            "Genauen Aufruf einmalig prüfen"
+        } else {
+            "Unvollständigen Sandbox-Test prüfen"
+        }
+        .to_owned(),
         effect: "Der echte Befehl darf nach Freigabe außerhalb der Sandbox laufen.".to_owned(),
         warning: Some("Ein einzelner Testlauf beweist keine allgemeine Sicherheit.".to_owned()),
         command: visible(command),
         targets: Vec::new(),
         text,
-    };
-    native_dialog(&description, &format!("{:032x}", rand::random::<u128>()))
-        && directory_identity(cwd).as_ref() == Some(&before)
+        scope,
+        scope_text: scope.sentence().to_owned(),
+    })
 }
 
 fn repository_root(cwd: &Path) -> Option<PathBuf> {
@@ -758,6 +824,66 @@ fn native_dialog(_: &ReviewDescription, _: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn approval_scope_has_one_truthful_localized_persistence_sentence() {
+        assert_eq!(ApprovalScope::trial(false), ApprovalScope::OneTime);
+        assert_eq!(ApprovalScope::trial(true), ApprovalScope::ExactVersion);
+        let sentences = [
+            ApprovalScope::OneTime,
+            ApprovalScope::ExactVersion,
+            ApprovalScope::LearnedFilesystem,
+            ApprovalScope::Confined,
+        ]
+        .map(ApprovalScope::sentence);
+        assert!(sentences[0].contains("keine wiederverwendbare Ausnahme"));
+        assert!(sentences[1].contains("exakte Befehls- und Projektversion"));
+        assert!(sentences[2].contains("Dateisystemobjekte"));
+        assert!(sentences[3].contains("keine Freigabe gespeichert"));
+        assert!(
+            sentences
+                .iter()
+                .all(|text| !text.contains("Runtime inputs"))
+        );
+    }
+
+    #[test]
+    fn descriptions_serialize_the_selected_scope_and_preserve_the_full_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let command = format!("node --test '{}'", "long-but-literal".repeat(20));
+        for (scope, wire) in [
+            (ApprovalScope::OneTime, "one_time"),
+            (ApprovalScope::ExactVersion, "exact_version"),
+        ] {
+            let mut description = trial_description(
+                &command,
+                temp.path(),
+                "Die Beobachtung ist unvollständig.",
+                "claude-code",
+                ApprovalScope::OneTime,
+            )
+            .unwrap();
+            description.set_scope(scope);
+            let json = serde_json::to_value(&description).unwrap();
+            assert_eq!(json["scope"], wire);
+            assert_eq!(json["scope_text"], scope.sentence());
+            assert_eq!(json["command"], command);
+            assert!(description.text.contains(&command));
+            assert!(description.text.contains(temp.path().to_str().unwrap()));
+            assert!(!description.text.contains("Die Freigabe gilt"));
+            assert!(!description.text.contains("Runtime inputs"));
+        }
+        assert!(
+            trial_description(
+                &"x".repeat(MAX_REVIEW_TEXT),
+                temp.path(),
+                "Prüfung",
+                "pi",
+                ApprovalScope::OneTime
+            )
+            .is_none()
+        );
+    }
+
     fn match_info(pattern: &str) -> PatternMatch {
         PatternMatch {
             pack_id: Some("core.filesystem".to_string()),
@@ -789,7 +915,7 @@ mod tests {
         assert_eq!(text.command, "rm -rf './old files'");
         assert_eq!(text.title, "„old files“ löschen");
         assert!(!text.title.contains(&cwd.display().to_string()));
-        assert!(text.text.contains("keine dauerhafte Ausnahme"));
+        assert!(text.scope_text.contains("keine wiederverwendbare Ausnahme"));
     }
 
     #[test]

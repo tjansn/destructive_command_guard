@@ -657,26 +657,38 @@ impl Assessment {
 
     /// The dialog is injected only in tests. Production passes the existing
     /// nonce-bound biometric review and rechecks operands before AND after it.
-    pub fn review_with(&self, store: Option<&TrialStore>, dialog: impl FnOnce() -> bool) -> bool {
+    pub fn review_with(
+        &self,
+        store: Option<&TrialStore>,
+        dialog: impl FnOnce(crate::desktop_review::ApprovalScope) -> bool,
+    ) -> bool {
+        use crate::desktop_review::ApprovalScope;
+        let scope = if !self.self_protected && self.version.is_some() && store.is_some() {
+            ApprovalScope::LearnedFilesystem
+        } else {
+            ApprovalScope::OneTime
+        };
         let unchanged = || {
             self.version.as_ref().is_none_or(|version| {
                 fingerprint(&version.command, &version.cwd, &version.rule_id)
                     .is_ok_and(|current| current == *version)
             })
         };
-        if !unchanged() || !dialog() || !unchanged() {
+        if !unchanged() || !dialog(scope) || !unchanged() {
             return false;
         }
-        if !self.self_protected
+        if scope == ApprovalScope::LearnedFilesystem
             && let (Some(store), Some(version)) = (store, self.version.as_ref())
         {
-            // Persistence failure cannot expand an approval; it remains one-request.
-            let _ = store.approve_learned(
-                version,
-                self.summary
-                    .as_deref()
-                    .unwrap_or("Touch ID: exact filesystem operands"),
-            );
+            // Do not silently substitute a different scope for the user's consent.
+            return store
+                .approve_learned(
+                    version,
+                    self.summary
+                        .as_deref()
+                        .unwrap_or("Touch ID: exact filesystem operands"),
+                )
+                .is_ok();
         }
         true
     }
@@ -846,15 +858,48 @@ mod tests {
         let text = command("rm -r", &[&target]);
         let first = assess(&text, &project, REMOVE);
         assert!(!first.allow && !first.learned(&store));
-        assert!(first.review_with(Some(&store), || true));
+        assert!(first.review_with(Some(&store), |scope| scope
+            == crate::desktop_review::ApprovalScope::LearnedFilesystem));
         assert!(assess(&text, &project, REMOVE).learned(&store));
         assert!(!assess(&text, &project, "core.filesystem:rm-protected-file").learned(&store));
         assert!(!assess(&format!("{text} "), &project, REMOVE).learned(&store));
         fs::write(&target, "changed").unwrap();
         let next = assess(&text, &project, REMOVE);
         assert!(!next.learned(&store));
-        assert!(!next.review_with(Some(&store), || false));
+        assert!(!next.review_with(Some(&store), |_| false));
         assert_eq!(store.list_learned().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unavailable_learning_store_uses_one_time_scope() {
+        let (_temp, project, store) = fixture();
+        let target = project.join("target");
+        fs::write(&target, "original").unwrap();
+        let check = assess(&command("rm -r", &[&target]), &project, REMOVE);
+        assert!(check.review_with(None, |scope| {
+            assert_eq!(scope, crate::desktop_review::ApprovalScope::OneTime);
+            true
+        }));
+        assert!(store.list_learned().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_learning_write_cannot_silently_change_the_consented_scope() {
+        let (_temp, project, _) = fixture();
+        let target = project.join("target");
+        fs::write(&target, "original").unwrap();
+        let store_path = project.join("not-a-directory");
+        fs::write(&store_path, "fixture obstacle").unwrap();
+        let store = TrialStore::new(store_path);
+        let check = assess(&command("rm -r", &[&target]), &project, REMOVE);
+        assert!(!check.review_with(Some(&store), |scope| {
+            assert_eq!(
+                scope,
+                crate::desktop_review::ApprovalScope::LearnedFilesystem
+            );
+            true
+        }));
+        assert_eq!(fs::read_to_string(target).unwrap(), "original");
     }
 
     #[test]
@@ -864,7 +909,7 @@ mod tests {
         fs::write(&target, "original").unwrap();
         let text = command("rm -r", &[&target]);
         let check = assess(&text, &project, REMOVE);
-        assert!(!check.review_with(Some(&store), || {
+        assert!(!check.review_with(Some(&store), |_| {
             fs::write(&target, "changed").unwrap();
             true
         }));
@@ -915,7 +960,8 @@ mod tests {
             for _ in 0..2 {
                 let mut asked = false;
                 assert!(!assessment.allow && !assessment.learned(&store));
-                assert!(assessment.review_with(Some(&store), || {
+                assert!(assessment.review_with(Some(&store), |scope| {
+                    assert_eq!(scope, crate::desktop_review::ApprovalScope::OneTime);
                     asked = true;
                     true
                 }));
