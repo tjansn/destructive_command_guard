@@ -962,11 +962,14 @@ fn flush_batch(db: &HistoryDb, batch: &mut Vec<CommandEntry>) -> FlushOutcome {
     let batch_len = batch.len();
     trace!(batch_size = batch_len, "Flushing history batch");
 
-    // Try batch insert first (more efficient)
+    // Bulk insertion is transactional: an error rolls back its whole prefix.
+    // Individual fallback inserts below instead commit one row at a time.
     if batch_len >= 2 {
         match db.log_commands_batch(batch) {
             Ok(()) => {
                 trace!(count = batch_len, "Batch insert succeeded");
+                batch.clear();
+                return FlushOutcome::Success;
             }
             Err(e) => {
                 if is_contention_error(&e) {
@@ -992,92 +995,68 @@ fn flush_batch(db: &HistoryDb, batch: &mut Vec<CommandEntry>) -> FlushOutcome {
                     batch_size = batch_len,
                     "Batch insert failed, falling back to individual inserts"
                 );
-                // Fallback to individual inserts on error
-                let mut success_count = 0;
-                let mut error_count = 0;
-                for entry in batch.iter() {
-                    match db.log_command(entry) {
-                        Ok(_id) => success_count += 1,
-                        Err(insert_err) => {
-                            if is_contention_error(&insert_err) {
-                                debug!(
-                                    "History database became busy during fallback; dropping remaining telemetry"
-                                );
-                                return FlushOutcome::Contended;
-                            }
-                            if is_capacity_error(&insert_err) {
-                                return FlushOutcome::CapacityReached;
-                            }
-                            if is_fatal_storage_error(&insert_err) {
-                                error!(
-                                    error = %insert_err,
-                                    command = %entry.command,
-                                    "Fatal history storage error in single-row insert"
-                                );
-                                return FlushOutcome::Fatal;
-                            }
-                            error_count += 1;
-                            history_diagnostic("storage_error", format_args!("phase=insert"));
-                            // Log first few errors, then summarize
-                            if error_count <= 3 {
-                                error!(
-                                    error = %insert_err,
-                                    command = %entry.command,
-                                    "Failed to insert history entry"
-                                );
-                            }
-                        }
-                    }
-                }
-                if error_count > 3 {
-                    error!(
-                        total_errors = error_count,
-                        "Additional history insert errors suppressed"
-                    );
-                }
-                if error_count > 0 {
-                    warn!(
-                        success = success_count,
-                        failed = error_count,
-                        "History batch recovery completed with errors"
-                    );
-                }
-            }
-        }
-    } else {
-        // Single entry, use regular insert
-        for entry in batch.iter() {
-            match db.log_command(entry) {
-                Ok(_id) => trace!(command = %entry.command, "Inserted history entry"),
-                Err(e) => {
-                    if is_contention_error(&e) {
-                        debug!("History database is busy; dropping best-effort telemetry entry");
-                        return FlushOutcome::Contended;
-                    }
-                    if is_capacity_error(&e) {
-                        return FlushOutcome::CapacityReached;
-                    }
-                    if is_fatal_storage_error(&e) {
-                        error!(
-                            error = %e,
-                            command = %entry.command,
-                            "Fatal history storage error in single-row insert"
-                        );
-                        return FlushOutcome::Fatal;
-                    }
-                    error!(
-                        error = %e,
-                        command = %entry.command,
-                        "Failed to insert history entry"
-                    );
-                    history_diagnostic("storage_error", format_args!("phase=insert"));
-                }
             }
         }
     }
 
-    batch.clear();
-    FlushOutcome::Success
+    flush_individual_entries(batch, |entry| db.log_command(entry))
+}
+
+/// Retire the processed prefix even when a later insert stops the batch.
+///
+/// Successful individual inserts are already committed; replaying them after
+/// recovery duplicates history. Permanently rejected entries are processed too
+/// and must not reappear when recovery removes a connection-local constraint.
+/// Only the terminally failing entry and the unattempted suffix remain. This
+/// does not resolve an ambiguous commit of the failing entry itself.
+fn flush_individual_entries(
+    batch: &mut Vec<CommandEntry>,
+    mut insert: impl FnMut(&CommandEntry) -> Result<i64, HistoryError>,
+) -> FlushOutcome {
+    let mut processed = 0;
+    let mut error_count = 0;
+    let mut outcome = FlushOutcome::Success;
+
+    for entry in batch.iter() {
+        match insert(entry) {
+            Ok(_id) => trace!("Inserted history entry"),
+            Err(e) => {
+                if is_contention_error(&e) {
+                    debug!("History database became busy; dropping remaining telemetry");
+                    outcome = FlushOutcome::Contended;
+                    break;
+                }
+                if is_capacity_error(&e) {
+                    outcome = FlushOutcome::CapacityReached;
+                    break;
+                }
+                if is_fatal_storage_error(&e) {
+                    error!(error = %e, "Fatal history storage error in single-row insert");
+                    outcome = FlushOutcome::Fatal;
+                    break;
+                }
+                error_count += 1;
+                history_diagnostic("storage_error", format_args!("phase=insert"));
+                if error_count <= 3 {
+                    error!(error = %e, "Failed to insert history entry");
+                }
+            }
+        }
+        processed += 1;
+    }
+
+    // Mutate only after the iteration borrow ends, and shift the suffix once
+    // rather than repeatedly removing the first element (quadratic work).
+    drop(batch.drain(..processed));
+    if error_count > 0 {
+        warn!(
+            success = processed - error_count,
+            failed = error_count,
+            remaining = batch.len(),
+            "History individual inserts completed with rejected entries"
+        );
+    }
+    outcome
 }
 
 /// Check if pruning is needed and perform it.
@@ -1137,6 +1116,193 @@ fn redact_for_history(command: &str, mode: HistoryRedactionMode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recovery_test_entries(commands: &[&str]) -> Vec<CommandEntry> {
+        commands
+            .iter()
+            .map(|command| CommandEntry {
+                command: (*command).to_string(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn injected_storage_error(code: i32) -> HistoryError {
+        HistoryError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            Some("injected between real SQLite inserts".to_string()),
+        ))
+    }
+
+    fn reject_recovery_test_entry(db: &HistoryDb) {
+        db.connection()
+            .execute(
+                "CREATE TEMP TRIGGER reject_history_probe BEFORE INSERT ON commands
+                 WHEN new.command = 'rejected'
+                 BEGIN SELECT RAISE(ABORT, 'test entry rejected'); END;",
+            )
+            .expect("install connection-local rejection trigger");
+    }
+
+    fn assert_fts_probe_count(path: &Path, term: &str, expected: i64) {
+        let connection =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open FTS observer");
+        // COUNT(*) without MATCH can read the external content table and
+        // would not prove that the search index itself was updated.
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM commands_fts WHERE commands_fts MATCH ?1",
+                [term],
+                |row| row.get(0),
+            )
+            .expect("query actual FTS postings");
+        assert_eq!(count, expected, "unexpected FTS count for {term}");
+    }
+
+    #[test]
+    fn batch_fallback_keeps_good_rows_and_legitimate_repeated_commands() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fallback-repeated.db");
+        let db = HistoryDb::open(Some(path.clone())).unwrap();
+        reject_recovery_test_entry(&db);
+        let mut batch = recovery_test_entries(&["repeatable", "rejected", "repeatable"]);
+
+        // The first row must be rolled back when the bulk insert hits the
+        // trigger. Fallback then commits the two distinct, identical events.
+        assert!(db.log_commands_batch(&batch).is_err());
+        assert!(persisted_test_commands(&path).is_empty());
+        assert_eq!(flush_batch(&db, &mut batch), FlushOutcome::Success);
+        assert!(batch.is_empty());
+        assert_eq!(
+            persisted_test_commands(&path),
+            vec!["repeatable", "repeatable"]
+        );
+        assert_fts_probe_count(&path, "repeatable", 2);
+        assert_fts_probe_count(&path, "rejected", 0);
+        assert_eq!(flush_batch(&db, &mut batch), FlushOutcome::Success);
+        assert_eq!(db.count_commands().unwrap(), 2);
+    }
+
+    #[test]
+    fn fatal_fallback_recovery_retries_only_the_unprocessed_suffix() {
+        let commands = ["prefix", "middle", "tail"];
+        for fail_at in 0..commands.len() {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("fallback-recovery.db");
+            let mut db = HistoryDb::open(Some(path.clone())).unwrap();
+            let mut batch = recovery_test_entries(&commands);
+            let mut attempted = 0;
+            let result = flush_individual_entries(&mut batch, |entry| {
+                let index = attempted;
+                attempted += 1;
+                if index == fail_at {
+                    Err(injected_storage_error(rusqlite::ffi::SQLITE_IOERR))
+                } else {
+                    db.log_command(entry)
+                }
+            });
+            assert_eq!(result, FlushOutcome::Fatal);
+            assert_eq!(attempted, fail_at + 1);
+            assert_eq!(persisted_test_commands(&path), commands[..fail_at]);
+            assert_eq!(
+                batch.iter().map(|entry| entry.command.as_str()).collect::<Vec<_>>(),
+                commands[fail_at..]
+            );
+
+            let max_size = WorkerConfig::default().max_size_bytes;
+            assert!(recover_history_db(&mut db, Some(&path), max_size));
+            let mut disabled = false;
+            flush_batch_with_recovery(&mut db, &mut batch, Some(&path), &mut disabled, max_size);
+            assert!(!disabled);
+            assert!(batch.is_empty());
+            assert_eq!(persisted_test_commands(&path), commands);
+            for command in commands {
+                assert_fts_probe_count(&path, command, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_recovery_cannot_resurrect_a_previously_rejected_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fallback-rejected-prefix.db");
+        let mut db = HistoryDb::open(Some(path.clone())).unwrap();
+        reject_recovery_test_entry(&db);
+        let mut batch = recovery_test_entries(&["committed", "rejected", "pending", "tail"]);
+        let result = flush_individual_entries(&mut batch, |entry| {
+            if entry.command == "pending" {
+                Err(injected_storage_error(rusqlite::ffi::SQLITE_IOERR))
+            } else {
+                db.log_command(entry)
+            }
+        });
+        assert_eq!(result, FlushOutcome::Fatal);
+        assert_eq!(persisted_test_commands(&path), vec!["committed"]);
+        assert_eq!(
+            batch.iter().map(|entry| entry.command.as_str()).collect::<Vec<_>>(),
+            vec!["pending", "tail"]
+        );
+
+        // Reopening removes the TEMP trigger. Retrying the original batch
+        // would now duplicate "committed" AND incorrectly insert "rejected".
+        let max_size = WorkerConfig::default().max_size_bytes;
+        assert!(recover_history_db(&mut db, Some(&path), max_size));
+        let mut disabled = false;
+        flush_batch_with_recovery(&mut db, &mut batch, Some(&path), &mut disabled, max_size);
+        assert!(!disabled);
+        assert!(batch.is_empty());
+        assert_eq!(
+            persisted_test_commands(&path),
+            vec!["committed", "pending", "tail"]
+        );
+        assert_fts_probe_count(&path, "committed", 1);
+        assert_fts_probe_count(&path, "rejected", 0);
+    }
+
+    #[test]
+    fn terminal_fallback_errors_preserve_only_unprocessed_entries() {
+        for (code, expected) in [
+            (rusqlite::ffi::SQLITE_BUSY, FlushOutcome::Contended),
+            (rusqlite::ffi::SQLITE_LOCKED, FlushOutcome::Contended),
+            (rusqlite::ffi::SQLITE_FULL, FlushOutcome::CapacityReached),
+            (rusqlite::ffi::SQLITE_IOERR, FlushOutcome::Fatal),
+        ] {
+            let db = HistoryDb::open_in_memory().unwrap();
+            let mut batch = recovery_test_entries(&["committed", "pending", "unattempted"]);
+            let mut attempted = 0;
+            let result = flush_individual_entries(&mut batch, |entry| {
+                attempted += 1;
+                if entry.command == "pending" {
+                    Err(injected_storage_error(code))
+                } else {
+                    db.log_command(entry)
+                }
+            });
+            assert_eq!(result, expected);
+            assert_eq!(attempted, 2);
+            assert_eq!(db.count_commands().unwrap(), 1);
+            assert_eq!(
+                batch.iter().map(|entry| entry.command.as_str()).collect::<Vec<_>>(),
+                vec!["pending", "unattempted"]
+            );
+        }
+    }
+
+    #[test]
+    fn individual_flush_handles_empty_and_single_rejected_batches() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let mut empty = Vec::new();
+        assert_eq!(
+            flush_individual_entries(&mut empty, |_| panic!("empty batch must not insert")),
+            FlushOutcome::Success
+        );
+        reject_recovery_test_entry(&db);
+        let mut batch = recovery_test_entries(&["rejected"]);
+        assert_eq!(flush_batch(&db, &mut batch), FlushOutcome::Success);
+        assert!(batch.is_empty(), "permanently rejected entries are not retried");
+        assert_eq!(db.count_commands().unwrap(), 0);
+    }
 
     #[test]
     fn hostname_normalization_rejects_empty_and_control_characters_514() {
