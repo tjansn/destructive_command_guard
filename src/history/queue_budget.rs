@@ -89,11 +89,11 @@ impl Drop for Reservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::HistoryRedactionMode;
     use crate::history::{
         CommandEntry, HistoryDb, HistoryEnqueueOutcome, HistoryMessage, HistoryWriter,
-        PendingHistoryBatch, WorkerConfig, history_worker,
+        PendingHistoryBatch, SqliteValue, WorkerConfig, history_worker,
     };
-    use crate::config::HistoryRedactionMode;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -211,7 +211,12 @@ mod tests {
         );
         let mut db = HistoryDb::open_in_memory().unwrap();
         let mut disabled = false;
-        batch.flush(&mut db, None, &mut disabled, WorkerConfig::default().max_size_bytes);
+        batch.flush(
+            &mut db,
+            None,
+            &mut disabled,
+            WorkerConfig::default().max_size_bytes,
+        );
         assert!(!disabled);
         assert_eq!(db.count_commands().unwrap(), 1);
         assert_eq!(budget.usage(), (0, 0));
@@ -220,7 +225,207 @@ mod tests {
             HistoryEnqueueOutcome::Queued
         );
         drop(receiver);
-        assert_eq!(budget.usage(), (0, 0), "receiver failure must release queued payloads");
+        assert_eq!(
+            budget.usage(),
+            (0, 0),
+            "receiver failure must release queued payloads"
+        );
+    }
+
+    fn stage_commands(
+        writer: &HistoryWriter,
+        receiver: &mpsc::Receiver<HistoryMessage>,
+        batch: &mut PendingHistoryBatch,
+        commands: &[&str],
+    ) {
+        for command in commands {
+            assert_eq!(
+                writer.try_log(CommandEntry {
+                    command: (*command).to_string(),
+                    ..Default::default()
+                }),
+                HistoryEnqueueOutcome::Queued
+            );
+            let HistoryMessage::Entry(entry) = receiver.try_recv().unwrap() else {
+                panic!("expected admitted entry");
+            };
+            batch.push(entry);
+        }
+    }
+
+    #[test]
+    fn rejected_batch_entries_release_capacity_without_reappearing() {
+        let (writer, receiver) = unstarted_writer(2, 8192, 1);
+        let budget = Arc::clone(writer.entry_budget.as_ref().unwrap());
+        let mut batch = PendingHistoryBatch::new(2);
+        let mut db = HistoryDb::open_in_memory().unwrap();
+        db.connection()
+            .execute(
+                "CREATE TEMP TRIGGER reject_admission_probe BEFORE INSERT ON commands
+                 WHEN new.command = 'rejected'
+                 BEGIN SELECT RAISE(ABORT, 'reject test entry'); END;",
+            )
+            .unwrap();
+        stage_commands(&writer, &receiver, &mut batch, &["kept", "rejected"]);
+        assert_eq!(budget.usage().0, 2);
+        let mut disabled = false;
+        let max_size = WorkerConfig::default().max_size_bytes;
+        batch.flush(&mut db, None, &mut disabled, max_size);
+        assert!(!disabled);
+        assert_eq!(budget.usage(), (0, 0));
+        assert_eq!(db.count_commands().unwrap(), 1);
+
+        // The bulk transaction rolls back, then fallback commits only "kept".
+        // Removing the rejecting trigger must not resurrect a retired entry.
+        db.connection()
+            .execute("DROP TRIGGER reject_admission_probe;")
+            .unwrap();
+        stage_commands(&writer, &receiver, &mut batch, &["later", "again"]);
+        batch.flush(&mut db, None, &mut disabled, max_size);
+        assert_eq!(budget.usage(), (0, 0));
+        let rows = db
+            .connection()
+            .query("SELECT command FROM commands ORDER BY id")
+            .unwrap();
+        let commands: Vec<_> = rows.iter().map(|row| row.values()[0].clone()).collect();
+        assert_eq!(
+            commands,
+            ["kept", "later", "again"].map(|command| SqliteValue::Text(command.into()))
+        );
+        let postings = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM commands_fts WHERE commands_fts MATCH 'rejected'")
+            .unwrap();
+        assert_eq!(postings.values(), &[SqliteValue::Integer(0)]);
+    }
+
+    #[test]
+    fn busy_batch_drop_returns_capacity_for_a_later_successful_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("admission-busy.db");
+        let mut db = HistoryDb::open(Some(path.clone())).unwrap();
+        let (writer, receiver) = unstarted_writer(2, 8192, 1);
+        let budget = Arc::clone(writer.entry_budget.as_ref().unwrap());
+        let mut batch = PendingHistoryBatch::new(2);
+        stage_commands(
+            &writer,
+            &receiver,
+            &mut batch,
+            &["busyfirst", "busysecond"],
+        );
+        let locker = rusqlite::Connection::open(&path).unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let mut disabled = false;
+        let max_size = WorkerConfig::default().max_size_bytes;
+        batch.flush(&mut db, Some(&path), &mut disabled, max_size);
+        locker.execute_batch("ROLLBACK;").unwrap();
+        drop(locker);
+        assert!(!disabled, "ordinary contention must not disable the worker");
+        assert_eq!(budget.usage(), (0, 0));
+        assert_eq!(db.count_commands().unwrap(), 0);
+
+        stage_commands(&writer, &receiver, &mut batch, &["survivor"]);
+        batch.flush(&mut db, Some(&path), &mut disabled, max_size);
+        assert_eq!(budget.usage(), (0, 0));
+        assert_eq!(db.count_commands().unwrap(), 1);
+        let row = db
+            .connection()
+            .query_row("SELECT command FROM commands")
+            .unwrap();
+        assert_eq!(row.values(), &[SqliteValue::Text("survivor".into())]);
+    }
+
+    #[test]
+    fn unavailable_recovery_discards_payload_and_releases_reservations() {
+        let (writer, receiver) = unstarted_writer(2, 8192, 1);
+        let budget = Arc::clone(writer.entry_budget.as_ref().unwrap());
+        let mut db = HistoryDb::open_in_memory().unwrap();
+        let mut batch = PendingHistoryBatch::new(2);
+        stage_commands(
+            &writer,
+            &receiver,
+            &mut batch,
+            &["pendingfirst", "pendingsecond"],
+        );
+        // An unfinished transaction requires recovery, and an in-memory
+        // database has no reopen path. This exercises the production failure
+        // branch without injecting a storage delay or relying on host speed.
+        db.connection().execute("BEGIN IMMEDIATE;").unwrap();
+        let mut disabled = false;
+        let max_size = WorkerConfig::default().max_size_bytes;
+        batch.flush(&mut db, None, &mut disabled, max_size);
+        assert!(disabled, "unavailable recovery must disable further writes");
+        assert_eq!(budget.usage(), (0, 0));
+        assert!(batch.entries.is_empty());
+        db.connection().execute("ROLLBACK;").unwrap();
+
+        stage_commands(&writer, &receiver, &mut batch, &["discarded"]);
+        batch.flush(&mut db, None, &mut disabled, max_size);
+        assert!(disabled);
+        assert_eq!(
+            budget.usage(),
+            (0, 0),
+            "disabled batches must release capacity too"
+        );
+        assert_eq!(db.count_commands().unwrap(), 0);
+    }
+
+    #[test]
+    fn cloned_flush_handles_share_capacity_and_acknowledgement_releases_it() {
+        let (writer, receiver) = unstarted_writer(1, 4096, 1);
+        let handle = writer.flush_handle().unwrap();
+        let clone = handle.clone();
+        let ack = handle.request_flush().expect("first request admitted");
+        assert!(
+            clone.request_flush().is_none(),
+            "clones must share the same limit"
+        );
+        let HistoryMessage::Flush(request) = receiver.try_recv().unwrap() else {
+            panic!("expected flush request");
+        };
+        assert!(
+            clone.request_flush().is_none(),
+            "receipt is not acknowledgement"
+        );
+        request.acknowledge();
+        ack.try_recv().expect("flush acknowledged");
+        assert_eq!(handle.budget.usage(), (0, 0));
+        let next_ack = clone
+            .request_flush()
+            .expect("capacity returned before acknowledgement");
+        drop(receiver);
+        assert_eq!(next_ack.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+        assert_eq!(handle.budget.usage(), (0, 0));
+    }
+
+    #[test]
+    fn late_flush_requests_release_capacity_when_shutdown_closes_the_receiver() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("admission-shutdown.db");
+        let db = HistoryDb::open(Some(path.clone())).unwrap();
+        let (writer, receiver) = unstarted_writer(1, 4096, 1);
+        let entries = Arc::clone(writer.entry_budget.as_ref().unwrap());
+        let handle = writer.flush_handle().unwrap();
+        assert_eq!(
+            writer.try_log(CommandEntry::default()),
+            HistoryEnqueueOutcome::Queued
+        );
+        drop(writer);
+        let ack = handle
+            .request_flush()
+            .expect("late flush queued after shutdown marker");
+        history_worker(db, receiver, WorkerConfig::default());
+        assert_eq!(ack.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+        assert_eq!(handle.budget.usage(), (0, 0));
+        assert_eq!(entries.usage(), (0, 0));
+        assert!(handle.request_flush().is_none());
+        assert_eq!(
+            handle.budget.usage(),
+            (0, 0),
+            "failed sends cannot retain capacity"
+        );
+        let db = HistoryDb::open(Some(path)).unwrap();
+        assert_eq!(db.count_commands().unwrap(), 1);
     }
 
     #[test]
@@ -319,7 +524,9 @@ mod tests {
         assert_eq!(entries.usage(), (0, 0));
         assert_eq!(flushes.usage(), (0, 0));
         let reader = rusqlite::Connection::open(&path).unwrap();
-        let mut statement = reader.prepare("SELECT command FROM commands ORDER BY id").unwrap();
+        let mut statement = reader
+            .prepare("SELECT command FROM commands ORDER BY id")
+            .unwrap();
         let commands = statement
             .query_map([], |row| row.get::<_, String>(0))
             .unwrap()
