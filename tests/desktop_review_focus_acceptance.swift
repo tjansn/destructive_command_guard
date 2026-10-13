@@ -39,6 +39,18 @@ struct FocusAcceptance {
         @MainActor func descendants(_ view: NSView) -> [NSView] {
             [view] + view.subviews.flatMap { descendants($0) }
         }
+        @MainActor func activateOrca() {
+            guard #available(macOS 14.0, *) else {
+                fatalError("Native focus acceptance requires macOS 14 or later")
+            }
+            precondition(NSApp.isActive && window().isKeyWindow)
+            // Cooperative activation transfers this preview's active status.
+            // An accepted request is not proof of focus: capture checks Orca's
+            // frontmost process and the paused production window a second later.
+            NSApp.yieldActivation(to: orca)
+            precondition(orca.activate(from: .current, options: [.activateAllWindows]),
+                         "Orca activation request was refused")
+        }
         @MainActor func capture(_ stage: String, key: Bool) {
             let panel = window()
             precondition(panel.isVisible && panel.isKeyWindow == key)
@@ -56,6 +68,8 @@ struct FocusAcceptance {
                 precondition(abs(glyph.frame.width - 48) < 1 && abs(glyph.frame.height - 48) < 1, "Touch ID view must stay 48 x 48")
                 precondition(glyph.superview?.layer?.masksToBounds == true, "glyph container must clip")
             } else {
+                precondition(orca.isActive && NSWorkspace.shared.frontmostApplication?.processIdentifier == orca.processIdentifier,
+                             "Orca must actually take focus before paused-state acceptance")
                 precondition(glyphs.isEmpty, "paused dialog must remove the cancelled glyph")
                 precondition(views.compactMap { ($0 as? NSTextField)?.stringValue }.contains("Prüfung pausiert"))
             }
@@ -74,16 +88,20 @@ struct FocusAcceptance {
         // the UI-less controller suite separately tests that early recovery.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { capture("first-key", key: true) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            orca.activate(options: [.activateIgnoringOtherApps])
+            activateOrca()
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { capture("first-paused", key: false) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
             window().makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            if #available(macOS 14.0, *) {
+                NSApp.activate()
+            } else {
+                fatalError("Native focus acceptance requires macOS 14 or later")
+            }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { capture("recreated-key", key: true) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) {
-            orca.activate(options: [.activateIgnoringOtherApps])
+            activateOrca()
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 7.0) {
             capture("recreated-paused", key: false)
