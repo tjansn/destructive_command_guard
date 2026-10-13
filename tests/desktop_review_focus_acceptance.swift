@@ -25,7 +25,7 @@ struct FocusAcceptance {
             agent: "Claude Code", host: "Orca", project: "Harmloser Dialogtest",
             repository: nil, cwd: NSTemporaryDirectory(), title: "Unvollständigen Sandbox-Test prüfen",
             effect: "Kein Befehl wird ausgeführt. Der Test schließt diesen Dialog selbst.",
-            warning: nil, command: "cd '/temporary/literal preview directory/node-harness' && npm test", targets: [],
+            warning: nil, command: "cd '/temporary/literal preview directory/node-harness' && npm test", executables: ["/opt/homebrew/bin/npm"], targets: [],
             text: "Test: Orca übernimmt zweimal den Fokus. Keine Dateien oder Freigaben werden geändert.\n\nGenauer Aufruf (nur Anzeigedaten):\ncd '/temporary/literal preview directory/node-harness' && npm test\n\nArbeitsordner:\n\(NSTemporaryDirectory())",
             scope: "one_time", scope_text: "Die Freigabe gilt nur für diesen harmlosen Dialogtest.")
         let controller = ReviewController(ReviewRequest(description: info, nonce: String(repeating: "0", count: 32)))

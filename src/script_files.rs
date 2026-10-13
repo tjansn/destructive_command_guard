@@ -160,7 +160,7 @@ pub(crate) fn evaluate(
             "file inspection currently requires a POSIX shell",
         ));
     }
-    let references = match references(command, deadline) {
+    let (references, review_reason) = match references(command, deadline) {
         Ok(references) => references,
         Err(reason) => return (!resolve_unverified).then(|| unverified(&reason)),
     };
@@ -207,7 +207,14 @@ pub(crate) fn evaluate(
     if deadline.is_exceeded() {
         Some(EvaluationResult::indeterminate_due_to_budget())
     } else {
-        first_denial.or(incomplete).or(first_warning)
+        first_denial
+            .or(incomplete)
+            .or_else(|| {
+                review_reason
+                    .filter(|_| !resolve_unverified)
+                    .map(|reason| unverified(&reason))
+            })
+            .or(first_warning)
     }
 }
 
@@ -222,7 +229,10 @@ fn definite(result: &EvaluationResult) -> bool {
         })
 }
 
-fn references(command: &str, deadline: &Deadline) -> Result<Vec<Reference>, String> {
+fn references(
+    command: &str,
+    deadline: &Deadline,
+) -> Result<(Vec<Reference>, Option<String>), String> {
     if command.len() as u64 > MAX_TOTAL_BYTES {
         return Err("command exceeds script inspection's input bound".to_string());
     }
@@ -231,6 +241,8 @@ fn references(command: &str, deadline: &Deadline) -> Result<Vec<Reference>, Stri
         return Err("shell source could not be parsed completely".to_string());
     }
     let mut references = Vec::new();
+    let mut review_reason = None;
+    let environment = std::env::vars_os().collect();
     let mut pending = vec![ast.root()];
     while let Some(node) = pending.pop() {
         if deadline.is_exceeded() {
@@ -246,7 +258,32 @@ fn references(command: &str, deadline: &Deadline) -> Result<Vec<Reference>, Stri
                 pending.extend(node.children());
                 continue;
             }
-            references.extend(command_references(node.text().as_ref())?);
+            if let Some(bound) = crate::invocation::bound_environment(&text, &environment)? {
+                // Inspection must precede the review marker, including in the
+                // relaxed pass. Binding a prefix cannot erase a definite sink.
+                references.extend(command_references(&bound.command)?);
+                for name in ["BASH_ENV", "ENV"] {
+                    if let Some(path) = bound
+                        .values
+                        .get(std::ffi::OsStr::new(name))
+                        .filter(|v| !v.is_empty())
+                    {
+                        references.push(Reference {
+                            path: static_word(&shell_words::quote(&path.to_string_lossy()))?,
+                            language: Some(ScriptLanguage::Bash),
+                            sourced: true,
+                            format: FileFormat::Script,
+                        });
+                    }
+                }
+                if let Err(reason) = bound.ensure_reviewable() {
+                    review_reason = Some(reason);
+                } else {
+                    review_reason.get_or_insert_with(|| BOUND_REVIEW_REASON.to_owned());
+                }
+            } else {
+                references.extend(command_references(&text)?);
+            }
             if references.len() > MAX_FILES {
                 return Err("too many executable file references".to_string());
             }
@@ -259,7 +296,15 @@ fn references(command: &str, deadline: &Deadline) -> Result<Vec<Reference>, Stri
                     "PATH" | "NODE_OPTIONS" | "NODE_PATH" | "LD_PRELOAD" | "LD_LIBRARY_PATH"
                 ) || name.starts_with("DYLD_")
             }) {
-                return Err(environment_review_reason(command));
+                if node
+                    .parent()
+                    .is_none_or(|parent| parent.kind().as_ref() != "command")
+                {
+                    return Err(
+                        "standalone execution environment changes cannot be bound for review"
+                            .to_owned(),
+                    );
+                }
             }
             if let Some((name, value)) = assignment.split_once('=')
                 && matches!(name, "BASH_ENV" | "ENV")
@@ -287,6 +332,10 @@ fn references(command: &str, deadline: &Deadline) -> Result<Vec<Reference>, Stri
                 }
                 let mut synthetic = owner.text().to_string();
                 synthetic.push_str(" ./DCG_STDIN_SOURCE");
+                if let Some(bound) = crate::invocation::bound_environment(&synthetic, &environment)?
+                {
+                    synthetic = bound.command;
+                }
                 for mut reference in command_references(&synthetic)? {
                     if reference.path == "./DCG_STDIN_SOURCE" {
                         reference.path = static_word(raw_path.trim())?;
@@ -297,7 +346,7 @@ fn references(command: &str, deadline: &Deadline) -> Result<Vec<Reference>, Stri
         }
         pending.extend(node.children());
     }
-    Ok(references)
+    Ok((references, review_reason))
 }
 
 fn static_word(raw: &str) -> Result<String, String> {
@@ -327,14 +376,7 @@ fn assignment(raw: &str) -> bool {
     })
 }
 
-fn environment_review_reason(source: &str) -> String {
-    let parent = std::env::vars_os().collect();
-    match crate::invocation::bound_environment(source, &parent) {
-        Ok(Some(_)) => "[dcg:bound-input-review] Literal environment assignments require review of this exact invocation; no reusable trial approval will be recorded.".to_owned(),
-        Err(reason) => reason,
-        Ok(None) => "execution-affecting environment requires explicit input review".to_owned(),
-    }
-}
+const BOUND_REVIEW_REASON: &str = "[dcg:bound-input-review] Literal environment assignments require review of this exact invocation; no reusable trial approval will be recorded.";
 
 fn command_references(source: &str) -> Result<Vec<Reference>, String> {
     // env's assignment operands are removed by the shared wrapper normalizer.
@@ -353,7 +395,10 @@ fn command_references(source: &str) -> Result<Vec<Reference>, String> {
             })
         })
     {
-        return Err(environment_review_reason(source));
+        return Err(
+            "execution environment inside an unsupported wrapper cannot be bound for review"
+                .to_owned(),
+        );
     }
     let startup: Vec<_> = words
         .iter()
@@ -1214,4 +1259,56 @@ fn native_binary(magic: &[u8; 4]) -> bool {
             | [0xca, 0xfe, 0xba, 0xbe]
             | [b'M', b'Z', _, _]
     )
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_prefix_keeps_definite_findings_and_sources_in_the_relaxed_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let source = "git reset --hard\n";
+        fs::write(cwd.join("check.sh"), source).unwrap();
+        for relaxed in [false, true] {
+            for command in [
+                "bash check.sh",
+                "env -i HOME=/tmp/h PATH=/usr/bin:/bin bash check.sh",
+                "env -i PATH=/usr/bin:/bin bash < check.sh",
+            ] {
+                let capture = crate::desktop_review::ReviewCapture::start();
+                let mut inspected = false;
+                let result = evaluate(
+                    command,
+                    Some(&cwd),
+                    ShellDialect::Posix,
+                    false,
+                    None,
+                    relaxed,
+                    |text, _, _| {
+                        assert_eq!(text, source);
+                        inspected = true;
+                        EvaluationResult::denied_by_embedded_sink(
+                            "heredoc.posix.git-reset-hard",
+                            "destructive fixture source",
+                        )
+                    },
+                )
+                .unwrap();
+                assert!(inspected, "{command}, relaxed={relaxed}");
+                assert_eq!(result.decision, EvaluationDecision::Deny);
+                let info = result.pattern_info.unwrap();
+                assert_eq!(info.pattern_name.as_deref(), Some("git-reset-hard"));
+                let snapshot = capture.snapshot();
+                assert!(snapshot.resolved_paths().contains(&cwd.join("check.sh")));
+                assert!(
+                    snapshot
+                        .description(command, &cwd, &info, "codex")
+                        .is_some(),
+                    "definite evidence must remain reviewable: {command}"
+                );
+            }
+        }
+    }
 }

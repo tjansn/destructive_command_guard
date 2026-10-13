@@ -49,6 +49,51 @@ pub(crate) struct BoundEnvironment {
     pub values: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
     pub wrapper: Option<(String, std::ffi::OsString)>,
     pub program: String,
+    /// Original program/argument text, excluding only the bound prefix.
+    pub command: String,
+    preload: bool,
+}
+
+impl BoundEnvironment {
+    pub fn ensure_reviewable(&self) -> Result<(), String> {
+        if self.preload {
+            Err("inherited preload or command-local startup state cannot be approved by literal-environment review".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+pub(crate) fn preload_variable(name: &str) -> bool {
+    name.starts_with("DYLD_")
+        || name.starts_with("LD_")
+        || name.starts_with("BASH_FUNC_")
+        || matches!(
+            name,
+            "NODE_OPTIONS"
+                | "NODE_PATH"
+                | "BASH_ENV"
+                | "ENV"
+                | "RUBYOPT"
+                | "RUBYLIB"
+                | "PERL5OPT"
+                | "PERL5LIB"
+                | "PYTHONPATH"
+                | "PYTHONHOME"
+                | "ZDOTDIR"
+                | "PHPRC"
+                | "PHP_INI_SCAN_DIR"
+        )
+}
+
+fn absolute_search_path(path: &std::ffi::OsStr) -> Result<(), String> {
+    if path.is_empty() || std::env::split_paths(path).any(|entry| !entry.is_absolute()) {
+        return Err(
+            "PATH must contain only non-empty absolute directories; desktop review unavailable"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 /// Bind literal assignment operands without executing a shell or expanding
@@ -141,10 +186,26 @@ pub(crate) fn bound_environment(
             "cleared environment requires a literal PATH or absolute executable".to_owned(),
         );
     }
+    let preload = [parent, &values].iter().any(|environment| {
+        environment
+            .iter()
+            .any(|(key, value)| !value.is_empty() && preload_variable(&key.to_string_lossy()))
+    });
+    if let Some(path) = values.get(std::ffi::OsStr::new("PATH")) {
+        absolute_search_path(path)?;
+    }
+    if let Some((wrapper, path)) = &wrapper
+        && !wrapper.contains('/')
+    {
+        absolute_search_path(path)?;
+    }
+    let command = source[tokens[index].byte_range.start..].to_owned();
     Ok(Some(BoundEnvironment {
         values,
         wrapper,
         program,
+        command,
+        preload,
     }))
 }
 
@@ -193,6 +254,7 @@ mod literal_environment_tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn clear_environment_binds_only_spelled_out_values() {
         let parent = BTreeMap::from([
@@ -206,6 +268,7 @@ mod literal_environment_tests {
         .unwrap()
         .unwrap();
         assert_eq!(bound.program, "cargo");
+        assert_eq!(bound.command, "cargo test");
         assert_eq!(bound.values.len(), 3);
         assert_eq!(bound.values[OsStr::new("HOME")], "/tmp/with space");
         assert_eq!(bound.values[OsStr::new("PATH")], "/usr/bin:/bin");
@@ -230,7 +293,7 @@ mod literal_environment_tests {
                 "{command}"
             );
         }
-        let bound = bound_environment("env -i HOME=/tmp /usr/bin/true", &BTreeMap::new())
+        let bound = bound_environment("/usr/bin/env -i HOME=/tmp /usr/bin/true", &BTreeMap::new())
             .unwrap()
             .unwrap();
         assert_eq!(bound.program, "/usr/bin/true");
@@ -239,6 +302,66 @@ mod literal_environment_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn literal_path_rejects_empty_and_relative_search_entries() {
+        let parent = BTreeMap::from([(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))]);
+        for path in [
+            "",
+            ".:/usr/bin",
+            ":/usr/bin",
+            "bin:/usr/bin",
+            "/usr/bin:",
+            "/bin::/usr/bin",
+        ] {
+            for prefix in ["env -i ", ""] {
+                let command = format!("{prefix}PATH={path} node scripts/check.js");
+                assert!(
+                    bound_environment(&command, &parent)
+                        .unwrap_err()
+                        .contains("absolute directories"),
+                    "{command}"
+                );
+            }
+        }
+        assert!(
+            bound_environment("env -i PATH=/usr/bin:/bin node scripts/check.js", &parent)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn bound_environment_rejects_local_and_inherited_preload_state() {
+        for name in [
+            "NODE_OPTIONS",
+            "NODE_PATH",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "BASH_ENV",
+            "PYTHONPATH",
+        ] {
+            let command = format!("{name}=fixture /usr/bin/true");
+            assert!(
+                bound_environment(&command, &BTreeMap::new())
+                    .unwrap()
+                    .unwrap()
+                    .ensure_reviewable()
+                    .unwrap_err()
+                    .contains("preload")
+            );
+            let parent = BTreeMap::from([(OsString::from(name), OsString::from("fixture"))]);
+            assert!(
+                bound_environment("/usr/bin/env -i /usr/bin/true", &parent)
+                    .unwrap()
+                    .unwrap()
+                    .ensure_reviewable()
+                    .unwrap_err()
+                    .contains("preload")
+            );
+        }
     }
 }
 

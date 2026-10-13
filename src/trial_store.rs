@@ -42,6 +42,7 @@ pub struct Fingerprint {
     pub command: String,
     pub shell: PathBuf,
     pub resolved_sources: Vec<PathBuf>,
+    pub resolved_executables: Vec<PathBuf>,
     /// False means isolation changed or could not bind a runtime input. Such
     /// requests may be reviewed once, but cannot reuse or create a grant.
     pub reproducible: bool,
@@ -175,6 +176,7 @@ impl TrialStore {
         let parent_environment: BTreeMap<_, _> = std::env::vars_os().collect();
         let (resolved, local_environment) =
             resolved_executables(command, &cwd, &parent_environment)?;
+        let reviewed_executables = resolved.iter().cloned().collect();
         let mut executables = BTreeSet::new();
         executables.insert(shell.clone());
         executables.extend(sources.iter().cloned());
@@ -278,6 +280,7 @@ impl TrialStore {
                     command: command.to_owned(),
                     shell,
                     resolved_sources: sources,
+                    resolved_executables: reviewed_executables,
                     reproducible,
                 },
                 dirty && persist_cache,
@@ -1275,35 +1278,15 @@ fn resolved_executables(
             let words = shell_words::split(&text).map_err(io::Error::other)?;
             let bound =
                 crate::invocation::bound_environment(&text, parent).map_err(io::Error::other)?;
+            if let Some(bound) = &bound {
+                bound.ensure_reviewable().map_err(io::Error::other)?;
+            }
             if bound.is_none() && words.iter().any(|word| word.starts_with("PATH=")) {
                 return Err(io::Error::other(
                     "PATH assignment inside an unsupported wrapper cannot be bound; use a direct literal environment invocation",
                 ));
             }
             local_environment |= bound.is_some();
-            if bound.is_some()
-                && parent.iter().any(|(key, value)| {
-                    let key = key.to_string_lossy();
-                    !value.is_empty()
-                        && (key.starts_with("DYLD_")
-                            || key.starts_with("LD_")
-                            || key.starts_with("BASH_FUNC_")
-                            || matches!(
-                                key.as_ref(),
-                                "NODE_OPTIONS"
-                                    | "NODE_PATH"
-                                    | "BASH_ENV"
-                                    | "ENV"
-                                    | "RUBYOPT"
-                                    | "PERL5OPT"
-                                    | "PYTHONPATH"
-                            ))
-                })
-            {
-                return Err(io::Error::other(
-                    "inherited preload or shell startup state cannot be approved by literal-environment review",
-                ));
-            }
             let Some(first) = words.iter().find(|word| !word.contains('=')) else {
                 continue;
             };
@@ -1375,7 +1358,7 @@ fn resolved_executables(
     Ok((result, local_environment))
 }
 
-fn resolve_executable(name: &str, cwd: &Path, path: &OsStr) -> io::Result<PathBuf> {
+pub(crate) fn resolve_executable(name: &str, cwd: &Path, path: &OsStr) -> io::Result<PathBuf> {
     if name.contains('/') || name.contains('\\') {
         return cwd.join(name).canonicalize();
     }
@@ -1530,7 +1513,7 @@ mod tests {
         ] {
             let parent = BTreeMap::from([(name.into(), "fixture-only-value".into())]);
             let error =
-                resolved_executables("env -i HOME=/tmp PATH=/bin cargo test", &project, &parent)
+                resolved_executables("/usr/bin/env -i HOME=/tmp /bin/true", &project, &parent)
                     .unwrap_err();
             assert!(
                 error.to_string().contains("inherited preload"),

@@ -2758,8 +2758,10 @@ fn attempt_sandbox_trial(
         .and_then(|t| t.tty.as_ref())
         .or_else(|| input.tool_args.as_ref().and_then(|t| t.get("tty")))
         .is_some_and(|v| v != &serde_json::Value::Bool(false));
-    let sources = capture
-        .map(|c| c.snapshot().resolved_paths())
+    let evidence = capture.map(destructive_command_guard::desktop_review::ReviewCapture::snapshot);
+    let sources = evidence
+        .as_ref()
+        .map(destructive_command_guard::desktop_review::ReviewSnapshot::resolved_paths)
         .unwrap_or_default();
     let resolve = || -> Result<bool, String> {
         let store = TrialStore::user().map_err(|e| format!("Trial store unavailable: {e}"))?;
@@ -2770,7 +2772,17 @@ fn attempt_sandbox_trial(
         if scope == desktop_review::ApprovalScope::OneTime {
             let explanation = "Runtime inputs or environment are not reproduced by the sandbox. This request requires one-time desktop review; no reusable approval will be recorded.";
             let german = "Laufzeiteingaben oder Umgebung können in der Sandbox nicht vollständig nachgebildet werden. Bitte prüfe den genauen Aufruf und seine Folgen.";
-            if !desktop || !desktop_review::request_trial(&command, cwd, german, agent, scope) {
+            if !desktop
+                || !desktop_review::request_trial(
+                    &command,
+                    cwd,
+                    german,
+                    agent,
+                    scope,
+                    &before,
+                    evidence.as_ref(),
+                )
+            {
                 return Err(format!(
                     "{explanation}\n[dcg:review-unavailable-or-cancelled] Desktop review unavailable, declined or expired."
                 ));
@@ -2839,6 +2851,8 @@ fn attempt_sandbox_trial(
                         &report.review_details(),
                         agent,
                         scope,
+                        &before,
+                        evidence.as_ref(),
                     )
                 {
                     return Err(format!(

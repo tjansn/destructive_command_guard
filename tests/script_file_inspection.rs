@@ -742,6 +742,39 @@ fn literal_env_diagnostics_offer_bound_review_without_a_command_only_code() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn literal_environment_does_not_hide_a_definite_script_denial() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "scripts/check.js",
+        "require('fs').rmSync('/home/fixture/valuable', {recursive: true, force: true});\n",
+    );
+    for candidate in [
+        "node scripts/check.js",
+        "env -i HOME=/tmp/h PATH=/usr/bin:/bin node scripts/check.js",
+        "PATH=/usr/bin:/bin node scripts/check.js",
+        "env -i HOME=/tmp/h PATH=/usr/bin:/bin node < scripts/check.js",
+    ] {
+        fixture.destructive(candidate, "scripts/check.js");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn relative_and_empty_literal_path_entries_cannot_reach_bound_review() {
+    let fixture = Fixture::new();
+    fixture.write("scripts/check.js", "console.log('safe');\n");
+    for path in ["", ".:/usr/bin", ":/usr/bin", "bin:/usr/bin", "/usr/bin:"] {
+        let result = fixture.denied(&format!(
+            "env -i HOME=/tmp/h PATH={path} node scripts/check.js"
+        ));
+        let text = result.to_string();
+        assert!(text.contains("non-empty absolute directories"), "{text}");
+        assert!(!text.contains("bound-input-review"), "{text}");
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn definite_findings_cannot_be_hidden_by_a_finite_rewrite() {

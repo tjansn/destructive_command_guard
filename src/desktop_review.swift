@@ -15,6 +15,7 @@ struct ReviewDescription: Decodable {
     let effect: String
     let warning: String?
     let command: String
+    let executables: [String]
     let targets: [String]
     let text: String
     let scope: String
@@ -22,12 +23,13 @@ struct ReviewDescription: Decodable {
 
     var valid: Bool {
         let required = [agent, project, cwd, title, effect, command, text, scope_text]
-        let fields = required + targets + [host ?? "", repository ?? "", warning ?? ""]
+        let fields = required + targets + executables + [host ?? "", repository ?? "", warning ?? ""]
         return ["one_time", "exact_version", "learned_filesystem", "confined"].contains(scope) &&
             required.allSatisfy { !$0.isEmpty } && cwd.hasPrefix("/") &&
             agent.utf8.count <= 128 && project.utf8.count <= 512 &&
             (host?.utf8.count ?? 0) <= 128 && title.utf8.count <= 128 &&
-            text.utf8.count <= 5_000 && targets.count <= 128 &&
+            text.utf8.count <= 5_000 && targets.count <= 128 && executables.count <= 128 &&
+            executables.allSatisfy { $0.hasPrefix("/") } &&
             fields.reduce(0) { $0 + $1.utf8.count } <= 16_000
     }
 }
@@ -355,6 +357,20 @@ final class ReviewController: NSObject, NSWindowDelegate {
         let result = vertical([label("Aufruf", size: 11, weight: .semibold), command,
                                label("Arbeitsordner", size: 11, weight: .semibold), cwd,
                                label(info.scope_text, size: 12)], spacing: 5)
+        if !info.executables.isEmpty {
+            result.insertArrangedSubview(label("Aufgelöste ausführbare Dateien", size: 11, weight: .semibold), at: 2)
+            for (index, path) in info.executables.prefix(3).enumerated() {
+                let executable = label(path, size: 11)
+                executable.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+                executable.maximumNumberOfLines = 1
+                executable.lineBreakMode = .byTruncatingMiddle
+                executable.toolTip = path
+                result.insertArrangedSubview(executable, at: 3 + index)
+            }
+            if info.executables.count > 3 {
+                result.insertArrangedSubview(label("Weitere ausführbare Dateien in Details", size: 11), at: 6)
+            }
+        }
         for row in result.arrangedSubviews {
             row.widthAnchor.constraint(equalTo: result.widthAnchor).isActive = true
         }
@@ -367,7 +383,7 @@ final class ReviewController: NSObject, NSWindowDelegate {
         if let text = scroll.documentView as? NSTextView, let storage = text.textStorage {
             let mono = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
             let source = value as NSString
-            for literal in [info.command, info.cwd] + info.targets {
+            for literal in [info.command, info.cwd] + info.targets + info.executables {
                 var start = 0
                 while start < source.length {
                     let range = source.range(of: literal, options: [], range: NSRange(location: start, length: source.length - start))

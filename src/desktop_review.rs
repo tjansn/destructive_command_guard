@@ -161,6 +161,7 @@ pub struct ReviewDescription {
     effect: String,
     warning: Option<String>,
     command: String,
+    executables: Vec<String>,
     targets: Vec<String>,
     text: String,
     scope: ApprovalScope,
@@ -299,6 +300,27 @@ impl ReviewSnapshot {
                 }
             }
         }
+        let executables =
+            crate::invocation::bound_environment(command, &std::env::vars_os().collect())
+                .ok()?
+                .map_or_else(
+                    || Some(Vec::new()),
+                    |bound| {
+                        bound.ensure_reviewable().ok()?;
+                        let path = bound
+                            .values
+                            .get(std::ffi::OsStr::new("PATH"))
+                            .cloned()
+                            .unwrap_or_default();
+                        let executable =
+                            crate::trial_store::resolve_executable(&bound.program, cwd, &path)
+                                .ok()?;
+                        Some(vec![visible(&executable.display().to_string())])
+                    },
+                )?;
+        for executable in &executables {
+            let _ = write!(text, "\nAufgelöste ausführbare Datei:\n{executable}\n");
+        }
         (text.len() <= MAX_REVIEW_TEXT).then(|| ReviewDescription {
             agent,
             host,
@@ -311,6 +333,7 @@ impl ReviewSnapshot {
                 "Kann auf einem anderen Rechner wirken. Host und Ziel im Aufruf prüfen.".to_owned()
             }),
             command: visible(command),
+            executables,
             targets: targets
                 .iter()
                 .map(|target| visible_inline(target))
@@ -360,6 +383,8 @@ pub fn request_trial(
     summary: &str,
     agent: &str,
     scope: ApprovalScope,
+    fingerprint: &crate::trial_store::Fingerprint,
+    evidence: Option<&ReviewSnapshot>,
 ) -> bool {
     let Some(_lock) = review_lock() else {
         return false;
@@ -367,7 +392,15 @@ pub fn request_trial(
     let Some(before) = directory_identity(cwd) else {
         return false;
     };
-    let Some(description) = trial_description(command, cwd, summary, agent, scope) else {
+    let Some(description) = trial_description(
+        command,
+        cwd,
+        summary,
+        agent,
+        scope,
+        &fingerprint.resolved_executables,
+        evidence,
+    ) else {
         return false;
     };
     native_dialog(&description, &format!("{:032x}", rand::random::<u128>()))
@@ -380,13 +413,37 @@ fn trial_description(
     summary: &str,
     agent: &str,
     scope: ApprovalScope,
+    executables: &[PathBuf],
+    evidence: Option<&ReviewSnapshot>,
 ) -> Option<ReviewDescription> {
-    let text = format!(
+    let mut text = format!(
         "Arbeitsordner:\n{}\n\nGenauer Aufruf:\n{}\n\n{}\n\nFreigabe trotz unvollständiger Sandbox-Prüfung? Bei unklaren Folgen ablehnen.",
         visible(&cwd.display().to_string()),
         visible(command),
         visible(summary)
     );
+    for path in executables {
+        let _ = write!(
+            text,
+            "\n\nAufgelöste ausführbare Datei:\n{}",
+            visible(&path.display().to_string())
+        );
+    }
+    if let Some(evidence) = evidence {
+        for item in &evidence.scripts {
+            let _ = write!(
+                text,
+                "\n\nSkript {} (vollständiger geprüfter Inhalt):\n",
+                visible(&item.path.display().to_string())
+            );
+            for line in item.source.lines() {
+                let _ = writeln!(text, "  | {}", visible(line));
+                if text.len() > MAX_REVIEW_TEXT {
+                    return None;
+                }
+            }
+        }
+    }
     if text.len() > MAX_REVIEW_TEXT {
         return None;
     }
@@ -405,6 +462,10 @@ fn trial_description(
         effect: "Der echte Befehl darf nach Freigabe außerhalb der Sandbox laufen.".to_owned(),
         warning: Some("Ein einzelner Testlauf beweist keine allgemeine Sicherheit.".to_owned()),
         command: visible(command),
+        executables: executables
+            .iter()
+            .map(|path| visible(&path.display().to_string()))
+            .collect(),
         targets: Vec::new(),
         text,
         scope,
@@ -860,6 +921,8 @@ mod tests {
                 "Die Beobachtung ist unvollständig.",
                 "claude-code",
                 ApprovalScope::OneTime,
+                &[PathBuf::from("/usr/bin/node")],
+                None,
             )
             .unwrap();
             description.set_scope(scope);
@@ -867,6 +930,7 @@ mod tests {
             assert_eq!(json["scope"], wire);
             assert_eq!(json["scope_text"], scope.sentence());
             assert_eq!(json["command"], command);
+            assert_eq!(json["executables"][0], "/usr/bin/node");
             assert!(description.text.contains(&command));
             assert!(description.text.contains(temp.path().to_str().unwrap()));
             assert!(!description.text.contains("Die Freigabe gilt"));
@@ -878,10 +942,63 @@ mod tests {
                 temp.path(),
                 "Prüfung",
                 "pi",
-                ApprovalScope::OneTime
+                ApprovalScope::OneTime,
+                &[],
+                None,
             )
             .is_none()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn literal_cargo_review_shows_the_bound_executable_and_source_evidence() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let bin = temp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let cargo = bin.join("cargo");
+        fs::write(&cargo, "fixture executable bytes, never executed").unwrap();
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o700)).unwrap();
+        let shell = temp.path().join("shell");
+        fs::write(&shell, "fixture shell bytes, never executed").unwrap();
+        let source_path = project.join("check.sh");
+        fs::write(&source_path, "echo harmless\n").unwrap();
+        let capture = ReviewCapture::start();
+        record_script(
+            &source_path,
+            "echo harmless\n",
+            &project,
+            ScriptLanguage::Bash,
+        );
+        let evidence = capture.snapshot();
+        let command = format!(
+            "/usr/bin/env -i HOME=/tmp/h PATH={} cargo test",
+            shell_words::quote(bin.to_str().unwrap())
+        );
+        let store = crate::trial_store::TrialStore::new(temp.path().join("trusted"));
+        let version = store
+            .fingerprint(&command, &project, &shell, &evidence.resolved_paths())
+            .unwrap();
+        assert!(!version.reproducible);
+        let description = trial_description(
+            &command,
+            &project,
+            "Bitte den genauen Aufruf prüfen.",
+            "codex",
+            ApprovalScope::OneTime,
+            &version.resolved_executables,
+            Some(&evidence),
+        )
+        .unwrap();
+        let resolved = cargo.canonicalize().unwrap().display().to_string();
+        assert!(description.executables.contains(&resolved));
+        assert!(description.text.contains(&resolved));
+        assert!(description.text.contains("  | echo harmless"));
+        assert_eq!(description.command, command);
+        assert_eq!(description.scope, ApprovalScope::OneTime);
     }
 
     fn match_info(pattern: &str) -> PatternMatch {
