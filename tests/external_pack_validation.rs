@@ -142,6 +142,76 @@ destructive_patterns:
 }
 
 // =============================================================================
+// Zero-width external rule validation
+// =============================================================================
+
+mod zero_width_rules {
+    use super::*;
+
+    #[test]
+    fn lookahead_only_destructive_rule_is_rejected_as_inert() {
+        let yaml = r#"
+id: test.zero_width
+name: Zero Width
+version: 1.0.0
+destructive_patterns:
+  - name: ifs-guard
+    pattern: '(?s)(?=.*IFS=@)(?=.*tee)'
+"#;
+        let error = parse_pack_string(yaml).expect_err("zero-width destructive rule must fail");
+        assert!(matches!(error, PackParseError::InvalidPattern { .. }));
+        assert!(
+            error.to_string().contains("no consuming match"),
+            "error must explain why the rule is operationally inert: {error}"
+        );
+    }
+
+    #[test]
+    fn lookahead_only_safe_rule_is_rejected() {
+        let yaml = r#"
+id: test.zero_safe
+name: Zero Width Safe
+version: 1.0.0
+safe_patterns:
+  - name: empty-allow
+    pattern: '^(?=tee)'
+"#;
+        let error = parse_pack_string(yaml).expect_err("zero-width safe rule must fail");
+        assert!(matches!(error, PackParseError::InvalidPattern { .. }));
+        assert!(
+            error.to_string().contains("zero-width safe"),
+            "safe-rule error must explain the authorization hazard: {error}"
+        );
+    }
+
+    #[test]
+    fn consuming_tail_keeps_lookahead_guard_valid() {
+        let yaml = r#"
+id: test.consuming
+name: Consuming Guard
+version: 1.0.0
+destructive_patterns:
+  - name: ifs-guard
+    pattern: '(?s)(?=.*IFS=@)(?=.*tee)[\\s\\S]*'
+"#;
+        assert!(
+            parse_pack_string(yaml).is_ok(),
+            "the reporter's consuming-tail repair must remain valid"
+        );
+    }
+
+    #[test]
+    fn ordinary_anchored_and_nullable_patterns_with_consuming_atoms_remain_valid() {
+        for pattern in [r"^tee", r"tee?", r"(?:tee|)", r"(?=tee)tee", r"\\btee\\b"] {
+            let yaml = format!(
+                "id: test.consuming\nname: Consuming\nversion: 1.0.0\ndestructive_patterns:\n  - name: test\n    pattern: '{pattern}'\n"
+            );
+            assert!(parse_pack_string(&yaml).is_ok(), "{pattern}");
+        }
+    }
+}
+
+// =============================================================================
 // Pack ID Collision Behavior Tests
 // =============================================================================
 
