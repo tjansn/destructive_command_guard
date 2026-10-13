@@ -38,6 +38,7 @@
 mod queue_budget;
 mod schema;
 mod sqlite;
+mod storage_limits;
 
 use crate::config::{HistoryConfig, HistoryRedactionMode, resolve_config_path_value};
 use crate::logging::{RedactionConfig, RedactionMode};
@@ -848,7 +849,7 @@ fn run_history_worker(
         last_prune_check = Instant::now();
     }
 
-    let mut history_disabled = match db.enforce_size_limit(config.max_size_bytes) {
+    let mut history_disabled = match db.enforce_live_size_limit(config.max_size_bytes) {
         Ok(true) => false,
         Ok(false) => {
             warn!(
@@ -992,7 +993,7 @@ fn recover_history_db(
     }
 
     match HistoryDb::open(Some(path.clone())) {
-        Ok(recovered_db) => match recovered_db.enforce_size_limit(max_size_bytes) {
+        Ok(recovered_db) => match recovered_db.enforce_live_size_limit(max_size_bytes) {
             Ok(true) => {
                 *db = recovered_db;
                 true
