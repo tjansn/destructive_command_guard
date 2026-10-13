@@ -17,6 +17,7 @@ pub enum Outcome {
     BoundInputs,
     Limit,
     ReviewUnavailable,
+    InternalCommand,
 }
 
 impl Outcome {
@@ -45,6 +46,7 @@ impl Outcome {
             Self::BoundInputs => "bound-input-review",
             Self::Limit => "analysis-limit",
             Self::ReviewUnavailable => "review-unavailable-or-cancelled",
+            Self::InternalCommand => "internal-hook-command",
         }
     }
 
@@ -55,6 +57,7 @@ impl Outcome {
             Self::BoundInputs => "Literal Inputs Need Review",
             Self::Limit => "Analysis Limit Reached",
             Self::ReviewUnavailable => "Review Not Approved",
+            Self::InternalCommand => "Internal Hook Command",
         }
     }
 
@@ -75,12 +78,18 @@ impl Outcome {
             Self::ReviewUnavailable => {
                 "The desktop review was unavailable, cancelled, declined or expired. Restore the review route and retry for an explicit decision; no approval was recorded."
             }
+            Self::InternalCommand => {
+                "Submit the original finite command to the hook. Only the hook may construct its confined replacement; direct runner requests cannot be approved or learned."
+            }
         }
     }
 }
 
 /// Classification changes presentation only, never the authorization decision.
 pub fn outcome(pack: Option<&str>, pattern: Option<&str>, reason: &str) -> Outcome {
+    if pack == Some("dcg.internal") && pattern == Some("confined-runner") {
+        return Outcome::InternalCommand;
+    }
     if reason.contains("[dcg:review-unavailable-or-cancelled]") {
         return Outcome::ReviewUnavailable;
     }
@@ -247,5 +256,10 @@ mod tests {
             !Outcome::BoundInputs
                 .supports_command_review(Some("heredoc.script_files"), Some("unverified"))
         );
+        assert_eq!(
+            outcome(Some("dcg.internal"), Some("confined-runner"), ""),
+            Outcome::InternalCommand
+        );
+        assert!(!Outcome::InternalCommand.supports_command_review(None, None));
     }
 }

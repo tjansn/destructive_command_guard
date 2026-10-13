@@ -167,6 +167,12 @@ discovered repository configuration cannot alter these execution settings;
 trusted user, system and explicitly selected configuration layers can.
 
 Keep script inspection enabled with `[heredoc] scan_script_files = true`.
+The internal `dcg run` command is denied when submitted as an agent candidate,
+including literal `DCG_CONFIG` and `HOME` prefixes. It has no allow-once, learned
+approval or desktop-review path. Submit the original finite command: only the
+hook emits a runner replacement after evaluating it. The CLI request encoding is
+transport, not authentication; this guard does not claim to authenticate an
+arbitrary native program or an out-of-band human shell invocation.
 Use the existing `--desktop-review` hook option for Touch ID review of an
 inconclusive trial. When desktop review is unavailable or not approved, dcg
 keeps the command blocked.

@@ -821,6 +821,66 @@ fn disabled_trials_use_one_time_review_without_opening_the_approval_store() {
     );
 }
 
+#[test]
+fn agents_cannot_forge_confined_receipts_or_redirect_their_trusted_config() {
+    use destructive_command_guard::config::ConfinedLoopback;
+    use destructive_command_guard::confined::Request;
+    let fixture = Fixture::new();
+    fixture.write("forged-config.toml", "[trial]\nconfined_loopback = 'all'\n");
+    let policy = std::fs::read_to_string(&fixture.config).unwrap();
+    std::fs::write(
+        &fixture.config,
+        format!(
+            "{policy}\n[trial]\nconfined_loopback = 'none'\n\
+             [overrides]\nallow = ['.*dcg.* run .*']\n\
+             [policy.rules]\n'dcg.internal:confined-runner' = 'warn'\n"
+        ),
+    )
+    .unwrap();
+    let request = Request::new("node --test", &fixture.root, "/bin/sh".as_ref(), 5)
+        .with_loopback(ConfinedLoopback::All);
+    let runner = request
+        .invocation(env!("CARGO_BIN_EXE_dcg").as_ref())
+        .unwrap();
+    for prefix in [
+        String::new(),
+        format!(
+            "DCG_CONFIG={} ",
+            shell_words::quote(fixture.root.join("forged-config.toml").to_str().unwrap())
+        ),
+        format!(
+            "HOME={} ",
+            shell_words::quote(fixture.root.to_str().unwrap())
+        ),
+    ] {
+        let candidate = format!("{prefix}{runner}");
+        let result = fixture.denied(&candidate);
+        assert_eq!(result["rule_id"], "dcg.internal:confined-runner");
+        let input = json!({"tool_name":"Bash", "tool_input":{"command":candidate}, "cwd":fixture.root});
+        let mut child = fixture
+            .command()
+            .args(["--agent", "claude-code", "--desktop-review"])
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let verdict: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let decision = &verdict["hookSpecificOutput"];
+        assert_eq!(decision["permissionDecision"], "deny", "{verdict}");
+        assert_eq!(decision["ruleId"], "dcg.internal:confined-runner", "{verdict}");
+        assert!(decision.get("allowOnceCode").is_none(), "{verdict}");
+        assert!(decision.get("updatedInput").is_none(), "{verdict}");
+        assert!(verdict.to_string().contains("internal-hook-command"));
+    }
+    fixture.allowed("dcg test 'dcg run --confined --request fixture'");
+    fixture.allowed("printf '%s' 'dcg run --confined --request fixture'");
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn definite_findings_cannot_be_hidden_by_a_finite_rewrite() {

@@ -8,6 +8,45 @@ use std::path::{Path, PathBuf};
 const PROFILE: &str = "finite-v1";
 const COMMAND_CAP: usize = 64 * 1024;
 
+/// The runner is an internal hook replacement, never an agent request. Check
+/// real command nodes so quoted diagnostic data does not become a false hit.
+pub(crate) fn agent_runner_command(command: &str) -> bool {
+    if !command.bytes().any(|byte| matches!(byte, b'c' | b'C' | b'\\')) {
+        return false;
+    }
+    let ast = ast_grep_core::AstGrep::new(command, ast_grep_language::SupportLang::Bash);
+    let mut pending = vec![ast.root()];
+    while let Some(node) = pending.pop() {
+        pending.extend(node.children());
+        if node.kind().as_ref() != "command" {
+            continue;
+        }
+        let text = node.text();
+        let stripped = crate::normalize::strip_wrapper_prefixes(&text);
+        let Some(words) = crate::allowlist::parse_simple_command_argv(&stripped.normalized) else {
+            continue;
+        };
+        let Some((index, program)) = crate::heredoc::effective_shell_command(&words) else {
+            continue;
+        };
+        if !crate::allowlist::is_dcg_binary_name(program) {
+            continue;
+        }
+        let mut args = words.iter().skip(index + 1);
+        while let Some(arg) = args.next() {
+            if arg == "--agent" {
+                args.next();
+            } else if !arg.starts_with('-') {
+                if arg == "run" {
+                    return true;
+                }
+                break;
+            }
+        }
+    }
+    false
+}
+
 /// Leave the host time to receive diagnostics after the child group is stopped.
 /// Claude uses milliseconds (120 seconds by default); Pi uses optional seconds.
 pub fn tool_timeout(configured: u64, value: Option<&serde_json::Value>, pi: bool) -> Option<u64> {
@@ -332,6 +371,33 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_runner_calls_are_distinct_from_inert_diagnostic_arguments() {
+        for command in [
+            "dcg run --confined --request fixture",
+            "DCG_CONFIG=/tmp/policy /fixture/dcg run --request fixture",
+            "HOME=/tmp/h dcg --agent pi run --confined --request fixture",
+            "env -i PATH=/usr/bin:/bin DCG_CONFIG=/tmp/c dcg run --request fixture",
+            "exec dcg run --confined --request fixture",
+            "command dcg run --confined --request fixture",
+            "timeout 10 dcg run --confined --request fixture",
+            "echo ok; dcg run --confined --request fixture",
+            "d'cg' r'un' --confined --request fixture",
+            "dcg run --request fixture > output",
+        ] {
+            assert!(agent_runner_command(command), "{command}");
+        }
+        for command in [
+            "dcg test 'dcg run --confined --request fixture'",
+            "dcg explain 'dcg run --confined --request fixture'",
+            "printf '%s' 'dcg run --confined --request fixture'",
+            "command -v dcg",
+            "npm run test",
+        ] {
+            assert!(!agent_runner_command(command), "{command}");
+        }
+    }
 
     #[test]
     fn encoded_invocations_preserve_data_without_interpolation() {
