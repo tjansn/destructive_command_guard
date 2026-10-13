@@ -83,6 +83,7 @@ pub mod interactive;
 mod invocation;
 pub mod logging;
 pub mod mcp;
+mod node_sources;
 pub mod normalize;
 pub mod output;
 pub mod packs;

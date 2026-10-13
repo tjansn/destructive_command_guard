@@ -497,6 +497,8 @@ pub(crate) enum SourceRole {
     Executable,
     SyntaxData,
     Startup,
+    NodeImport,
+    NodeRequire,
 }
 
 #[derive(Debug)]
@@ -662,7 +664,15 @@ pub(crate) fn classify(
             }
             result.sources.push(Source {
                 path,
-                role: SourceRole::Startup,
+                role: if node && !reporter {
+                    if arg == "--import" || arg.starts_with("--import=") {
+                        SourceRole::NodeImport
+                    } else {
+                        SourceRole::NodeRequire
+                    }
+                } else {
+                    SourceRole::Startup
+                },
                 glob: false,
             });
             continue;

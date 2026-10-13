@@ -103,6 +103,7 @@ struct Reference {
 #[derive(Debug)]
 enum FileFormat {
     Script,
+    NodePreload(crate::node_sources::Mode),
     SyntaxOnly(String),
     TestGlob(String),
     FiniteScript(String),
@@ -576,7 +577,11 @@ fn interpreter_references(
             path: source.path,
             language: Some(language),
             sourced: source.role == crate::invocation::SourceRole::Startup,
-            format: if source.role == crate::invocation::SourceRole::SyntaxData {
+            format: if source.role == crate::invocation::SourceRole::NodeImport {
+                FileFormat::NodePreload(crate::node_sources::Mode::Import)
+            } else if source.role == crate::invocation::SourceRole::NodeRequire {
+                FileFormat::NodePreload(crate::node_sources::Mode::Require)
+            } else if source.role == crate::invocation::SourceRole::SyntaxData {
                 FileFormat::SyntaxOnly(program.to_owned())
             } else if source.glob {
                 FileFormat::TestGlob(program.to_owned())
@@ -672,6 +677,22 @@ fn inspect_reference(
     cwd: &Path,
     evaluate_source: &mut impl FnMut(&str, &Path, ScriptLanguage) -> EvaluationResult,
 ) -> Result<Option<EvaluationResult>, String> {
+    if let FileFormat::NodePreload(mode) = reference.format {
+        if builtin_module(&reference.path) {
+            return Ok(None);
+        }
+        let path = crate::node_sources::resolve(&reference.path, cwd, mode)?;
+        return inspect_reference(
+            &Reference {
+                path: path.to_str().ok_or("non-UTF-8 Node preload path")?.to_owned(),
+                language: Some(ScriptLanguage::JavaScript),
+                sourced: false,
+                format: FileFormat::Script,
+            },
+            cwd,
+            evaluate_source,
+        );
+    }
     if let FileFormat::TestGlob(program) = &reference.format {
         verify_syntax_interpreter(program, cwd)?;
         let mut result = None;
@@ -785,7 +806,7 @@ fn inspect_reference(
     crate::desktop_review::record_script(&path, &content, cwd, language);
     let sources = match &reference.format {
         FileFormat::Script | FileFormat::FiniteScript(_) => vec![content],
-        FileFormat::SyntaxOnly(_) | FileFormat::TestGlob(_) => {
+        FileFormat::SyntaxOnly(_) | FileFormat::TestGlob(_) | FileFormat::NodePreload(_) => {
             unreachable!("syntax operands were handled before source inspection")
         }
         FileFormat::PackageScript(task) => package_source(&content, task)?,
@@ -924,6 +945,9 @@ fn js_literal(source: &str) -> Result<String, String> {
 fn builtin_module(name: &str) -> bool {
     // Explicit names only: an arbitrary `node:` URL is not evidence of a
     // supported builtin. Unknown/bare package imports remain unresolved.
+    if matches!(name, "test" | "test/reporters") {
+        return false; // These builtins require node:, unlike packages of that name.
+    }
     matches!(
         name.strip_prefix("node:").unwrap_or(name),
         "assert"
@@ -1165,7 +1189,7 @@ fn verify_syntax_interpreter(program: &str, cwd: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn verify_unchanged(path: &Path, before: &fs::Metadata) -> Result<(), String> {
+pub(crate) fn verify_unchanged(path: &Path, before: &fs::Metadata) -> Result<(), String> {
     let after = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     if !after.is_file()
         || after.file_type().is_symlink()

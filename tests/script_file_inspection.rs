@@ -1043,6 +1043,45 @@ fn finite_node_imports_resolve_relative_to_the_importing_file() {
 }
 
 #[test]
+fn bare_node_preloads_inspect_the_export_for_each_cli_spelling() {
+    let fixture = Fixture::new();
+    fixture.write("package.json", r#"{"name":"fixture"}"#);
+    fixture.write("case.test.js", "console.log('fixture');\n");
+    fixture.write(
+        "node_modules/loader/package.json",
+        r#"{"exports":{".":"./entry.cjs"}}"#,
+    );
+    for option in [
+        "--import loader",
+        "--import=loader",
+        "--require loader",
+        "--require=loader",
+        "-r loader",
+        "-rloader",
+    ] {
+        let command = format!("node {option} --test case.test.js");
+        fixture.write("node_modules/loader/entry.cjs", "console.log('preload');\n");
+        fixture.allowed(&command);
+        fixture.write(
+            "node_modules/loader/entry.cjs",
+            "require('child_process').execSync('git reset --hard');\n",
+        );
+        fixture.denied(&command);
+    }
+    // Missing packages and private, unexported subpaths remain inconclusive.
+    for command in [
+        "node --import missing --test case.test.js",
+        "node -r loader/private --test case.test.js",
+    ] {
+        let result = fixture.denied(command);
+        assert_eq!(
+            result["rule_id"], "heredoc.script_files:unverified",
+            "{result}"
+        );
+    }
+}
+
+#[test]
 fn finite_node_child_helpers_are_inspected_and_computed_children_are_unverified() {
     let fixture = Fixture::new();
     fixture.write(
