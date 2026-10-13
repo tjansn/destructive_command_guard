@@ -2374,7 +2374,7 @@ fn stated_roots(parts: &[RootPart]) -> Vec<(Root, usize, Fit)> {
     // makes `/home/luna/w/.netrc` the home file it is. A reading that rests on
     // a pattern is only one possibility, so it neither shadows nor is
     // shadowed: every possibility is kept.
-    if let Some(home) = runtime_home() {
+    for home in runtime_home().into_iter().flat_map(home_spellings) {
         let home_fit = if parts.len() >= home.len() {
             Fit::all(
                 home.iter()
@@ -2448,7 +2448,7 @@ const NON_HOME_TOP_LEVEL: &[&str] = &[
 /// relative, climbs with `..`, or is not usable as an additional root.
 ///
 /// Rejected besides: a system directory ([`NON_HOME_TOP_LEVEL`]), anything
-/// under `/etc` or `/private` (the `Root::Etc` spellings), and a `$HOME`
+/// under `/etc` or `/private/etc` (the `Root::Etc` spellings), and a `$HOME`
 /// with a component that is itself protected material
 /// ([`is_protected_home_component`]). Those last rules are what let
 /// [`rooted_prefixes`] prefer a longer `$HOME` without ever losing a
@@ -2468,21 +2468,55 @@ fn home_components(home: &str) -> Option<Vec<String>> {
         }
     }
     let first = comps.first()?;
-    if ["etc", "private"]
-        .iter()
-        .any(|system| first.eq_ignore_ascii_case(system))
+    if first.eq_ignore_ascii_case("etc")
+        || (first.eq_ignore_ascii_case("private")
+            && comps
+                .get(1)
+                .is_some_and(|part| part.eq_ignore_ascii_case("etc")))
         || comps.iter().any(|comp| is_protected_home_component(comp))
     {
         return None;
     }
-    if comps.len() == 1
+    if (comps.len() == 1
         && NON_HOME_TOP_LEVEL
             .iter()
-            .any(|system| first.eq_ignore_ascii_case(system))
+            .any(|system| first.eq_ignore_ascii_case(system)))
+        || (comps.len() == 2
+            && first.eq_ignore_ascii_case("private")
+            && comps.get(1).is_some_and(|part| {
+                part.eq_ignore_ascii_case("tmp") || part.eq_ignore_ascii_case("var")
+            }))
     {
         return None;
     }
     Some(comps)
+}
+
+/// macOS exposes the same temporary homes through `/tmp` and `/private/tmp`
+/// (and `/var` and `/private/var`). Keep both lexical spellings without reading
+/// the target, which may not exist yet. Only the runtime home gets this alias;
+/// unrelated temporary directories do not become home roots.
+fn home_spellings(home: Vec<String>) -> Vec<Vec<String>> {
+    let alias = if home.first().is_some_and(|part| {
+        part.eq_ignore_ascii_case("tmp") || part.eq_ignore_ascii_case("var")
+    }) {
+        Some(
+            std::iter::once("private".to_owned())
+                .chain(home.iter().cloned())
+                .collect(),
+        )
+    } else if home
+        .first()
+        .is_some_and(|part| part.eq_ignore_ascii_case("private"))
+        && home.get(1).is_some_and(|part| {
+            part.eq_ignore_ascii_case("tmp") || part.eq_ignore_ascii_case("var")
+        })
+    {
+        Some(home[1..].to_vec())
+    } else {
+        None
+    };
+    std::iter::once(home).chain(alias).collect()
 }
 
 /// Whether `component` begins protected material under a home: the first
@@ -4501,6 +4535,9 @@ mod tests {
             "/",
             "/var",
             "/tmp",
+            "/private",
+            "/private/tmp",
+            "/private/var",
             "/usr",
             "/nonexistent",
             "/etc",
@@ -4519,6 +4556,43 @@ mod tests {
                     "HOME={system} must not make /var/.netrc a home file"
                 );
             });
+        }
+    }
+
+    #[test]
+    fn runtime_temporary_home_protects_both_private_and_short_spellings() {
+        for (short, private) in [
+            ("/tmp/dcg-home", "/private/tmp/dcg-home"),
+            ("/var/folders/dcg/home", "/private/var/folders/dcg/home"),
+        ] {
+            for home in [short, private] {
+                with_runtime_home(Some(home), || {
+                    let classify = |command: &str| {
+                        classify_credential_file_write(command, ShellDialect::Posix)
+                    };
+                    for root in [short, private] {
+                        for file in [".netrc", ".npmrc", ".pypirc", ".zshrc"] {
+                            for command in [
+                                format!("echo x >> {root}/{file}"),
+                                format!("echo x | tee -a {root}/{file}"),
+                                format!("cp ./x {root}/{file}"),
+                            ] {
+                                assert!(may_name_protected_path(&command), "{command}");
+                                assert!(classify(&command).is_some(), "HOME={home}: {command}");
+                            }
+                        }
+                        for command in [
+                            format!("echo x >> {root}/notes.txt"),
+                            format!("cat {root}/.netrc"),
+                            format!("echo x >> {root}-other/.netrc"),
+                        ] {
+                            assert!(classify(&command).is_none(), "HOME={home}: {command}");
+                        }
+                    }
+                    assert!(classify("echo x >> /private/etc/sudoers").is_some());
+                    assert!(classify("echo x >> /etc/sudoers").is_some());
+                });
+            }
         }
     }
 

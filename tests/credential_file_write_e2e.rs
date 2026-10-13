@@ -437,6 +437,33 @@ fn the_runtime_home_is_a_home_root_through_the_hook() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn runtime_home_credentials_are_guarded_across_tmp_and_private_tmp_spellings() {
+    let home = tempfile::Builder::new()
+        .prefix("dcg-credential-home")
+        .tempdir_in("/private/tmp")
+        .expect("private temp home");
+    let private = home.path().to_path_buf();
+    let short = Path::new("/").join(private.strip_prefix("/private").unwrap());
+    assert_eq!(private.canonicalize().unwrap(), short.canonicalize().unwrap());
+    fs::create_dir_all(private.join("xdg_config/dcg")).expect("fixture dir");
+    // Pass both HOME spellings to real, separate hooks; candidate writers are
+    // only protocol data and must never create the named credential files.
+    for root in [&private, &short] {
+        for target in [&private, &short] {
+            for file in [".netrc", ".npmrc", ".pypirc", ".zshrc"] {
+                let path = target.join(file);
+                let command = format!("echo x >> {}", shell_words::quote(path.to_str().unwrap()));
+                assert_eq!(verdict(&command, root), Verdict::Deny("credential-file-write"));
+                assert!(!path.exists());
+            }
+            let command = format!("echo x >> {}/notes.txt", target.display());
+            assert_eq!(verdict(&command, root), Verdict::Allow);
+        }
+    }
+}
+
 /// Spellings of a home or system root that the review of #502 found still
 /// open through the hook: a quote splitting the root's name (the candidate
 /// gate searched the raw text for `/home/`), a backslash-escaped first
