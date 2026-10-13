@@ -150,9 +150,9 @@ pub fn inspect_for_rewrite<T>(
     #[cfg(target_os = "macos")]
     {
         let (cwd, _) = execution(command, cwd).ok_or("not a finite confined command")?;
-        let (_, writable, protected) = native::boundaries(&cwd).map_err(|e| e.to_string())?;
+        let (project, writable, protected) = native::boundaries(&cwd).map_err(|e| e.to_string())?;
         Ok(crate::script_files::with_confined_dependencies(
-            writable, protected, inspect,
+            project, writable, protected, inspect,
         ))
     }
     #[cfg(not(target_os = "macos"))]

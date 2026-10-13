@@ -309,6 +309,61 @@ mod macos {
     }
 
     #[test]
+    fn dependency_ignored_data_is_not_an_approved_cleanup_output() {
+        let fixture = Fixture::new("console.log('must not execute');");
+        fs::write(
+            fixture.project.join(".gitignore"),
+            "build/\ndist/\n.env\ndata.sqlite\n.next/\n",
+        )
+        .unwrap();
+        for name in [".env", "data.sqlite"] {
+            fs::write(fixture.project.join(name), "preserve ignored fixture data").unwrap();
+        }
+        let package = fixture.project.join("node_modules/fixture-loader");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("package.json"), r#"{"exports":"./loader.mjs"}"#).unwrap();
+        fs::write(
+            fixture.project.join("package.json"),
+            r#"{"scripts":{"test":"node --import fixture-loader --test case.test.cjs"}}"#,
+        )
+        .unwrap();
+        for (target, deferred) in [
+            ("dist/x", true),
+            (".env", false),
+            ("data.sqlite", false),
+            (".next/x", false),
+        ] {
+            fs::write(
+                package.join("loader.mjs"),
+                format!("import fs from 'node:fs'; fs.rmSync('{target}', {{recursive:true, force:true}});"),
+            )
+            .unwrap();
+            let output = hook_request(
+                &fixture.project,
+                &fixture.runtime,
+                "npm test",
+                "claude-code",
+                false,
+            );
+            if deferred {
+                assert_eq!(rewritten_request(&output).command, "npm test");
+            } else {
+                assert_eq!(
+                    output["hookSpecificOutput"]["permissionDecision"], "deny",
+                    "{target}: {output}"
+                );
+                assert!(output["hookSpecificOutput"].get("updatedInput").is_none());
+            }
+        }
+        for name in [".env", "data.sqlite"] {
+            assert_eq!(
+                fs::read_to_string(fixture.project.join(name)).unwrap(),
+                "preserve ignored fixture data"
+            );
+        }
+    }
+
+    #[test]
     fn dependency_literal_targets_outside_outputs_and_direct_commands_stay_denied() {
         let fixture = Fixture::new("console.log('must not execute');");
         let package = fixture.project.join("node_modules/fixture-loader");

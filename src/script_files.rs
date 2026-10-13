@@ -34,12 +34,14 @@ thread_local! {
 }
 
 struct ConfinedPaths {
+    project: PathBuf,
     writable: Vec<PathBuf>,
     protected: Vec<PathBuf>,
 }
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
 pub(crate) fn with_confined_dependencies<T>(
+    project: PathBuf,
     writable: Vec<PathBuf>,
     protected: Vec<PathBuf>,
     inspect: impl FnOnce() -> T,
@@ -51,6 +53,7 @@ pub(crate) fn with_confined_dependencies<T>(
         }
     }
     let paths = ConfinedPaths {
+        project,
         writable,
         protected,
     };
@@ -59,7 +62,7 @@ pub(crate) fn with_confined_dependencies<T>(
 }
 
 impl ConfinedPaths {
-    fn writable_target(&self, literal: &str, cwd: &Path) -> bool {
+    fn deferrable_target(&self, literal: &str, cwd: &Path) -> bool {
         use std::path::Component;
         // Resolve existing ancestors, including symlinks, before appending a
         // new leaf. A lexical in-bounds spelling must not conceal an escape.
@@ -78,11 +81,34 @@ impl ConfinedPaths {
                 Err(_) => return false,
             }
         }
-        self.writable.iter().any(|root| target.starts_with(root))
+        self.build_output(&target)
+            && self.writable.iter().any(|root| target.starts_with(root))
             && !self
                 .protected
                 .iter()
                 .any(|root| target.starts_with(root) || root.starts_with(&target))
+    }
+
+    fn build_output(&self, target: &Path) -> bool {
+        let Ok(relative) = target.strip_prefix(&self.project) else {
+            return false;
+        };
+        let mut path = self.project.clone();
+        for part in relative.components() {
+            path.push(part);
+            if matches!(
+                part.as_os_str().to_str(),
+                Some("build" | "dist" | "target" | ".cache" | "coverage" | "node_modules")
+            ) {
+                // The output name denotes a directory, not an ignored file
+                // with that basename. Absent ignored output roots are valid.
+                return match fs::symlink_metadata(&path) {
+                    Ok(meta) => meta.is_dir(),
+                    Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                };
+            }
+        }
+        false
     }
 }
 
@@ -115,7 +141,7 @@ fn dependency_result(
                 match dependency_target(source, cwd, language, paths) {
                     Ok(Some(target)) => EvaluationResult::denied_by_embedded_sink(
                         "heredoc.script_files.confined-target",
-                        &format!("Dependency operation targets a path outside the confined writable set: {target}"),
+                        &format!("Dependency operation targets a path outside approved confined build/cache outputs: {target}"),
                     ),
                     Ok(None) => EvaluationResult::allowed(),
                     Err(()) => original,
@@ -124,9 +150,9 @@ fn dependency_result(
             ScriptLanguage::Bash => {
                 // Explicit child command strings still run through the normal
                 // evaluator. Only a literal filesystem command whose targets
-                // are all writable can lose its static finding here.
+                // are all approved writable outputs can lose its finding.
                 if dependency_shell_targets(source).is_some_and(|targets| {
-                    targets.iter().all(|target| paths.writable_target(target, cwd))
+                    targets.iter().all(|target| paths.deferrable_target(target, cwd))
                 }) {
                     EvaluationResult::allowed()
                 } else {
@@ -217,7 +243,7 @@ fn dependency_target(
         for &operand in operands {
             if let Some(argument) = args.get(operand)
                 && let Ok(target) = js_literal(&argument.text())
-                && !paths.writable_target(&target, cwd)
+                && !paths.deferrable_target(&target, cwd)
             {
                 return Ok(Some(target));
             }
@@ -228,7 +254,7 @@ fn dependency_target(
             && let Some(targets) = dependency_shell_targets(&command)
             && let Some(target) = targets
                 .into_iter()
-                .find(|target| !paths.writable_target(target, cwd))
+                .find(|target| !paths.deferrable_target(target, cwd))
         {
             return Ok(Some(target));
         }
@@ -1534,39 +1560,114 @@ mod tests {
             inspect(&dependency, dynamic).decision,
             EvaluationDecision::Deny
         );
-        with_confined_dependencies(vec![cwd.join("build")], vec![cwd.join(".git")], || {
-            assert_eq!(
-                inspect(&dependency, dynamic).decision,
-                EvaluationDecision::Allow
-            );
-            assert_eq!(
-                inspect(&cwd.join("own.test.js"), dynamic).decision,
-                EvaluationDecision::Deny
-            );
-            assert_eq!(
-                inspect(&dependency, "fs.rmSync('build/cache', {recursive:true});").decision,
-                EvaluationDecision::Allow
-            );
-            for target in ["tracked.txt", ".git", "../outside", "build/../../outside"] {
-                let source = format!("fs.rmSync('{target}', {{recursive:true}});");
-                let found = inspect(&dependency, &source);
-                assert_eq!(found.decision, EvaluationDecision::Deny, "{source}");
+        with_confined_dependencies(
+            cwd.clone(),
+            vec![cwd.join("build")],
+            vec![cwd.join(".git")],
+            || {
                 assert_eq!(
-                    found.pattern_info.unwrap().pattern_name.as_deref(),
-                    Some("confined-target")
+                    inspect(&dependency, dynamic).decision,
+                    EvaluationDecision::Allow
                 );
-            }
-            fs::create_dir(cwd.join("build")).unwrap();
-            std::os::unix::fs::symlink(&cwd, cwd.join("build/escape")).unwrap();
-            assert_eq!(
-                inspect(&dependency, "fs.rmSync('build/escape/tracked.txt');").decision,
-                EvaluationDecision::Deny
-            );
-        });
+                assert_eq!(
+                    inspect(&cwd.join("own.test.js"), dynamic).decision,
+                    EvaluationDecision::Deny
+                );
+                assert_eq!(
+                    inspect(&dependency, "fs.rmSync('build/cache', {recursive:true});").decision,
+                    EvaluationDecision::Allow
+                );
+                for target in ["tracked.txt", ".git", "../outside", "build/../../outside"] {
+                    let source = format!("fs.rmSync('{target}', {{recursive:true}});");
+                    let found = inspect(&dependency, &source);
+                    assert_eq!(found.decision, EvaluationDecision::Deny, "{source}");
+                    assert_eq!(
+                        found.pattern_info.unwrap().pattern_name.as_deref(),
+                        Some("confined-target")
+                    );
+                }
+                fs::create_dir(cwd.join("build")).unwrap();
+                std::os::unix::fs::symlink(&cwd, cwd.join("build/escape")).unwrap();
+                assert_eq!(
+                    inspect(&dependency, "fs.rmSync('build/escape/tracked.txt');").decision,
+                    EvaluationDecision::Deny
+                );
+            },
+        );
         assert_eq!(
             inspect(&dependency, dynamic).decision,
             EvaluationDecision::Deny
         );
+    }
+
+    #[test]
+    fn dependency_deferral_rejects_ignored_data_and_requires_approved_output_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let dependency = cwd.join("node_modules/loader/entry.js");
+        let outputs = ["build", "dist", "target", ".cache", "coverage", "node_modules"];
+        let other = [
+            ".env", "data.sqlite", ".build", ".next", ".turbo", "out", "dist-old",
+        ];
+        let writable = outputs
+            .iter()
+            .chain(&other)
+            .map(|name| cwd.join(name))
+            .collect();
+        let inspect = |source: &str, language| {
+            dependency_result(
+                &dependency,
+                source,
+                &cwd,
+                language,
+                EvaluationResult::denied_by_embedded_sink(
+                    "heredoc.javascript.fs-rm",
+                    "filesystem deletion",
+                ),
+            )
+            .decision
+        };
+        with_confined_dependencies(cwd.clone(), writable, vec![cwd.join(".git")], || {
+            for name in outputs {
+                let source = format!("fs.rmSync('{name}/x', {{recursive:true}});");
+                assert_eq!(
+                    inspect(&source, ScriptLanguage::JavaScript),
+                    EvaluationDecision::Allow,
+                    "{source}"
+                );
+            }
+            for name in other {
+                for source in [
+                    format!("fs.rmSync('{name}', {{recursive:true}});"),
+                    format!("fs.rmSync('dist/x'); fs.rmSync('{name}');"),
+                    format!("execSync('rm -rf {name}');"),
+                ] {
+                    assert_eq!(
+                        inspect(&source, ScriptLanguage::JavaScript),
+                        EvaluationDecision::Deny,
+                        "{source}"
+                    );
+                }
+                assert_eq!(
+                    inspect(&format!("rm -rf dist/x {name}"), ScriptLanguage::Bash),
+                    EvaluationDecision::Deny,
+                    "{name}"
+                );
+            }
+            // A literal host temp/home path is not the runner's fresh private
+            // temp/home, which is allocated only after the hook rewrites.
+            let outside = temp.path().parent().unwrap().join("dist/x");
+            let source = format!("fs.rmSync('{}');", outside.display());
+            assert_eq!(
+                inspect(&source, ScriptLanguage::JavaScript),
+                EvaluationDecision::Deny
+            );
+            fs::write(cwd.join("dist"), "an ignored file, not a directory").unwrap();
+            assert_eq!(
+                inspect("fs.rmSync('dist');", ScriptLanguage::JavaScript),
+                EvaluationDecision::Deny
+            );
+        });
     }
 
     #[test]

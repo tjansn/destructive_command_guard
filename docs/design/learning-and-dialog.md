@@ -167,14 +167,23 @@ For a finite command on a host capable of continuing-confinement rewriting,
 the hook may re-evaluate dependency findings in a dedicated scope. That scope
 uses the runner's Git-derived writable and protected paths. JavaScript and
 TypeScript dependency files beneath `node_modules` may defer dynamic cleanup
-or bounded fallback findings to kernel enforcement. Literal filesystem targets
-outside those writable paths still deny, including symlink escapes and protected
-paths. Explicit child commands are evaluated normally; only bounded deletion
-commands whose literal operands are writable can defer. Config blocks, dcg's
+or bounded fallback findings to kernel enforcement. Every recognized literal
+filesystem target must also lie within a project build/cache output directory:
+`build`, `dist`, `target`, `.cache`, `coverage` or `node_modules`. Git-ignored
+data such as `.env` or `data.sqlite` does not qualify. Neither do `.build`,
+`.next`, `.turbo` or `out`. Output names alone do not grant write access;
+Git-derived source/protected paths and symlink escapes still deny. Explicit
+child commands are evaluated normally; only bounded deletion commands whose
+literal operands meet both restrictions can defer. Config blocks, dcg's
 internal-command protection, credential writes, Git findings, and findings in
 the command or project-owned test sources remain in force. Static analysis is
 bounded and does not claim to resolve arbitrary dynamic targets; the unchanged
 kernel profile enforces every actual access throughout execution.
+
+The run's private temp/home remain writable. They are allocated after rewriting,
+so the hook does not equate any inherited home/temp literal with those private
+directories. Dynamic runtime accesses to the actual run temp/home remain under
+kernel enforcement; no host temp/home prefix is added to the literal exception.
 
 This scope can only produce a confined replacement. It creates no ordinary
 allow, observed-safe trial result, learned approval or exception. Failed scope
