@@ -457,10 +457,20 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(
             sub.join("package.json"),
-            r#"{"scripts":{"test":"node --test"}}"#,
+            r#"{"scripts":{"test":"node --test case.test.js"}}"#,
         )
         .unwrap();
+        std::fs::write(sub.join("case.test.js"), "console.log('fixture');\n").unwrap();
         assert!(eligible("cd sub && npm test", temp.path()));
+        assert_eq!(
+            execution("cd sub && npm test", temp.path()),
+            Some((sub.canonicalize().unwrap(), "npm test".to_owned()))
+        );
+        assert!(
+            Request::new("cd sub && npm test", temp.path(), Path::new("/bin/sh"), 5)
+                .validate()
+                .is_ok()
+        );
         for command in [
             "cd sub # && npm test",
             "cd sub # comment\n&& npm test",

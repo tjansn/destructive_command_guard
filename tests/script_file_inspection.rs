@@ -849,6 +849,7 @@ fn relative_and_empty_literal_path_entries_cannot_reach_bound_review() {
 #[cfg(unix)]
 #[test]
 fn disabled_trials_use_one_time_review_without_opening_the_approval_store() {
+    use std::os::unix::fs::PermissionsExt;
     let fixture = Fixture::new();
     let policy = std::fs::read_to_string(&fixture.config).unwrap();
     std::fs::write(&fixture.config, format!("{policy}\n[trial]\nenabled = false\n")).unwrap();
@@ -858,7 +859,15 @@ fn disabled_trials_use_one_time_review_without_opening_the_approval_store() {
         "home/.config/dcg/verified_trials.json",
         "invalid fixture store",
     );
-    let candidate = format!("PATH=/usr/bin:/bin /bin/true {}", "x".repeat(6_000));
+    // Use a real fixture executable: /bin/true does not exist on macOS.
+    // The hook only inspects it; disabled trials must not execute it.
+    fixture.write("review-fixture.sh", "#!/bin/sh\nprintf safe\n");
+    std::fs::set_permissions(
+        fixture.root.join("review-fixture.sh"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let candidate = format!("PATH=/usr/bin:/bin ./review-fixture.sh {}", "x".repeat(6_000));
     let input = json!({"tool_name":"Bash", "tool_input":{"command":candidate}, "cwd":fixture.root});
     let mut child = fixture
         .command()

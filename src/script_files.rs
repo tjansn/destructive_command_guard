@@ -1292,6 +1292,7 @@ mod tests {
             "env BASH_ENV=./startup.sh bash check.sh",
         ] {
             for relaxed in [false, true] {
+                let capture = crate::desktop_review::ReviewCapture::start();
                 let mut inspected = false;
                 let result = evaluate(
                     command,
@@ -1300,12 +1301,15 @@ mod tests {
                     false,
                     None,
                     relaxed,
-                    |_, path, _| {
-                        inspected |= path == cwd.join("check.sh");
+                    |source, source_cwd, language| {
+                        assert_eq!(source_cwd, cwd);
+                        assert_eq!(language, ScriptLanguage::Bash);
+                        inspected |= source == "echo safe\n";
                         EvaluationResult::allowed()
                     },
                 );
                 assert!(inspected, "{command}, relaxed={relaxed}");
+                assert!(capture.snapshot().resolved_paths().contains(&cwd.join("check.sh")));
                 if relaxed {
                     assert!(result.is_none(), "{command}: {result:?}");
                 } else {
