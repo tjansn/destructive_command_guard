@@ -1038,7 +1038,7 @@ fn flush_batch_with_recovery(
         return;
     }
 
-    match flush_batch(db, batch) {
+    match flush_batch(db, batch, max_size_bytes) {
         FlushOutcome::Success => {}
         FlushOutcome::Contended => {
             batch.clear();
@@ -1055,7 +1055,7 @@ fn flush_batch_with_recovery(
             history_diagnostic("storage_error", format_args!("phase=recovery"));
             warn!("Detected fatal history storage error; attempting DB recovery");
             if recover_history_db(db, db_path, max_size_bytes) {
-                match flush_batch(db, batch) {
+                match flush_batch(db, batch, max_size_bytes) {
                     FlushOutcome::Success => {
                         debug!("History DB recovery succeeded");
                     }
@@ -1101,6 +1101,9 @@ enum FlushOutcome {
 }
 
 fn is_fatal_storage_error(error: &HistoryError) -> bool {
+    if matches!(error, HistoryError::IntegrityCheckFailed(_)) {
+        return true;
+    }
     matches!(
         error,
         HistoryError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
@@ -1134,8 +1137,8 @@ fn is_contention_error(error: &HistoryError) -> bool {
     )
 }
 
-/// Flush the batch to the database.
-fn flush_batch(db: &HistoryDb, batch: &mut Vec<CommandEntry>) -> FlushOutcome {
+/// Flush the batch to the database, rechecking its cap inside each transaction.
+fn flush_batch(db: &HistoryDb, batch: &mut Vec<CommandEntry>, max_size_bytes: u64) -> FlushOutcome {
     let _phase = crate::perf::PhaseTimer::start("history_storage_insert");
     if batch.is_empty() {
         return FlushOutcome::Success;
@@ -1153,14 +1156,14 @@ fn flush_batch(db: &HistoryDb, batch: &mut Vec<CommandEntry>) -> FlushOutcome {
     // Bulk insertion is transactional: an error rolls back its whole prefix.
     // Individual fallback inserts below instead commit one row at a time.
     if batch_len >= 2 {
-        match db.log_commands_batch(batch) {
+        match db.log_commands_batch_with_live_limit(batch, max_size_bytes) {
             Ok(()) => {
                 trace!(count = batch_len, "Batch insert succeeded");
                 batch.clear();
                 return FlushOutcome::Success;
             }
             Err(e) => {
-                // The schema layer attempts rollback on error, but cannot
+                // The storage layer attempts rollback on error, but cannot
                 // guarantee that rollback succeeds after a storage failure.
                 // Retain the entire batch until that transaction is aborted.
                 if !db.connection().is_autocommit() {
@@ -1194,7 +1197,9 @@ fn flush_batch(db: &HistoryDb, batch: &mut Vec<CommandEntry>) -> FlushOutcome {
         }
     }
 
-    flush_individual_entries(batch, |entry| db.log_command(entry))
+    flush_individual_entries(batch, |entry| {
+        db.log_command_with_live_limit(entry, max_size_bytes)
+    })
 }
 
 /// Retire the processed prefix even when a later insert stops the batch.
@@ -1384,7 +1389,10 @@ mod tests {
             assert!(!db.connection().is_autocommit());
             assert!(persisted_test_commands(&path).is_empty());
 
-            assert_eq!(flush_batch(&db, &mut batch), FlushOutcome::Fatal);
+            assert_eq!(
+                flush_batch(&db, &mut batch, WorkerConfig::default().max_size_bytes),
+                FlushOutcome::Fatal
+            );
             assert_eq!(batch.len(), commands.len(), "uncommitted entries must remain queued");
             assert_eq!(db.count_commands().unwrap(), 1);
 
@@ -1458,7 +1466,10 @@ mod tests {
         assert!(db.log_commands_batch(&batch).is_err());
         assert!(db.connection().is_autocommit());
         assert!(persisted_test_commands(&path).is_empty());
-        assert_eq!(flush_batch(&db, &mut batch), FlushOutcome::Success);
+        assert_eq!(
+            flush_batch(&db, &mut batch, WorkerConfig::default().max_size_bytes),
+            FlushOutcome::Success
+        );
         assert!(batch.is_empty());
         assert_eq!(
             persisted_test_commands(&path),
@@ -1466,7 +1477,10 @@ mod tests {
         );
         assert_fts_probe_count(&path, "repeatable", 2);
         assert_fts_probe_count(&path, "rejected", 0);
-        assert_eq!(flush_batch(&db, &mut batch), FlushOutcome::Success);
+        assert_eq!(
+            flush_batch(&db, &mut batch, WorkerConfig::default().max_size_bytes),
+            FlushOutcome::Success
+        );
         assert_eq!(db.count_commands().unwrap(), 2);
     }
 
@@ -1594,12 +1608,29 @@ mod tests {
         );
         reject_recovery_test_entry(&db);
         let mut batch = recovery_test_entries(&["rejected"]);
-        assert_eq!(flush_batch(&db, &mut batch), FlushOutcome::Success);
+        assert_eq!(
+            flush_batch(&db, &mut batch, WorkerConfig::default().max_size_bytes),
+            FlushOutcome::Success
+        );
         assert!(
             batch.is_empty(),
             "permanently rejected entries are not retried"
         );
         assert_eq!(db.count_commands().unwrap(), 0);
+    }
+
+    #[test]
+    fn integrity_failures_preserve_entries_for_recovery() {
+        let mut batch = recovery_test_entries(&["pending", "unattempted"]);
+        assert_eq!(
+            flush_individual_entries(&mut batch, |_| {
+                Err(HistoryError::IntegrityCheckFailed(
+                    "rollback left a transaction active".to_string(),
+                ))
+            }),
+            FlushOutcome::Fatal
+        );
+        assert_eq!(batch.len(), 2, "failed cleanup must not retire the pending entry");
     }
 
     #[test]
