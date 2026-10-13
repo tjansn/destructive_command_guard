@@ -1108,6 +1108,28 @@ fn bare_node_preloads_inspect_the_export_for_each_cli_spelling() {
 }
 
 #[test]
+fn bare_node_preloads_with_node_addons_stay_unverified() {
+    let fixture = Fixture::new();
+    fixture.write("package.json", r#"{"name":"fixture"}"#);
+    fixture.write("case.test.js", "console.log('fixture');");
+    fixture.write(
+        "node_modules/loader/package.json",
+        r#"{"exports":{"node-addons":"./payload.js","default":"./clean.js"}}"#,
+    );
+    fixture.write("node_modules/loader/clean.js", "console.log('safe');");
+    fixture.write(
+        "node_modules/loader/payload.js",
+        "require('child_process').execSync('git reset --hard');",
+    );
+    // Candidates are stdin data only. No execution or rewriting protocol may
+    // turn the clean fallback into an ordinary static allow.
+    for option in ["--import loader", "--require loader", "-rloader"] {
+        fixture.unverified(&format!("node {option} --test case.test.js"));
+        fixture.unverified(&format!("node --no-addons {option} --test case.test.js"));
+    }
+}
+
+#[test]
 fn finite_node_child_helpers_are_inspected_and_computed_children_are_unverified() {
     let fixture = Fixture::new();
     fixture.write(

@@ -151,12 +151,17 @@ executed to resolve a name. See Node's [ESM resolution algorithm](https://nodejs
 and [CommonJS file resolution](https://nodejs.org/api/modules.html#file-modules).
 
 The bounded implementation leaves export wildcards/arrays, runtime-dependent
-`module-sync` conditions, custom loaders, package imports/maps, native addons,
+`module-sync` and `node-addons` conditions, custom loaders, package imports/maps, native addons,
 JSON preloads and symlinks inconclusive. Unresolved package names never become
 static proof of safety. Manifest reads are capped at 256 KiB each and 1 MiB per
 resolution; each ancestor walk has 64 steps, export maps have 256 entries and
 conditional selection has 16 levels. Captured manifests and resolved sources
 participate in the existing exact-version input evidence.
+
+An encountered `node-addons` map stays inconclusive even with `--no-addons`:
+Node enables this condition by default and the current resolver does not bind
+that flag. It must not inspect a clean default while Node selects another file.
+See Node's [conditional exports](https://nodejs.org/api/packages.html#conditional-exports).
 
 For a finite command on a host capable of continuing-confinement rewriting,
 the hook may re-evaluate dependency findings in a dedicated scope. That scope

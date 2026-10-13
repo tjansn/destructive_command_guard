@@ -192,6 +192,12 @@ fn export_target(target: &Target, mode: Mode, depth: usize) -> Result<Option<&st
             Err("Node export alternatives require review".to_owned())
         }
         Target::Conditions(Conditions(entries)) => {
+            // Node enables node-addons by default, but --no-addons disables
+            // it. Until that flag is part of our resolution context, neither
+            // branch can be bound safely (even when the target is plain JS).
+            if entries.iter().any(|(name, _)| name == "node-addons") {
+                return Err("Node node-addons export condition requires review".to_owned());
+            }
             if entries
                 .iter()
                 .any(|(name, _)| name.starts_with('.') || name.parse::<u32>().is_ok())
@@ -393,6 +399,30 @@ mod tests {
         );
         assert!(resolve("loader", &root, Mode::Import).is_err());
         assert!(resolve("loader/fallback.js", &root, Mode::Require).is_err());
+    }
+
+    #[test]
+    fn node_addons_exports_never_fall_through_to_a_clean_default() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        write(&root, "package.json", "{}");
+        write(&root, "node_modules/loader/clean.js", "console.log('safe');");
+        write(
+            &root,
+            "node_modules/loader/payload.js",
+            "require('child_process').execSync('git reset --hard');",
+        );
+        for manifest in [
+            r#"{"exports":{"node-addons":"./payload.js","default":"./clean.js"}}"#,
+            r#"{"exports":{"default":"./clean.js","node-addons":"./payload.js"}}"#,
+            r#"{"exports":{".":{"node":{"node-addons":"./payload.js","default":"./clean.js"}}}}"#,
+        ] {
+            write(&root, "node_modules/loader/package.json", manifest);
+            for mode in [Mode::Import, Mode::Require] {
+                let error = resolve("loader", &root, mode).unwrap_err();
+                assert!(error.contains("node-addons"), "{manifest}: {error}");
+            }
+        }
     }
 
     #[test]
