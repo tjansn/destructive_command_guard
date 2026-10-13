@@ -4,6 +4,65 @@ import AppKit
 import Foundation
 import LocalAuthentication
 import LocalAuthenticationEmbeddedUI
+import QuartzCore
+
+// The window server must not infer an active-state rectangular shadow from
+// NSGlassEffectView's backing surface. Clip the material and draw one explicit
+// rounded shadow inside a transparent, padded window in both focus states.
+@MainActor
+final class ReviewPanelSurface: NSView {
+    static let padding: CGFloat = 20
+    static let radius: CGFloat = 28
+    let clip = NSView()
+    private let shadow = CALayer()
+    private let shadowCutout = CAShapeLayer()
+
+    init(material: NSView) {
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+        shadow.shadowColor = NSColor.black.cgColor
+        shadow.shadowOpacity = 0.22
+        shadow.shadowRadius = 10
+        shadow.shadowOffset = CGSize(width: 0, height: -3)
+        shadowCutout.fillRule = .evenOdd
+        shadow.mask = shadowCutout
+        layer?.addSublayer(shadow)
+        clip.wantsLayer = true
+        clip.layer?.cornerRadius = Self.radius
+        clip.layer?.masksToBounds = true
+        clip.layer?.borderWidth = 0
+        addSubview(clip)
+        clip.addSubview(material)
+        material.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            material.leadingAnchor.constraint(equalTo: clip.leadingAnchor),
+            material.trailingAnchor.constraint(equalTo: clip.trailingAnchor),
+            material.topAnchor.constraint(equalTo: clip.topAnchor),
+            material.bottomAnchor.constraint(equalTo: clip.bottomAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func layout() {
+        super.layout()
+        let panel = bounds.insetBy(dx: Self.padding, dy: Self.padding)
+        clip.frame = panel
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        shadow.frame = bounds
+        let outline = CGPath(roundedRect: panel, cornerWidth: Self.radius,
+                             cornerHeight: Self.radius, transform: nil)
+        shadow.shadowPath = outline
+        let cutout = CGMutablePath()
+        cutout.addRect(bounds)
+        cutout.addPath(outline)
+        shadowCutout.frame = bounds
+        shadowCutout.path = cutout
+        CATransaction.commit()
+    }
+}
 
 struct ReviewDescription: Decodable {
     let agent: String
@@ -457,14 +516,14 @@ final class ReviewController: NSObject, NSWindowDelegate {
 
     private func buildWindow() -> ReviewWindow {
         let info = request.description
-        let window = ReviewWindow(contentRect: NSRect(x: 0, y: 0, width: Self.width, height: 440),
+        let window = ReviewWindow(contentRect: NSRect(x: 0, y: 0, width: Self.width + 2 * ReviewPanelSurface.padding, height: 480),
                                   styleMask: [.borderless], backing: .buffered, defer: false)
         self.window = window
         window.title = "DCG · \(info.agent) · \(info.project)"
         window.isReleasedWhenClosed = false
         window.isOpaque = false
         window.backgroundColor = .clear
-        window.hasShadow = true
+        window.hasShadow = false
         window.level = .floating
         window.isMovableByWindowBackground = true
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -478,10 +537,10 @@ final class ReviewController: NSObject, NSWindowDelegate {
         content.layer?.masksToBounds = true
         if #available(macOS 26.0, *) {
             let glass = NSGlassEffectView()
-            glass.style = .regular
+            glass.style = .clear
             glass.cornerRadius = 28
             glass.contentView = content
-            window.contentView = glass
+            window.contentView = ReviewPanelSurface(material: glass)
         } else {
             let material = NSVisualEffectView()
             material.material = .hudWindow
@@ -498,7 +557,7 @@ final class ReviewController: NSObject, NSWindowDelegate {
                 content.topAnchor.constraint(equalTo: material.topAnchor),
                 content.bottomAnchor.constraint(equalTo: material.bottomAnchor),
             ])
-            window.contentView = material
+            window.contentView = ReviewPanelSurface(material: material)
         }
 
         let identity = identityCard(info)
@@ -533,8 +592,9 @@ final class ReviewController: NSObject, NSWindowDelegate {
         guard let window, let stack else { return }
         window.contentView?.layoutSubtreeIfNeeded()
         let old = window.frame
-        let height = stack.fittingSize.height + 2 * Self.inset
-        window.setFrame(NSRect(x: old.minX, y: old.maxY - height, width: Self.width, height: height), display: true)
+        let height = stack.fittingSize.height + 2 * (Self.inset + ReviewPanelSurface.padding)
+        let width = Self.width + 2 * ReviewPanelSurface.padding
+        window.setFrame(NSRect(x: old.minX, y: old.maxY - height, width: width, height: height), display: true)
         window.contentView?.layoutSubtreeIfNeeded()
         window.invalidateShadow()
         DispatchQueue.main.async { [weak window] in window?.invalidateShadow() }

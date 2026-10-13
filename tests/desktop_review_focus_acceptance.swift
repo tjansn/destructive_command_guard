@@ -64,6 +64,14 @@ struct FocusAcceptance {
             precondition(panel.isVisible && panel.isKeyWindow == key)
             precondition(NSApp.isActive == key)
             panel.contentView?.layoutSubtreeIfNeeded()
+            precondition(!panel.hasShadow, "window-server rectangular shadow must stay disabled")
+            guard let surface = panel.contentView as? ReviewPanelSurface else {
+                fatalError("dialog must use the rounded panel surface in both focus states")
+            }
+            precondition(surface.clip.layer?.masksToBounds == true)
+            precondition(surface.clip.layer?.cornerRadius == ReviewPanelSurface.radius)
+            precondition(surface.clip.frame == surface.bounds.insetBy(dx: ReviewPanelSurface.padding,
+                                                                      dy: ReviewPanelSurface.padding))
             let views = descendants(panel.contentView!)
             let labels = views.compactMap { ($0 as? NSTextField)?.stringValue }
             precondition(labels.contains(info.commandHeading))

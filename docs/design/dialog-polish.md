@@ -96,3 +96,17 @@ when they are ready; do not reroute or split blocked commands.
   pi bridge tests, recounted totals).
 - Report: /Users/tom/Documents/Codex/2026-10-09/k/work/dcg-dialog-polish-REPORT.md
   with a short plain-language summary for Tom.
+# F3 frame follow-up (2026-10-13)
+
+The active-state square outline is addressed at the compositing boundary:
+the borderless window has no window-server shadow, and both material variants
+sit inside the same 28-point rounded clipping view. A transparent 20-point
+margin holds an explicit rounded Core Animation shadow. Its interior is cut
+out so it does not darken the glass. macOS 26 glass uses the clear style; the
+existing readable paused-state fill and all Touch ID focus behavior are retained.
+
+The native focus helper asserts the rounded surface, clipping, padding and
+disabled window shadow in every capture. Visual acceptance still requires the
+eight light/dark active/paused screenshots; geometry assertions alone do not
+prove that WindowServer rendered clean edges. Use `dcg-f2-preview.sh` with the
+fresh F3 validation directory; it rebuilds the helper before capturing.
