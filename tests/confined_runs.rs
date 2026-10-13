@@ -552,5 +552,13 @@ mod macos {
                 || stdout.contains("ℹ tests"),
             "the fixture did not reach npm/Node: {report}"
         );
+        assert!(
+            !result.timed_out,
+            "pi-os exceeded the 595-second deadline: {report}"
+        );
+        assert_eq!(
+            result.exit_code, 0,
+            "the real pi-os suite did not pass: {report}"
+        );
     }
 }

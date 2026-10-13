@@ -232,6 +232,7 @@ mod tests {
         for (reason, expected) in [
             ("destructive", Outcome::Dangerous),
             ("[dcg:unsupported-dynamic]", Outcome::Dynamic),
+            ("[dcg:bound-input-review]", Outcome::BoundInputs),
             ("[dcg:analysis-limit]", Outcome::Limit),
             (
                 "[dcg:review-unavailable-or-cancelled]",
@@ -242,5 +243,9 @@ mod tests {
             assert!(!expected.code().is_empty());
             assert!(!expected.remediation().is_empty());
         }
+        assert!(
+            !Outcome::BoundInputs
+                .supports_command_review(Some("heredoc.script_files"), Some("unverified"))
+        );
     }
 }
