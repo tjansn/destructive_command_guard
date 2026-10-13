@@ -27,7 +27,11 @@ fallback if setup or execution fails.
 
 Supported forms are explicit Node test/syntax inputs, system-shell syntax checks,
 finite tsc/eslint/biome commands and npm/pnpm/yarn test/check/lint/build scripts whose
-pre/main/post entrypoints meet the same contract. Chains, substitutions, background,
+pre/main/post entrypoints meet the same contract. A single leading `cd <literal dir>
+&& <finite command>` is also supported: dcg canonicalizes the directory and launches
+the finite command there. Quoted spaces and `cd --` work. Expansion, substitution,
+`cd -`, relative paths affected by `CDPATH`, and additional chains are excluded.
+Other chains, substitutions, background,
 watch, service-start and unsupported runner forms are excluded. This identifies
 runner intent, not guaranteed termination of arbitrary imported code; all runtime
 code and descendants remain subject to the kernel profile and resource bounds.
@@ -40,8 +44,20 @@ symlink roots and existing hard links in writable trees fail setup, and creating
 hard links is denied. The per-run home and temp directories are writable. Project
 files are readable; the Part C credential, external-read, network and Mach boundaries
 continue to apply. Real-project Unix sockets are not considered owned by the run.
-Because Seatbelt does not prove TCP endpoint ownership, **all outbound TCP remains
-denied**, including exchanges with the run's own listener.
+By default **all outbound TCP remains denied**, including exchanges with the run's
+own listener. Trusted `[trial] confined_loopback = "all"` opens outbound TCP to
+**every localhost service**, including pre-existing host services. It does not prove
+endpoint ownership: such a service can act outside the child's filesystem sandbox
+as a confused deputy. This is Tom's explicit Part F2 choice after the failed F1
+ownership probes, not a replacement isolation backend. Non-loopback outbound and
+the existing read/write/Mach restrictions stay denied. Observational trials always
+keep deny-all outbound TCP, even with this setting.
+
+The rewrite receipt includes `approvalScope = "confined"`, `confinedLoopback` and
+plain-language policy text; the runner repeats that policy on stderr. The request
+binds the choice, and the runner rejects it if current trusted config differs.
+Automatically discovered project config cannot enable it. No reusable approval is
+created by a confined run in either mode.
 
 The real environment is retained except for the following case-insensitive removals:
 
@@ -133,11 +149,16 @@ Use a trusted dcg configuration file:
 enabled = true
 timeout_secs = 600
 network = "localhost"
+confined_loopback = "none"
 max_copy_bytes = 2_000_000_000
 keep_artifacts = false
 ```
 
-These are the defaults. `localhost` is the only accepted network policy.
+These are the defaults. `localhost` is the only accepted observational network
+policy and permits binding/listening, not outbound TCP. For continuing confinement
+only, `confined_loopback` accepts `none` or `all`. To opt in after validated
+installation, Tom may add **`confined_loopback = "all"`** under `[trial]` in trusted
+user config. This task does not change that live file.
 The timeout and fallback copy cap must be positive. Set `enabled = false` to
 keep the previous static decision and desktop-review path. Automatically
 discovered repository configuration cannot alter these execution settings;
@@ -147,6 +168,15 @@ Keep script inspection enabled with `[heredoc] scan_script_files = true`.
 Use the existing `--desktop-review` hook option for Touch ID review of an
 inconclusive trial. When desktop review is unavailable or not approved, dcg
 keeps the command blocked.
+
+Literal execution-affecting assignments such as
+`env -i HOME=/tmp/example PATH=/usr/bin:/bin cargo test` are classified as
+`bound-input-review`. Their raw values and the executable resolved through that
+PATH are bound into the reviewed identity and rechecked after Touch ID. This path
+offers **one-request** review, with no trial or reusable approval for the override.
+Expansion, substitution, unsupported `env` switches, an unresolved executable and
+inherited preload/startup variables still fail closed. The diagnostic advertises
+desktop review and never suggests an ineffective command-only code or trial grant.
 
 ## What happens during a trial
 

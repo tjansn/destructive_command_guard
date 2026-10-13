@@ -679,31 +679,102 @@ fn finite_hook_rewrites_only_capable_hosts_and_never_executes_during_the_hook() 
 
 #[cfg(target_os = "macos")]
 #[test]
+fn leading_literal_cd_rewrites_from_the_resolved_directory_without_executing() {
+    use destructive_command_guard::confined::Request;
+    let fixture = Fixture::new();
+    fixture.write(
+        "nested dir/once.test.js",
+        "require('node:fs').writeFileSync('executed-marker', 'ran');\n",
+    );
+    for candidate in [
+        "cd 'nested dir' && node --test once.test.js".to_owned(),
+        format!(
+            "cd -- {} && node --test once.test.js",
+            shell_words::quote(fixture.root.join("nested dir").to_str().unwrap())
+        ),
+    ] {
+        let input = json!({"tool_name":"Bash", "tool_input":{"command":candidate, "timeout":600_000}, "cwd":fixture.root});
+        let mut child = fixture
+            .command()
+            .args(["--agent", "claude-code"])
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output["dcg_verdict"], "confined", "{candidate}: {output}");
+        let words = shell_words::split(
+            output["hookSpecificOutput"]["updatedInput"]["command"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let request = Request::decode(words.last().unwrap()).unwrap();
+        assert_eq!(request.command, candidate);
+        assert_eq!(request.cwd, fixture.root);
+        assert!(!fixture.root.join("nested dir/executed-marker").exists());
+    }
+}
+
+#[test]
+fn literal_env_diagnostics_offer_bound_review_without_a_command_only_code() {
+    let fixture = Fixture::new();
+    let result = fixture.denied("env -i HOME=/tmp/fixture PATH=/usr/bin:/bin cargo test");
+    let text = result.to_string();
+    assert!(text.contains("bound-input-review"), "{text}");
+    assert!(text.contains("no reusable trial approval"), "{text}");
+    assert!(
+        !text.contains("command-local PATH requires desktop review"),
+        "{text}"
+    );
+    assert!(!text.contains("dcg trial run"), "{text}");
+    for candidate in [
+        "env -i HOME=$HOME PATH=/bin cargo test",
+        "env -i HOME=$(pwd) PATH=/bin cargo test",
+    ] {
+        let text = fixture.denied(candidate).to_string();
+        assert!(!text.contains("bound-input-review"), "{text}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn definite_findings_cannot_be_hidden_by_a_finite_rewrite() {
     let fixture = Fixture::new();
     fixture.write(
         "danger.test.js",
         "require('child_process').execSync('git reset --hard');\n",
     );
-    let input = json!({"tool_name":"Bash","tool_input":{"command":"node --test danger.test.js"},"cwd":fixture.root});
-    let mut child = fixture
-        .command()
-        .args(["--agent", "claude-code"])
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.to_string().as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    let output: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(
-        output["hookSpecificOutput"]["permissionDecision"], "deny",
-        "{output}"
-    );
-    assert!(output["hookSpecificOutput"].get("updatedInput").is_none());
+    for candidate in [
+        "node --test danger.test.js",
+        "cd . && node --test danger.test.js",
+    ] {
+        let input =
+            json!({"tool_name":"Bash","tool_input":{"command":candidate},"cwd":fixture.root});
+        let mut child = fixture
+            .command()
+            .args(["--agent", "claude-code"])
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            output["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{output}"
+        );
+        assert!(output["hookSpecificOutput"].get("updatedInput").is_none());
+    }
 }
 
 #[test]

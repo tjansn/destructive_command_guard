@@ -749,19 +749,43 @@ struct TrialConfigLayer {
     enabled: Option<bool>,
     timeout_secs: Option<u64>,
     network: Option<TrialNetwork>,
+    confined_loopback: Option<ConfinedLoopback>,
     max_copy_bytes: Option<u64>,
     keep_artifacts: Option<bool>,
 }
 
-/// Network policy for sandboxed trials. Only loopback traffic is supported.
+/// Observational network policy: local listeners and owned Unix sockets only.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum TrialNetwork {
-    /// Permit loopback connections and Unix sockets inside the trial directory.
+    /// Permit loopback listeners and owned Unix sockets; outbound TCP is denied.
     #[default]
     Localhost,
+}
+
+/// Trusted opt-in for Part E only. This grants access to every host loopback
+/// service, including services outside the confined process tree.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfinedLoopback {
+    #[default]
+    None,
+    All,
+}
+
+impl ConfinedLoopback {
+    pub const fn receipt(self) -> &'static str {
+        match self {
+            Self::None => "Localhost outbound TCP is closed.",
+            Self::All => {
+                "Localhost outbound TCP is open to all host services; trusted config accepts the confused-deputy risk."
+            }
+        }
+    }
 }
 
 /// Sandboxed trial settings for commands whose source cannot be verified statically.
@@ -773,8 +797,10 @@ pub struct TrialConfig {
     /// Maximum wall-clock time for a trial, in seconds.
     #[schemars(range(min = 1))]
     pub timeout_secs: u64,
-    /// Network access is restricted to localhost; other policies are unsupported.
+    /// Observational trials deny outbound TCP, including localhost.
     pub network: TrialNetwork,
+    /// Trusted continuing-confinement policy. Observational trials ignore it.
+    pub confined_loopback: ConfinedLoopback,
     /// Maximum bytes copied when copy-on-write cloning is unavailable.
     #[schemars(range(min = 1))]
     pub max_copy_bytes: u64,
@@ -788,6 +814,7 @@ impl Default for TrialConfig {
             enabled: true,
             timeout_secs: 600,
             network: TrialNetwork::Localhost,
+            confined_loopback: ConfinedLoopback::None,
             max_copy_bytes: 2_000_000_000,
             keep_artifacts: false,
         }
@@ -4575,6 +4602,9 @@ impl Config {
         if let Some(network) = trial.network {
             self.trial.network = network;
         }
+        if let Some(loopback) = trial.confined_loopback {
+            self.trial.confined_loopback = loopback;
+        }
         if let Some(max_copy_bytes) = trial.max_copy_bytes {
             self.trial.max_copy_bytes = max_copy_bytes;
         }
@@ -5898,8 +5928,11 @@ fallback_on_timeout = true
 # Verify supported unverified-source commands in an isolated macOS sandbox.
 enabled = true
 timeout_secs = 600
-# Only localhost is supported. Internet attempts require desktop review.
+# Observational trials allow local listeners; all outbound TCP stays denied.
 network = "localhost"
+# Trusted opt-in for continuing confinement only. "all" opens every host
+# localhost TCP service, including pre-existing services outside the sandbox.
+confined_loopback = "none"
 # Plain-copy fallback cap when copy-on-write cloning is unavailable.
 max_copy_bytes = 2_000_000_000
 keep_artifacts = false
@@ -6104,6 +6137,7 @@ mod tests {
         assert!(config.trial.enabled);
         assert_eq!(config.trial.timeout_secs, 600);
         assert_eq!(config.trial.network, TrialNetwork::Localhost);
+        assert_eq!(config.trial.confined_loopback, ConfinedLoopback::None);
         assert_eq!(config.trial.max_copy_bytes, 2_000_000_000);
         assert!(!config.trial.keep_artifacts);
         assert_eq!(config.trial.hook_timeout_secs(), 780);
@@ -6175,12 +6209,22 @@ mod tests {
     #[test]
     fn trial_automatic_project_layer_cannot_change_execution_policy() {
         let layer: ConfigLayer = toml::from_str(
-            "[trial]\nenabled = false\ntimeout_secs = 9999\nmax_copy_bytes = 9999\nkeep_artifacts = true\n",
+            "[trial]\nenabled = false\ntimeout_secs = 9999\nmax_copy_bytes = 9999\nkeep_artifacts = true\nconfined_loopback = 'all'\n",
         )
         .unwrap();
         let mut config = Config::default();
         config.merge_layer(layer.into_restricted_project_policy());
         assert_eq!(config.trial, TrialConfig::default());
+    }
+
+    #[test]
+    fn confined_loopback_requires_a_trusted_config_layer() {
+        let mut config = Config::default();
+        config.merge_layer(toml::from_str("[trial]\nconfined_loopback = 'all'\n").unwrap());
+        assert_eq!(config.trial.confined_loopback, ConfinedLoopback::All);
+        config.merge_layer(toml::from_str("[trial]\nconfined_loopback = 'none'\n").unwrap());
+        assert_eq!(config.trial.confined_loopback, ConfinedLoopback::None);
+        assert!(toml::from_str::<Config>("[trial]\nconfined_loopback = 'internet'\n").is_err());
     }
 
     #[test]

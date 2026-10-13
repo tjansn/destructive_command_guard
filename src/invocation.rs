@@ -2,6 +2,246 @@
 
 use crate::heredoc::ScriptLanguage;
 
+/// Split only a literal leading cd. The caller must still validate the entire
+/// remaining command; this function never grants permission for a chain.
+pub(crate) fn leading_cd(
+    source: &str,
+    cwd: &std::path::Path,
+    cdpath: Option<&std::ffi::OsStr>,
+) -> Option<(std::path::PathBuf, String)> {
+    use crate::normalize::{NormalizeTokenKind, tokenize_for_normalization};
+    let source = source.trim();
+    let tokens = tokenize_for_normalization(source);
+    let separator = tokens
+        .iter()
+        .position(|token| token.kind == NormalizeTokenKind::Separator)?;
+    let token = &tokens[separator];
+    if &source[token.byte_range.clone()] != "&&" {
+        return None;
+    }
+    let prefix = &source[..token.byte_range.start];
+    if prefix.contains(['$', '`', '~', '\n', '\r', '*', '?', '[', '{']) {
+        return None;
+    }
+    let words = shell_words::split(prefix).ok()?;
+    let path = match words.as_slice() {
+        [cd, path] if cd == "cd" => path,
+        [cd, options, path] if cd == "cd" && options == "--" => path,
+        _ => return None,
+    };
+    if path.is_empty() || path.starts_with('-') {
+        return None;
+    }
+    let path = std::path::Path::new(path);
+    if !path.is_absolute() && cdpath.is_some_and(|value| !value.is_empty()) {
+        return None;
+    }
+    let target = cwd.join(path).canonicalize().ok()?;
+    if !target.is_dir() {
+        return None;
+    }
+    let rest = source[token.byte_range.end..].trim();
+    (!rest.is_empty()).then(|| (target, rest.to_owned()))
+}
+
+#[derive(Debug)]
+pub(crate) struct BoundEnvironment {
+    pub values: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    pub wrapper: Option<(String, std::ffi::OsString)>,
+    pub program: String,
+}
+
+/// Bind literal assignment operands without executing a shell or expanding
+/// variables. Unsupported env switches remain unavailable for review.
+pub(crate) fn bound_environment(
+    source: &str,
+    parent: &std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+) -> Result<Option<BoundEnvironment>, String> {
+    use crate::normalize::{NormalizeTokenKind, tokenize_for_normalization};
+    let tokens = tokenize_for_normalization(source);
+    let mut values = parent.clone();
+    let mut index = 0;
+    let mut bound = false;
+    let word = |index: usize| -> Result<(String, &str), String> {
+        let token = tokens.get(index).ok_or("environment has no executable")?;
+        if token.kind != NormalizeTokenKind::Word {
+            return Err("environment executable is not a literal word".to_owned());
+        }
+        let raw = &source[token.byte_range.clone()];
+        let decoded = shell_words::split(raw).map_err(|e| e.to_string())?;
+        match decoded.as_slice() {
+            [value] => Ok((value.clone(), raw)),
+            _ => Err("environment operand is not a literal word".to_owned()),
+        }
+    };
+    let assignment = |value: &str,
+                      raw: &str|
+     -> Result<Option<(std::ffi::OsString, std::ffi::OsString)>, String> {
+        let Some((name, value)) = value.split_once('=') else {
+            return Ok(None);
+        };
+        if name.is_empty()
+            || name.starts_with(|ch: char| ch.is_ascii_digit())
+            || !name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            return Err("invalid literal environment name".to_owned());
+        }
+        if raw.contains(['$', '`', '~', '\n', '\r', '*', '?', '[', ']', '{', '}']) {
+            return Err("environment expansion or substitution cannot be reviewed".to_owned());
+        }
+        Ok(Some((name.into(), value.into())))
+    };
+    while let Ok((value, raw)) = word(index) {
+        let Some((key, value)) = assignment(&value, raw)? else {
+            break;
+        };
+        values.insert(key, value);
+        bound = true;
+        index += 1;
+    }
+    let (outer, _) = word(index)?;
+    let mut wrapper = None;
+    if outer.rsplit('/').next() == Some("env") {
+        wrapper = Some((
+            outer,
+            values
+                .get(std::ffi::OsStr::new("PATH"))
+                .cloned()
+                .unwrap_or_default(),
+        ));
+        index += 1;
+        if matches!(word(index)?.0.as_str(), "-i" | "--ignore-environment") {
+            values.clear();
+            bound = true;
+            index += 1;
+        }
+        if word(index)?.0 == "--" {
+            index += 1;
+        }
+        while let Ok((value, raw)) = word(index) {
+            let Some((key, value)) = assignment(&value, raw)? else {
+                break;
+            };
+            values.insert(key, value);
+            bound = true;
+            index += 1;
+        }
+    }
+    if !bound {
+        return Ok(None);
+    }
+    let (program, raw) = word(index)?;
+    if program.starts_with('-') || raw.contains(['$', '`', '~', '*', '?', '[', '{']) {
+        return Err("environment executable requires a literal path".to_owned());
+    }
+    if !program.contains('/') && !values.contains_key(std::ffi::OsStr::new("PATH")) {
+        return Err(
+            "cleared environment requires a literal PATH or absolute executable".to_owned(),
+        );
+    }
+    Ok(Some(BoundEnvironment {
+        values,
+        wrapper,
+        program,
+    }))
+}
+
+#[cfg(test)]
+mod literal_environment_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::ffi::{OsStr, OsString};
+
+    #[test]
+    fn leading_cd_is_literal_canonical_and_independent_of_cdpath() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("with space");
+        std::fs::create_dir(&child).unwrap();
+        let result = leading_cd("cd 'with space' && node --test", temp.path(), None).unwrap();
+        assert_eq!(
+            result,
+            (child.canonicalize().unwrap(), "node --test".to_owned())
+        );
+        assert!(
+            leading_cd(
+                "cd 'with space' && node --test",
+                temp.path(),
+                Some(OsStr::new("/different"))
+            )
+            .is_none()
+        );
+        let absolute = format!(
+            "cd -- {} && node --test",
+            shell_words::quote(child.to_str().unwrap())
+        );
+        assert!(leading_cd(&absolute, temp.path(), Some(OsStr::new("/different"))).is_some());
+        for command in [
+            "cd - && node --test",
+            "cd $HOME && node --test",
+            "cd $(pwd) && node --test",
+            "cd .; node --test",
+            "cd . || node --test",
+            "cd",
+            "cd . &&",
+        ] {
+            assert!(
+                leading_cd(command, temp.path(), None).is_none(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_environment_binds_only_spelled_out_values() {
+        let parent = BTreeMap::from([
+            (OsString::from("PATH"), OsString::from("/parent/bin")),
+            (OsString::from("SECRET"), OsString::from("not forwarded")),
+        ]);
+        let bound = bound_environment(
+            "env -i HOME='/tmp/with space' PATH=/usr/bin:/bin EMPTY= cargo test",
+            &parent,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(bound.program, "cargo");
+        assert_eq!(bound.values.len(), 3);
+        assert_eq!(bound.values[OsStr::new("HOME")], "/tmp/with space");
+        assert_eq!(bound.values[OsStr::new("PATH")], "/usr/bin:/bin");
+        assert_eq!(bound.values[OsStr::new("EMPTY")], "");
+        assert_eq!(bound.wrapper, Some(("env".into(), "/parent/bin".into())));
+    }
+
+    #[test]
+    fn expansions_unsupported_options_and_missing_path_remain_unbound() {
+        for command in [
+            "env -i HOME=$HOME PATH=/bin cargo test",
+            "env -i HOME=$(pwd) PATH=/bin cargo test",
+            "env -i HOME=`pwd` PATH=/bin cargo test",
+            "env -i HOME=~ PATH=/bin cargo test",
+            "env -i HOME=/tmp/* PATH=/bin cargo test",
+            "env -i HOME=/tmp cargo test",
+            "env -i -u HOME PATH=/bin cargo test",
+            "PATH=$PATH cargo test",
+        ] {
+            assert!(
+                bound_environment(command, &BTreeMap::new()).is_err(),
+                "{command}"
+            );
+        }
+        let bound = bound_environment("env -i HOME=/tmp /usr/bin/true", &BTreeMap::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.program, "/usr/bin/true");
+        assert!(
+            bound_environment("cargo test", &BTreeMap::new())
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourceRole {
     Executable,

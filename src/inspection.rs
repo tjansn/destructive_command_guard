@@ -14,6 +14,7 @@ use crate::heredoc::ScriptLanguage;
 pub enum Outcome {
     Dangerous,
     Dynamic,
+    BoundInputs,
     Limit,
     ReviewUnavailable,
 }
@@ -41,6 +42,7 @@ impl Outcome {
         match self {
             Self::Dangerous => "definite-dangerous-operation",
             Self::Dynamic => "unsupported-dynamic",
+            Self::BoundInputs => "bound-input-review",
             Self::Limit => "analysis-limit",
             Self::ReviewUnavailable => "review-unavailable-or-cancelled",
         }
@@ -50,6 +52,7 @@ impl Outcome {
         match self {
             Self::Dangerous => "Destructive Command Detected",
             Self::Dynamic => "Inspection Incomplete",
+            Self::BoundInputs => "Literal Inputs Need Review",
             Self::Limit => "Analysis Limit Reached",
             Self::ReviewUnavailable => "Review Not Approved",
         }
@@ -62,6 +65,9 @@ impl Outcome {
             }
             Self::Dynamic => {
                 "Executable inputs remain unresolved. Use bounded literal inputs, sandbox verification, or exact-version desktop review; command-only codes cannot resolve this boundary."
+            }
+            Self::BoundInputs => {
+                "Literal environment values can be bound for one-request desktop review. Use a hook with desktop review enabled; no reusable trial approval or command-only exception applies."
             }
             Self::Limit => {
                 "Static analysis reached a resource limit. A bounded parse-only retry cannot authorize execution; reduce the input or request desktop review."
@@ -77,6 +83,9 @@ impl Outcome {
 pub fn outcome(pack: Option<&str>, pattern: Option<&str>, reason: &str) -> Outcome {
     if reason.contains("[dcg:review-unavailable-or-cancelled]") {
         return Outcome::ReviewUnavailable;
+    }
+    if reason.contains("[dcg:bound-input-review]") {
+        return Outcome::BoundInputs;
     }
     if reason.contains("[dcg:analysis-limit]")
         || reason.contains("AST matching error")

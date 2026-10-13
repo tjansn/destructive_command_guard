@@ -2402,7 +2402,8 @@ fn main() {
     {
         // The host executes this replacement once. Do not trial, learn or
         // emit an ordinary allow receipt for the original command.
-        let delivered = hook::output_confined_rewrite(&hook_input, &invocation);
+        let delivered =
+            hook::output_confined_rewrite(&hook_input, &invocation, config.trial.confined_loopback);
         drop(history_writer);
         finish_hook_mode(if delivered.is_ok() {
             EXIT_SUCCESS
@@ -2610,6 +2611,7 @@ fn confined_invocation(
         input.dcg_input_rewrite.as_ref() == Some(&serde_json::Value::Bool(true)),
     )?;
     confined::Request::new(command, cwd, &shell, timeout)
+        .with_loopback(ctx.config.trial.confined_loopback)
         .invocation(&std::env::current_exe().ok()?)
         .ok()
 }

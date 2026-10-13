@@ -30,6 +30,7 @@ pub struct Request {
     pub cwd: PathBuf,
     pub shell: PathBuf,
     pub timeout_secs: u64,
+    pub loopback: crate::config::ConfinedLoopback,
 }
 
 impl Request {
@@ -40,7 +41,13 @@ impl Request {
             cwd: cwd.to_path_buf(),
             shell: shell.to_path_buf(),
             timeout_secs: timeout_secs.clamp(1, 600),
+            loopback: crate::config::ConfinedLoopback::None,
         }
+    }
+
+    pub const fn with_loopback(mut self, loopback: crate::config::ConfinedLoopback) -> Self {
+        self.loopback = loopback;
+        self
     }
 
     /// Base64url carries the original command as data, without shell metacharacters.
@@ -87,7 +94,16 @@ impl Request {
 /// Unresolved runner sources remain confined for their entire execution.
 /// Known definite denials are checked by the hook before rewriting.
 pub fn eligible(command: &str, cwd: &Path) -> bool {
-    finite(command, cwd, 0)
+    execution(command, cwd).is_some()
+}
+
+fn execution(command: &str, cwd: &Path) -> Option<(PathBuf, String)> {
+    if finite(command, cwd, 0) {
+        return Some((cwd.to_path_buf(), command.to_owned()));
+    }
+    let (target, inner) =
+        crate::invocation::leading_cd(command, cwd, std::env::var_os("CDPATH").as_deref())?;
+    finite(&inner, &target, 0).then_some((target, inner))
 }
 
 fn finite(command: &str, cwd: &Path, depth: usize) -> bool {
@@ -291,14 +307,25 @@ pub struct RunResult {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn run(request: &Request, _temporary_root: &Path) -> Result<RunResult, String> {
+pub fn run(
+    request: &Request,
+    _temporary_root: &Path,
+    _trusted_loopback: crate::config::ConfinedLoopback,
+) -> Result<RunResult, String> {
     request.validate()?;
     Err("continuing confinement requires macOS Seatbelt".to_owned())
 }
 
 #[cfg(target_os = "macos")]
-pub fn run(request: &Request, temporary_root: &Path) -> Result<RunResult, String> {
+pub fn run(
+    request: &Request,
+    temporary_root: &Path,
+    trusted_loopback: crate::config::ConfinedLoopback,
+) -> Result<RunResult, String> {
     request.validate()?;
+    if request.loopback != trusted_loopback {
+        return Err("trusted localhost policy changed or differs from the confined receipt; command was not started".to_owned());
+    }
     native::execute(request, temporary_root).map_err(|e| e.to_string())
 }
 
@@ -326,6 +353,35 @@ mod tests {
         assert_eq!(decoded.cwd, request.cwd);
         assert!(Request::decode(&"x".repeat(COMMAND_CAP * 4 + 1)).is_err());
         assert!(Request::decode("not%base64").is_err());
+    }
+
+    #[test]
+    fn one_leading_cd_resolves_the_finite_command_and_rejects_further_chains() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("literal dir");
+        std::fs::create_dir(&target).unwrap();
+        let prefix = format!("cd {} && ", shell_words::quote(target.to_str().unwrap()));
+        let command = format!("{prefix}node --test case.test.js");
+        assert_eq!(
+            execution(&command, temp.path()),
+            Some((
+                target.canonicalize().unwrap(),
+                "node --test case.test.js".into()
+            ))
+        );
+        for suffix in [
+            "node --test && echo done",
+            "cd .. && node --test",
+            "node --test; echo done",
+            "node --test | cat",
+            "node --test &",
+            "node --watch --test",
+        ] {
+            assert!(
+                !eligible(&format!("{prefix}{suffix}"), temp.path()),
+                "{suffix}"
+            );
+        }
     }
 
     #[test]
@@ -439,11 +495,31 @@ mod tests {
             HookProtocol::Codex,
             "claude-code"
         ));
-        let output = hook::confined_rewrite(&input, "encoded-fixture").unwrap();
+        let output = hook::confined_rewrite(
+            &input,
+            "encoded-fixture",
+            crate::config::ConfinedLoopback::None,
+        )
+        .unwrap();
         let mut expected = raw["tool_input"].clone();
         expected["command"] = serde_json::json!("encoded-fixture");
         assert_eq!(output["hookSpecificOutput"]["updatedInput"], expected);
         assert_eq!(output["dcg_verdict"], "confined");
+        assert_eq!(output["hookSpecificOutput"]["approvalScope"], "confined");
+        assert_eq!(output["hookSpecificOutput"]["confinedLoopback"], "none");
+        let open = hook::confined_rewrite(
+            &input,
+            "encoded-fixture",
+            crate::config::ConfinedLoopback::All,
+        )
+        .unwrap();
+        assert_eq!(open["hookSpecificOutput"]["confinedLoopback"], "all");
+        assert!(
+            open["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("open to all host services")
+        );
         let mut raw = raw;
         raw["dcg_input_rewrite"] = serde_json::json!(true);
         let input = hook::parse_hook_input(&raw.to_string()).unwrap();
@@ -625,7 +701,9 @@ mod native {
 
     pub(super) fn execute(request: &Request, temporary_root: &Path) -> io::Result<RunResult> {
         let started = Instant::now();
-        let cwd = request.cwd.canonicalize()?;
+        let (cwd, execution_command) = execution(&request.command, &request.cwd)
+            .ok_or_else(|| io::Error::other("finite invocation changed before execution"))?;
+        let cwd = cwd.canonicalize()?;
         let (project, writable, protected) = boundaries(&cwd)?;
         let directory = tempfile::Builder::new()
             .prefix("dcg-confined-")
@@ -637,7 +715,13 @@ mod native {
         fs::create_dir(&temp)?;
         let tag = format!("dcg-confined-{:032x}", rand::random::<u128>());
         let profile = crate::trial_profile::confined_profile(
-            &project, &home, &temp, &tag, &writable, &protected,
+            &project,
+            &home,
+            &temp,
+            &tag,
+            &writable,
+            &protected,
+            request.loopback,
         );
         if profile.len() > 64 * 1024 {
             return Err(io::Error::other(
@@ -688,7 +772,7 @@ mod native {
         let mut child = Command::new("/usr/bin/sandbox-exec");
         child.args(["-p", &profile, "/bin/sh", "-c"])
             .arg("ulimit -t \"$1\"; ulimit -f 131072; ulimit -n 256; if [ \"$2\" = /bin/zsh ]; then \"$2\" -f -c \"$3\"; else \"$2\" -c \"$3\"; fi; result=$?; /usr/bin/touch \"$4\" 2>/dev/null; exit \"$result\"")
-            .arg("dcg-confined").arg(remaining.as_secs().max(1).to_string()).arg(&request.shell).arg(&request.command).arg(&end_canary)
+            .arg("dcg-confined").arg(remaining.as_secs().max(1).to_string()).arg(&request.shell).arg(&execution_command).arg(&end_canary)
             .current_dir(&cwd).env_clear().envs(environment(std::env::vars_os(), &home, &temp));
         let output = capture(&mut child, remaining, OUTPUT_CAP)?;
         let mut issues = Vec::new();
@@ -735,6 +819,14 @@ mod native {
                 .any(|p| v.target.contains(&p.display().to_string()))
         });
         let mut stderr = output.stderr;
+        {
+            use std::io::Write as _;
+            writeln!(
+                stderr,
+                "\n[dcg:confined-policy] {}",
+                request.loopback.receipt()
+            )?;
+        }
         for violation in &violations {
             use std::io::Write as _;
             writeln!(

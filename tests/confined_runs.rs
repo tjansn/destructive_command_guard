@@ -4,6 +4,7 @@
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use destructive_command_guard::config::ConfinedLoopback;
     use destructive_command_guard::confined::{self, Request, RunResult};
     use std::fs;
     use std::io::{Read, Write};
@@ -85,14 +86,24 @@ mod macos {
         }
 
         fn run(&self, timeout_secs: u64) -> Result<RunResult, String> {
+            self.run_with_loopback(timeout_secs, ConfinedLoopback::None)
+        }
+
+        fn run_with_loopback(
+            &self,
+            timeout_secs: u64,
+            loopback: ConfinedLoopback,
+        ) -> Result<RunResult, String> {
             confined::run(
                 &Request::new(
                     "node --test ./case.test.cjs",
                     &self.project,
                     Path::new("/bin/sh"),
                     timeout_secs,
-                ),
+                )
+                .with_loopback(loopback),
                 &self.runtime,
+                loopback,
             )
         }
 
@@ -272,50 +283,133 @@ mod macos {
     }
 
     #[test]
-    fn a_preexisting_loopback_http_deputy_cannot_mutate_its_fixture_victim() {
-        let fixture = Fixture::new("");
-        let victim = fixture.root.join("deputy-victim.txt");
-        fs::write(&victim, "unchanged").unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture loopback listener");
-        listener.set_nonblocking(true).unwrap();
-        let address = listener.local_addr().unwrap();
-        let stopped = Arc::new(AtomicBool::new(false));
-        let stop = Arc::clone(&stopped);
-        let target = victim.clone();
-        let server = std::thread::spawn(move || {
-            let started = Instant::now();
-            while !stop.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(25) {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    stream
-                        .set_read_timeout(Some(Duration::from_millis(500)))
-                        .unwrap();
-                    let mut request = [0; 1024];
-                    if stream.read(&mut request).unwrap_or(0) > 0 {
-                        fs::write(&target, "delegated mutation").unwrap();
-                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    fn trusted_all_explicitly_accepts_preexisting_loopback_deputies() {
+        for loopback in [ConfinedLoopback::None, ConfinedLoopback::All] {
+            let fixture = Fixture::new("");
+            let victim = fixture.root.join("deputy-victim.txt");
+            fs::write(&victim, "unchanged").unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").expect("fixture loopback listener");
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let stopped = Arc::new(AtomicBool::new(false));
+            let stop = Arc::clone(&stopped);
+            let target = victim.clone();
+            let server = std::thread::spawn(move || {
+                let started = Instant::now();
+                while !stop.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(25) {
+                    if let Ok((mut stream, _)) = listener.accept() {
+                        stream
+                            .set_read_timeout(Some(Duration::from_millis(500)))
+                            .unwrap();
+                        let mut request = [0; 1024];
+                        if stream.read(&mut request).unwrap_or(0) > 0 {
+                            fs::write(&target, "delegated mutation").unwrap();
+                            let _ =
+                                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                        }
                     }
+                    std::thread::sleep(Duration::from_millis(5));
                 }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        });
-        fixture.replace_body(&format!(
+            });
+            fixture.replace_body(&format!(
             "await new Promise((resolve, reject) => {{\n\
              const request = require('node:http').get('http://{address}/mutate', response => {{ response.resume(); response.on('end', resolve); }});\n\
              request.on('error', reject);\n\
              request.setTimeout(2000, () => request.destroy(new Error('fixture network timeout')));\n\
              }});"
         ));
-        let result = fixture.run(15);
-        stopped.store(true, Ordering::SeqCst);
-        server.join().expect("join fixture deputy");
-        let result = result.expect("loopback deputy fixture result");
-        assert_violation(&result, "network", &format!(":{}", address.port()));
-        assert!(
-            String::from_utf8_lossy(&result.stdout).contains("127.0.0.1"),
-            "{}",
-            details(&result)
+            let result = fixture.run_with_loopback(15, loopback);
+            stopped.store(true, Ordering::SeqCst);
+            server.join().expect("join fixture deputy");
+            let result = result.expect("loopback deputy fixture result");
+            if loopback == ConfinedLoopback::None {
+                assert_violation(&result, "network", &format!(":{}", address.port()));
+                assert!(
+                    String::from_utf8_lossy(&result.stdout).contains("127.0.0.1"),
+                    "{}",
+                    details(&result)
+                );
+                assert_eq!(fs::read_to_string(victim).unwrap(), "unchanged");
+            } else {
+                assert_eq!(result.exit_code, 0, "{}", details(&result));
+                assert_eq!(fs::read_to_string(victim).unwrap(), "delegated mutation");
+            }
+        }
+    }
+
+    #[test]
+    fn owned_tcp_listeners_require_the_trusted_all_opt_in() {
+        for loopback in [ConfinedLoopback::None, ConfinedLoopback::All] {
+            for (listen, connect) in [
+                ("127.0.0.1", "127.0.0.1"),
+                ("::1", "::1"),
+                ("127.0.0.1", "::ffff:127.0.0.1"),
+            ] {
+                let body = format!(
+                    "const net = require('node:net');\n\
+                     const server = net.createServer(socket => socket.end('fixture response'));\n\
+                     await new Promise((resolve, reject) => {{ server.once('error', reject); server.listen(0, '{listen}', resolve); }});\n\
+                     try {{\n\
+                       const result = await new Promise(resolve => {{\n\
+                         const socket = net.connect(server.address().port, '{connect}');\n\
+                         socket.setTimeout(2000, () => {{ socket.destroy(); resolve('TIMEOUT'); }});\n\
+                         socket.once('data', data => {{ socket.destroy(); resolve(data.toString()); }});\n\
+                         socket.once('error', error => resolve(error.code));\n\
+                       }});\n\
+                       assert.equal(result, '{}');\n\
+                     }} finally {{ await new Promise(resolve => server.close(resolve)); }}",
+                    if loopback == ConfinedLoopback::All {
+                        "fixture response"
+                    } else {
+                        "EPERM"
+                    }
+                );
+                let fixture = Fixture::new(&body);
+                let result = fixture.run_with_loopback(15, loopback).unwrap();
+                assert_eq!(
+                    result.exit_code,
+                    0,
+                    "{loopback:?} {connect}: {}",
+                    details(&result)
+                );
+                assert!(!result.timed_out, "{}", details(&result));
+                assert!(String::from_utf8_lossy(&result.stderr).contains(loopback.receipt()));
+            }
+        }
+    }
+
+    #[test]
+    fn localhost_opt_in_does_not_open_non_loopback_tcp() {
+        let fixture = Fixture::new(
+            "const result = await new Promise(resolve => {\n\
+               const socket = require('node:net').connect(9, '192.0.2.1');\n\
+               socket.setTimeout(2000, () => { socket.destroy(); resolve('TIMEOUT'); });\n\
+               socket.once('connect', () => { socket.destroy(); resolve('CONNECTED'); });\n\
+               socket.once('error', error => resolve(error.code));\n\
+             });\n\
+             assert.equal(result, 'EPERM');",
         );
-        assert_eq!(fs::read_to_string(victim).unwrap(), "unchanged");
+        let result = fixture
+            .run_with_loopback(15, ConfinedLoopback::All)
+            .unwrap();
+        assert_eq!(result.exit_code, 0, "{}", details(&result));
+        assert!(!result.timed_out);
+    }
+
+    #[test]
+    fn receipt_cannot_enable_localhost_without_matching_trusted_config() {
+        let fixture =
+            Fixture::new("fs.mkdirSync('build'); fs.writeFileSync('build/marker', 'executed');");
+        let request = Request::new(
+            "node --test ./case.test.cjs",
+            &fixture.project,
+            Path::new("/bin/sh"),
+            15,
+        )
+        .with_loopback(ConfinedLoopback::All);
+        let error = confined::run(&request, &fixture.runtime, ConfinedLoopback::None).unwrap_err();
+        assert!(error.contains("differs from the confined receipt"));
+        assert!(!fixture.project.join("build/marker").exists());
     }
 
     #[test]
@@ -430,8 +524,10 @@ mod macos {
         let temp_root = std::env::temp_dir().canonicalize().unwrap();
         assert!(temp_root.starts_with(&temporary) && temp_root != temporary);
         let result = confined::run(
-            &Request::new("npm test", &cwd, Path::new("/bin/sh"), 180),
+            &Request::new("npm test", &cwd, Path::new("/bin/sh"), 595)
+                .with_loopback(ConfinedLoopback::All),
             &temp_root,
+            ConfinedLoopback::All,
         )
         .expect("run the prepared temporary pi-os copy under continuing confinement");
         let stdout = String::from_utf8_lossy(&result.stdout);

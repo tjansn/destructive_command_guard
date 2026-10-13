@@ -117,6 +117,14 @@ fn unverified(reason: &str) -> EvaluationResult {
         &format!("Script-file inspection incomplete: {reason}"),
     );
     if let Some(info) = result.pattern_info.as_mut() {
+        if reason.contains("[dcg:bound-input-review]") {
+            info.explanation = Some(
+                crate::inspection::Outcome::BoundInputs
+                    .remediation()
+                    .to_owned(),
+            );
+            return result;
+        }
         info.explanation = Some(
             "Static inspection could not establish the executable sources. A sandbox trial \
              or desktop review must verify this exact project, command and source version. \
@@ -251,7 +259,7 @@ fn references(command: &str, deadline: &Deadline) -> Result<Vec<Reference>, Stri
                     "PATH" | "NODE_OPTIONS" | "NODE_PATH" | "LD_PRELOAD" | "LD_LIBRARY_PATH"
                 ) || name.starts_with("DYLD_")
             }) {
-                return Err("execution-affecting environment assignment requires review".to_owned());
+                return Err(environment_review_reason(command));
             }
             if let Some((name, value)) = assignment.split_once('=')
                 && matches!(name, "BASH_ENV" | "ENV")
@@ -319,6 +327,15 @@ fn assignment(raw: &str) -> bool {
     })
 }
 
+fn environment_review_reason(source: &str) -> String {
+    let parent = std::env::vars_os().collect();
+    match crate::invocation::bound_environment(source, &parent) {
+        Ok(Some(_)) => "[dcg:bound-input-review] Literal environment assignments require review of this exact invocation; no reusable trial approval will be recorded.".to_owned(),
+        Err(reason) => reason,
+        Ok(None) => "execution-affecting environment requires explicit input review".to_owned(),
+    }
+}
+
 fn command_references(source: &str) -> Result<Vec<Reference>, String> {
     // env's assignment operands are removed by the shared wrapper normalizer.
     // Preserve shell startup sources before normalizing those operands away.
@@ -336,7 +353,7 @@ fn command_references(source: &str) -> Result<Vec<Reference>, String> {
             })
         })
     {
-        return Err("execution-affecting environment assignment requires review".to_owned());
+        return Err(environment_review_reason(source));
     }
     let startup: Vec<_> = words
         .iter()

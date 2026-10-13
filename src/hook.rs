@@ -853,7 +853,11 @@ pub fn supports_confined_rewrite(input: &HookInput, protocol: HookProtocol, agen
 }
 
 /// Preserve the complete tool object: Claude's updatedInput replaces it.
-pub fn confined_rewrite(input: &HookInput, rewritten: &str) -> Option<serde_json::Value> {
+pub fn confined_rewrite(
+    input: &HookInput,
+    rewritten: &str,
+    loopback: crate::config::ConfinedLoopback,
+) -> Option<serde_json::Value> {
     let mut updated = input.raw_tool_input.clone()?;
     updated
         .as_object_mut()?
@@ -861,14 +865,20 @@ pub fn confined_rewrite(input: &HookInput, rewritten: &str) -> Option<serde_json
     Some(
         serde_json::json!({"dcg_verdict": "confined", "hookSpecificOutput": {
             "hookEventName": "PreToolUse", "permissionDecision": "allow",
-            "permissionDecisionReason": "Run once under continuing confinement; no unconfined approval or learned grant.",
+            "permissionDecisionReason": format!("Run once under continuing confinement; no unconfined approval or learned grant. {}", loopback.receipt()),
+            "confinedLoopback": loopback,
+            "approvalScope": crate::desktop_review::ApprovalScope::Confined,
             "updatedInput": updated
         }}),
     )
 }
 
-pub fn output_confined_rewrite(input: &HookInput, rewritten: &str) -> io::Result<()> {
-    let output = confined_rewrite(input, rewritten)
+pub fn output_confined_rewrite(
+    input: &HookInput,
+    rewritten: &str,
+    loopback: crate::config::ConfinedLoopback,
+) -> io::Result<()> {
+    let output = confined_rewrite(input, rewritten, loopback)
         .ok_or_else(|| io::Error::other("original tool input unavailable"))?;
     let mut bytes = serde_json::to_vec(&output)?;
     bytes.push(b'\n');

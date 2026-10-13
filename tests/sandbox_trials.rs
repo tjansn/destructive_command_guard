@@ -37,6 +37,17 @@ mod macos {
         }
 
         fn run(&self, timeout_secs: u64) -> TrialReport {
+            self.run_with_loopback(
+                timeout_secs,
+                destructive_command_guard::config::ConfinedLoopback::None,
+            )
+        }
+
+        fn run_with_loopback(
+            &self,
+            timeout_secs: u64,
+            confined_loopback: destructive_command_guard::config::ConfinedLoopback,
+        ) -> TrialReport {
             let fingerprint = self
                 .store
                 .fingerprint("/bin/sh ./run.sh", &self.project, Path::new("/bin/sh"), &[])
@@ -47,6 +58,7 @@ mod macos {
                 Path::new("/bin/sh"),
                 &TrialConfig {
                     timeout_secs,
+                    confined_loopback,
                     ..TrialConfig::default()
                 },
                 self.temp.path(),
@@ -437,14 +449,15 @@ mod macos {
     }
 
     #[test]
-    fn loopback_exchange_requires_review_without_endpoint_ownership_proof() {
+    fn trial_loopback_stays_closed_even_when_confined_loopback_is_all() {
         // Use curl for the connect syscall: Python can report a preflight
         // permission error without producing a tagged kernel network event.
         // Its parent owns the listener; the same sandbox still denies TCP out.
         let fixture = Fixture::new(
             "python3 -S -c 'import socket,subprocess,sys; s=socket.socket(); s.bind((\"127.0.0.1\",0)); s.listen(1); sys.exit(subprocess.run([\"/usr/bin/curl\",\"--noproxy\",\"*\",\"--max-time\",\"2\",\"-sS\",\"http://127.0.0.1:%d/\"%s.getsockname()[1]]).returncode)'",
         );
-        let report = fixture.run(10);
+        let report =
+            fixture.run_with_loopback(10, destructive_command_guard::config::ConfinedLoopback::All);
         assert_eq!(
             report.observations.verdict(),
             Verdict::Inconclusive,
