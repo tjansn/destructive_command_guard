@@ -62,8 +62,13 @@ impl Fixture {
     }
 
     fn run(&self, candidate: &str) -> (Output, Value) {
+        self.run_with_path(candidate, &std::env::var_os("PATH").unwrap_or_default())
+    }
+
+    fn run_with_path(&self, candidate: &str, path: &std::ffi::OsStr) -> (Output, Value) {
         let mut child = self
             .command()
+            .env("PATH", path)
             .args([
                 "--robot",
                 "test",
@@ -742,6 +747,66 @@ fn literal_env_diagnostics_offer_bound_review_without_a_command_only_code() {
     }
 }
 
+#[test]
+fn ordinary_assignment_prefixes_preserve_static_decisions_with_script_scanning() {
+    let fixture = Fixture::new();
+    fixture.write("package.json", r#"{"scripts":{"test":"echo safe"}}"#);
+    fixture.write("input.txt", "fixture\n");
+    // These are tom.10's static allow cases. Exercise the full evaluator with
+    // scan_script_files=true, including an unusable PATH in the hook process.
+    // The candidates remain data; no npm, Swift, Git or grep command is run.
+    for path in ["/usr/bin:/bin", "", ".:/usr/bin", ":/usr/bin", "bin:/usr/bin"] {
+        for (candidate, plain) in [
+            ("CI=1 npm test", "npm test"),
+            ("GIT_PAGER=cat git log", "git log"),
+            ("LC_ALL=C grep fixture input.txt", "grep fixture input.txt"),
+            ("TZ=UTC date", "date"),
+            ("PI_OFFLINE=1 PI_OS_AGENT=0 swift test", "swift test"),
+            ("FOO=$BAR git log", "git log"),
+            ("FOO=~/fixture git log", "git log"),
+            ("FOO=*.txt git log", "git log"),
+            ("FOO={one,two} git log", "git log"),
+            ("env FOO=$BAR git log", "git log"),
+            ("env -- CI=1 npm test", "npm test"),
+            ("CI=1 env TZ=UTC date", "date"),
+        ] {
+            let (baseline_output, baseline) = fixture.run_with_path(plain, path.as_ref());
+            assert_eq!(baseline["decision"], "allow", "{plain}: {baseline}");
+            let (output, result) = fixture.run_with_path(candidate, path.as_ref());
+            assert_eq!(
+                result["decision"], baseline["decision"],
+                "{candidate}: {result}"
+            );
+            assert_eq!(result["rule_id"], baseline["rule_id"], "{candidate}: {result}");
+            assert_eq!(output.status.code(), baseline_output.status.code());
+        }
+    }
+}
+
+#[test]
+fn local_preload_prefixes_keep_trial_diagnostics_with_script_scanning() {
+    let fixture = Fixture::new();
+    fixture.write("package.json", r#"{"scripts":{"build":"echo safe"}}"#);
+    for path in ["/usr/bin:/bin", "", ".:/usr/bin"] {
+        for candidate in [
+            "PYTHONPATH=src pytest",
+            "NODE_OPTIONS=--max-old-space-size=4096 npm run build",
+            "env PYTHONPATH=src pytest",
+            "env NODE_OPTIONS=--max-old-space-size=4096 npm run build",
+            "PYTHONPATH=$SOURCE pytest",
+            "CI=1 PYTHONPATH=src pytest",
+            "CI=1 env CI=1 env PYTHONPATH=src pytest",
+        ] {
+            let (_, result) = fixture.run_with_path(candidate, path.as_ref());
+            assert_eq!(result["rule_id"], "heredoc.script_files:unverified", "{result}");
+            let text = result.to_string();
+            assert!(text.contains("dcg trial run"), "{candidate}: {text}");
+            assert!(!text.contains("bound-input-review"), "{candidate}: {text}");
+            assert!(!text.contains("cannot be approved"), "{candidate}: {text}");
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn literal_environment_does_not_hide_a_definite_script_denial() {
@@ -755,6 +820,12 @@ fn literal_environment_does_not_hide_a_definite_script_denial() {
         "env -i HOME=/tmp/h PATH=/usr/bin:/bin node scripts/check.js",
         "PATH=/usr/bin:/bin node scripts/check.js",
         "env -i HOME=/tmp/h PATH=/usr/bin:/bin node < scripts/check.js",
+        "CI=1 node scripts/check.js",
+        "FOO=$BAR node scripts/check.js",
+        "PYTHONPATH=src node scripts/check.js",
+        "NODE_OPTIONS=--max-old-space-size=4096 node scripts/check.js",
+        "env NODE_OPTIONS=--max-old-space-size=4096 node scripts/check.js",
+        "env NODE_OPTIONS=--max-old-space-size=4096 node < scripts/check.js",
     ] {
         fixture.destructive(candidate, "scripts/check.js");
     }
@@ -787,7 +858,7 @@ fn disabled_trials_use_one_time_review_without_opening_the_approval_store() {
         "home/.config/dcg/verified_trials.json",
         "invalid fixture store",
     );
-    let candidate = format!("DCG_FIXTURE=1 /bin/true {}", "x".repeat(6_000));
+    let candidate = format!("PATH=/usr/bin:/bin /bin/true {}", "x".repeat(6_000));
     let input = json!({"tool_name":"Bash", "tool_input":{"command":candidate}, "cwd":fixture.root});
     let mut child = fixture
         .command()

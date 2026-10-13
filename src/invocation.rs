@@ -95,6 +95,65 @@ pub(crate) fn preload_variable(name: &str) -> bool {
         )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnvironmentReview {
+    None,
+    Trial,
+    Bound,
+}
+
+/// Classify only the command prefix, without interpreting assignment values or
+/// consulting the hook's environment. Ordinary prefixes retain normal inspection,
+/// including dynamic values; PATH and env -i need the stricter binding below.
+pub(crate) fn environment_review(source: &str) -> EnvironmentReview {
+    use crate::normalize::{NormalizeTokenKind, is_env_assignment, tokenize_for_normalization};
+    let tokens = tokenize_for_normalization(source);
+    let mut words = tokens
+        .iter()
+        .take_while(|token| token.kind == NormalizeTokenKind::Word)
+        .map(|token| {
+            let raw = &source[token.byte_range.clone()];
+            shell_words::split(raw)
+                .ok()
+                .and_then(|words| words.into_iter().next())
+                .unwrap_or_else(|| raw.to_owned())
+        })
+        .peekable();
+    let mut review = EnvironmentReview::None;
+    // Walk assignment/env prefixes only. Classification does not authorize
+    // nested wrappers: literal binding still rejects them in ensure_reviewable.
+    loop {
+        while words.peek().is_some_and(|word| is_env_assignment(word)) {
+            let word = words.next().expect("peeked assignment");
+            let (name, _) = word.split_once('=').expect("assignment name");
+            let name = name.strip_suffix('+').unwrap_or(name);
+            let name = name.split_once('[').map_or(name, |(name, _)| name);
+            if name == "PATH" {
+                return EnvironmentReview::Bound;
+            }
+            if preload_variable(name) {
+                review = EnvironmentReview::Trial;
+            }
+        }
+        if words
+            .next()
+            .is_none_or(|word| word.rsplit('/').next() != Some("env"))
+        {
+            break;
+        }
+        if words
+            .peek()
+            .is_some_and(|word| matches!(word.as_str(), "-i" | "--ignore-environment"))
+        {
+            return EnvironmentReview::Bound;
+        }
+        if words.peek().is_some_and(|word| word == "--") {
+            words.next();
+        }
+    }
+    review
+}
+
 fn absolute_search_path(path: &std::ffi::OsStr) -> Result<(), String> {
     // POSIX command data can also be inspected on Windows (e.g. git-bash).
     // Keep slash-rooted POSIX PATH syntax separate from native guard paths.
@@ -121,6 +180,9 @@ pub(crate) fn bound_environment(
     parent: &std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
 ) -> Result<Option<BoundEnvironment>, String> {
     use crate::normalize::{NormalizeTokenKind, tokenize_for_normalization};
+    if environment_review(source) != EnvironmentReview::Bound {
+        return Ok(None);
+    }
     let tokens = tokenize_for_normalization(source);
     let mut values = parent.clone();
     let mut index = 0;
@@ -355,7 +417,40 @@ mod literal_environment_tests {
     }
 
     #[test]
-    fn bound_environment_rejects_local_and_inherited_preload_state() {
+    fn ordinary_prefixes_never_bind_values_or_the_inherited_path() {
+        for path in ["", ".:/usr/bin", ":/usr/bin", "bin:/usr/bin", "/usr/bin:"] {
+            let parent = BTreeMap::from([(OsString::from("PATH"), OsString::from(path))]);
+            for command in [
+                "GIT_PAGER=cat git log",
+                "CI=1 npm test",
+                "LC_ALL=C grep fixture input.txt",
+                "TZ=UTC date",
+                "PI_OFFLINE=1 PI_OS_AGENT=0 swift test",
+                "FOO=$BAR git log",
+                "FOO=~/fixture git log",
+                "FOO=*.txt git log",
+                "FOO={one,two} git log",
+                "env FOO=$BAR git log",
+                "env -- CI=1 npm test",
+                "CI=1 env TZ=UTC date",
+                "printf '%s' PATH=/relative",
+            ] {
+                assert_eq!(environment_review(command), EnvironmentReview::None);
+                assert!(bound_environment(command, &parent).unwrap().is_none());
+            }
+        }
+        for command in [
+            "FOO=$BAR PATH=/bin cargo test",
+            "env CI=1 PATH=/bin cargo test",
+            "CI=1 env -i /bin/true",
+            "PATH+=:/bin cargo test",
+        ] {
+            assert_eq!(environment_review(command), EnvironmentReview::Bound);
+        }
+    }
+
+    #[test]
+    fn local_preloads_use_trials_but_cannot_enter_literal_environment_review() {
         for name in [
             "NODE_OPTIONS",
             "NODE_PATH",
@@ -365,6 +460,17 @@ mod literal_environment_tests {
             "PYTHONPATH",
         ] {
             let command = format!("{name}=fixture /usr/bin/true");
+            assert_eq!(environment_review(&command), EnvironmentReview::Trial);
+            assert_eq!(
+                environment_review(&format!("CI=1 env CI=1 env {command}")),
+                EnvironmentReview::Trial
+            );
+            assert!(
+                bound_environment(&command, &BTreeMap::new())
+                    .unwrap()
+                    .is_none()
+            );
+            let command = format!("/usr/bin/env -i {command}");
             assert!(
                 bound_environment(&command, &BTreeMap::new())
                     .unwrap()

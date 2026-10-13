@@ -1560,6 +1560,49 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn local_preloads_keep_trial_resolution_and_bind_their_raw_values() {
+        use std::os::unix::fs::PermissionsExt;
+        let (temp, project, store) = fixture();
+        let executable = project.join("fixture-program");
+        fs::write(&executable, "fixture executable").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let program = shell_words::quote(executable.to_str().unwrap());
+        for path in ["/usr/bin:/bin", "", ".:/usr/bin", ":/usr/bin"] {
+            let parent = BTreeMap::from([(OsString::from("PATH"), OsString::from(path))]);
+            for prefix in [
+                "CI=1",
+                "FOO=$BAR",
+                "PYTHONPATH=src",
+                "PYTHONPATH=$SOURCE",
+                "NODE_OPTIONS=--max-old-space-size=4096",
+                "LD_PRELOAD=./preload.so",
+                "BASH_ENV=./startup.sh",
+                "/usr/bin/env PYTHONPATH=src",
+            ] {
+                let command = format!("{prefix} {program}");
+                let (files, bound) = resolved_executables(&command, &project, &parent).unwrap();
+                assert!(!bound, "{command} must remain eligible for a trial");
+                assert!(files.contains(&executable.canonicalize().unwrap()));
+            }
+        }
+        let capture = |prefix: &str| {
+            store
+                .fingerprint(
+                    &format!("{prefix} {program}"),
+                    &project,
+                    &temp.path().join("shell"),
+                    &[],
+                )
+                .unwrap()
+        };
+        let first = capture("PYTHONPATH=src");
+        let changed = capture("PYTHONPATH=other");
+        assert_ne!(first.digest, changed.digest);
+        assert_eq!(first.reproducible, capture("CI=1").reproducible);
+    }
+
     #[test]
     fn one_time_fingerprint_ignores_existing_grants_and_never_touches_the_store() {
         let (temp, project, store) = fixture();

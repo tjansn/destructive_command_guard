@@ -283,6 +283,16 @@ fn references(
                 }
             } else {
                 references.extend(command_references(&text)?);
+                if crate::invocation::environment_review(&text)
+                    == crate::invocation::EnvironmentReview::Trial
+                {
+                    // Local preload/startup values are executed by the trial's
+                    // shell. They must not become a literal-environment approval
+                    // or hide a definite finding in the program's source.
+                    review_reason.get_or_insert_with(|| {
+                        "execution-affecting environment assignment requires review".to_owned()
+                    });
+                }
             }
             if references.len() > MAX_FILES {
                 return Err("too many executable file references".to_string());
@@ -388,10 +398,10 @@ fn command_references(source: &str) -> Result<Vec<Reference>, String> {
     if is_env
         && words.iter().any(|word| {
             word.split_once('=').is_some_and(|(name, _)| {
-                matches!(
-                    name,
-                    "PATH" | "NODE_OPTIONS" | "NODE_PATH" | "LD_PRELOAD" | "LD_LIBRARY_PATH"
-                ) || name.starts_with("DYLD_")
+                name == "PATH"
+                    || (crate::invocation::preload_variable(name)
+                        && crate::invocation::environment_review(source)
+                            != crate::invocation::EnvironmentReview::Trial)
             })
         })
     {
@@ -1266,6 +1276,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn local_preload_marker_is_resolved_only_by_the_trial_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        fs::write(cwd.join("check.sh"), "echo safe\n").unwrap();
+        fs::write(cwd.join("startup.sh"), "echo startup\n").unwrap();
+        for command in [
+            "PYTHONPATH=src bash check.sh",
+            "PYTHONPATH=$SOURCE bash check.sh",
+            "NODE_OPTIONS=--max-old-space-size=4096 bash check.sh",
+            "env NODE_OPTIONS=--max-old-space-size=4096 bash check.sh",
+            "CI=1 env CI=1 env NODE_OPTIONS=--max-old-space-size=4096 bash check.sh",
+            "env NODE_OPTIONS=--max-old-space-size=4096 bash < check.sh",
+            "BASH_ENV=./startup.sh bash check.sh",
+            "env BASH_ENV=./startup.sh bash check.sh",
+        ] {
+            for relaxed in [false, true] {
+                let mut inspected = false;
+                let result = evaluate(
+                    command,
+                    Some(&cwd),
+                    ShellDialect::Posix,
+                    false,
+                    None,
+                    relaxed,
+                    |_, path, _| {
+                        inspected |= path == cwd.join("check.sh");
+                        EvaluationResult::allowed()
+                    },
+                );
+                assert!(inspected, "{command}, relaxed={relaxed}");
+                if relaxed {
+                    assert!(result.is_none(), "{command}: {result:?}");
+                } else {
+                    let info = result.unwrap().pattern_info.unwrap();
+                    assert_eq!(info.pattern_name.as_deref(), Some("unverified"));
+                    assert_eq!(
+                        crate::inspection::outcome(
+                            info.pack_id.as_deref(),
+                            info.pattern_name.as_deref(),
+                            &info.reason,
+                        ),
+                        crate::inspection::Outcome::Dynamic
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn env_prefix_keeps_definite_findings_and_sources_in_the_relaxed_pass() {
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().canonicalize().unwrap();
@@ -1276,6 +1335,12 @@ mod tests {
                 "bash check.sh",
                 "env -i HOME=/tmp/h PATH=/usr/bin:/bin bash check.sh",
                 "env -i PATH=/usr/bin:/bin bash < check.sh",
+                "CI=1 bash check.sh",
+                "FOO=$BAR bash check.sh",
+                "PYTHONPATH=src bash check.sh",
+                "NODE_OPTIONS=--max-old-space-size=4096 bash check.sh",
+                "env NODE_OPTIONS=--max-old-space-size=4096 bash check.sh",
+                "env NODE_OPTIONS=--max-old-space-size=4096 bash < check.sh",
             ] {
                 let capture = crate::desktop_review::ReviewCapture::start();
                 let mut inspected = false;

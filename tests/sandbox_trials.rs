@@ -774,6 +774,40 @@ mod macos {
     }
 
     #[test]
+    fn hook_local_preloads_run_trials_and_reuse_only_the_exact_version() {
+        let fixture = Fixture::new("mkdir -p build; printf safe > build/out");
+        for command in [
+            "PYTHONPATH=src /bin/sh ./run.sh",
+            "NODE_OPTIONS=--max-old-space-size=4096 /bin/sh ./run.sh",
+            "/usr/bin/env PYTHONPATH=src /bin/sh ./run.sh",
+        ] {
+            let output = hook(&fixture, command);
+            assert!(output.status.success());
+            assert!(
+                output.stdout.is_empty(),
+                "{command}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("verifying `"), "{command}: {stderr}");
+            assert!(
+                stderr.contains("observed safe in one sandboxed run"),
+                "{command}: {stderr}"
+            );
+            assert!(!fixture.project.join("build").exists());
+            let cached = hook(&fixture, command);
+            assert!(cached.status.success() && cached.stdout.is_empty());
+            let stderr = String::from_utf8_lossy(&cached.stderr);
+            assert!(!stderr.contains("verifying `"), "{command}: {stderr}");
+            assert!(
+                stderr.contains("observed safe in one sandboxed run"),
+                "{command}: {stderr}"
+            );
+        }
+    }
+
+    #[test]
     fn hook_unverified_node_allows_observed_version_and_denies_malicious() {
         let fixture = Fixture::new("mkdir -p build; cat source.txt > build/out");
         fs::write(
