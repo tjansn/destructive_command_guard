@@ -13,20 +13,35 @@ const deny = { hookSpecificOutput: {
   permissionDecision: "deny", permissionDecisionReason: "Human declined",
 } };
 const confinedCommand = "/fixture/dcg run --confined --request 7b7d";
-const confined = { dcg_verdict: "confined", hookSpecificOutput: {
-  permissionDecision: "allow", updatedInput: { command: confinedCommand, timeout: 1 },
+const confined = { dcg_verdict: "confined", dcg_approval_scope: "confined", dcg_confined_loopback: "none", hookSpecificOutput: {
+  hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: { command: confinedCommand, timeout: 1 },
 } };
+const update = (updatedInput, permissionDecision = "allow") => ({ ...confined,
+  hookSpecificOutput: { ...confined.hookSpecificOutput, permissionDecision, updatedInput },
+});
 const cases = [
   { name: "explicit_allow", code: 0, verdict: { dcg_verdict: "allow" }, blocked: false },
   { name: "confined_rewrites_in_place", code: 0, verdict: confined, blocked: false, rewritten: true },
+  { name: "confined_all_loopback_rewrites_in_place", code: 0, verdict: { ...confined, dcg_confined_loopback: "all" }, blocked: false, rewritten: true },
+  { name: "confined_missing_scope", code: 0, verdict: { ...confined, dcg_approval_scope: undefined }, blocked: true },
+  { name: "confined_invalid_scope", code: 0, verdict: { ...confined, dcg_approval_scope: "one_time" }, blocked: true },
+  { name: "confined_missing_loopback", code: 0, verdict: { ...confined, dcg_confined_loopback: undefined }, blocked: true },
+  { name: "confined_invalid_loopback", code: 0, verdict: { ...confined, dcg_confined_loopback: "owned" }, blocked: true },
+  { name: "confined_nonstring_loopback", code: 0, verdict: { ...confined, dcg_confined_loopback: true }, blocked: true },
+  { name: "confined_nested_metadata_only", code: 0, verdict: {
+    dcg_verdict: "confined", hookSpecificOutput: { ...confined.hookSpecificOutput, approvalScope: "confined", confinedLoopback: "all" },
+  }, blocked: true },
+  { name: "confined_wrong_hook_event", code: 0, verdict: { ...confined,
+    hookSpecificOutput: { ...confined.hookSpecificOutput, hookEventName: "PostToolUse" },
+  }, blocked: true },
   { name: "confined_wrong_exit", code: 1, verdict: confined, blocked: true },
-  { name: "confined_missing_update", code: 0, verdict: { dcg_verdict: "confined", hookSpecificOutput: { permissionDecision: "allow" } }, blocked: true },
-  { name: "confined_null_update", code: 0, verdict: { dcg_verdict: "confined", hookSpecificOutput: { permissionDecision: "allow", updatedInput: null } }, blocked: true },
-  { name: "confined_missing_command", code: 0, verdict: { dcg_verdict: "confined", hookSpecificOutput: { permissionDecision: "allow", updatedInput: { timeout: 1 } } }, blocked: true },
-  { name: "confined_nonstring_command", code: 0, verdict: { dcg_verdict: "confined", hookSpecificOutput: { permissionDecision: "allow", updatedInput: { command: 42 } } }, blocked: true },
-  { name: "confined_empty_command", code: 0, verdict: { dcg_verdict: "confined", hookSpecificOutput: { permissionDecision: "allow", updatedInput: { command: "" } } }, blocked: true },
-  { name: "confined_blank_command", code: 0, verdict: { dcg_verdict: "confined", hookSpecificOutput: { permissionDecision: "allow", updatedInput: { command: " \t " } } }, blocked: true },
-  { name: "confined_ask_permission", code: 0, verdict: { dcg_verdict: "confined", hookSpecificOutput: { permissionDecision: "ask", updatedInput: { command: confinedCommand } } }, blocked: true },
+  { name: "confined_missing_update", code: 0, verdict: update(undefined), blocked: true },
+  { name: "confined_null_update", code: 0, verdict: update(null), blocked: true },
+  { name: "confined_missing_command", code: 0, verdict: update({ timeout: 1 }), blocked: true },
+  { name: "confined_nonstring_command", code: 0, verdict: update({ command: 42 }), blocked: true },
+  { name: "confined_empty_command", code: 0, verdict: update({ command: "" }), blocked: true },
+  { name: "confined_blank_command", code: 0, verdict: update({ command: " \t " }), blocked: true },
+  { name: "confined_ask_permission", code: 0, verdict: update({ command: confinedCommand }, "ask"), blocked: true },
   { name: "confined_immutable_input", code: 0, verdict: confined, blocked: true, immutable: true },
   { name: "json_deny_exit_zero", code: 0, verdict: deny, blocked: true },
   { name: "json_deny_exit_two", code: 2, verdict: deny, blocked: true },

@@ -53,8 +53,14 @@ ownership probes, not a replacement isolation backend. Non-loopback outbound and
 the existing read/write/Mach restrictions stay denied. Observational trials always
 keep deny-all outbound TCP, even with this setting.
 
-The rewrite receipt includes `approvalScope = "confined"`, `confinedLoopback` and
-plain-language policy text; the runner repeats that policy on stderr. The request
+The rewrite receipt includes top-level `dcg_approval_scope = "confined"` and
+`dcg_confined_loopback` metadata. The pi bridge requires both fields and a valid
+`PreToolUse` replacement before changing the command. `hookSpecificOutput`
+contains only documented Claude Code fields: `hookEventName`, `permissionDecision`,
+`permissionDecisionReason` and `updatedInput`. This avoids relying on undocumented
+acceptance of nested extension fields; the [official hook schema](https://code.claude.com/docs/en/hooks#pretooluse-decision-control)
+does not specify how unknown nested fields are handled.
+The receipt includes plain-language policy text; the runner repeats it on stderr. The request
 binds the choice, and the runner rejects it if current trusted config differs.
 Automatically discovered project config cannot enable it. No reusable approval is
 created by a confined run in either mode.

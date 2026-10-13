@@ -594,15 +594,30 @@ mod tests {
         expected["command"] = serde_json::json!("encoded-fixture");
         assert_eq!(output["hookSpecificOutput"]["updatedInput"], expected);
         assert_eq!(output["dcg_verdict"], "confined");
-        assert_eq!(output["hookSpecificOutput"]["approvalScope"], "confined");
-        assert_eq!(output["hookSpecificOutput"]["confinedLoopback"], "none");
+        assert_eq!(output["dcg_approval_scope"], "confined");
+        assert_eq!(output["dcg_confined_loopback"], "none");
+        let keys: std::collections::BTreeSet<_> = output["hookSpecificOutput"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "hookEventName",
+                "permissionDecision",
+                "permissionDecisionReason",
+                "updatedInput",
+            ])
+        );
         let open = hook::confined_rewrite(
             &input,
             "encoded-fixture",
             crate::config::ConfinedLoopback::All,
         )
         .unwrap();
-        assert_eq!(open["hookSpecificOutput"]["confinedLoopback"], "all");
+        assert_eq!(open["dcg_confined_loopback"], "all");
         assert!(
             open["hookSpecificOutput"]["permissionDecisionReason"]
                 .as_str()
