@@ -50,6 +50,50 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   for the project reuses them. Manage them with `dcg allowlist list|remove|prune`.
   See [approved scripts](docs/learned-approvals.md#approved-scripts).
 
+### 0.15.3+tom.15
+
+- **Archive-only tar from Python with constant argv is no longer a tar
+  helper (fork #1, upstream #562).** `subprocess.run(["tar", "-czf", OUT, SRC])`
+  with module-level string or `pathlib.Path` constants hit
+  `core.filesystem:tar-exec-unverified`. Module constants that are assigned once
+  and never rebound (including `Path(...) / "x"` and `.parent`/`.name`) now
+  resolve in exec argv; anything rebindable stays unknown.
+- **New rule `core.filesystem:tar-options-unresolved` (fork #1).** Tar options
+  whose values are only known at runtime, with no helper visible anywhere in the
+  invocation, now report this rule instead of `tar-exec-unverified`. It joins the
+  sandbox-trial, Touch ID and approved-scripts route. An identified helper
+  (`--to-command`, checkpoint actions, compressors, info/rmt/rsh scripts) and
+  literal option text the parser does not model keep `tar-exec-unverified` and
+  stay outside that route; an approved script still denies a literal
+  `--to-command=sh`. Existing allowlist and policy entries for
+  `tar-exec-unverified` keep covering the new rule unless an entry names it.
+- **Desktop review says why it did not approve (fork #2).** Denials now carry
+  `review-not-started`, `review-declined`, `review-expired` or
+  `review-unavailable-or-cancelled` (busy, Touch ID helper missing or changed,
+  inputs changed during the dialog), each with its own remediation. None of
+  them tells an agent to retry. The helper reports its own 120-second deadline
+  as `expired`. A remote/namespace script (`ssh host '…'`) now gets a specific
+  not-started reason with a next step instead of "too large for a complete
+  dialog". Long script sources are excerpted in the dialog (path, line count,
+  SHA-256 prefix, hidden-line note) instead of making the review fail. The
+  approval still binds every byte, and the exact command is never shortened.
+- **Adopted from upstream main, cherry-picked with `-x`:** history storage
+  caps and recovery (#433 and follow-ups), zero-width external pack rules
+  rejected (#558), OpenCode v2 `shell` tool and rename guard (#547), Git Bash
+  `cmd //c` switches (#561), the literal budget charged only for substitution
+  candidates (#560), kernel module unloads (`modprobe -r`, `rmmod`, also over
+  ssh), regex work exhaustion failing closed, recursive mutations through
+  protected path aliases, and MCP checks preserving an explicit shell dialect.
+  The #555 performance port is now recorded as merged.
+- **Held back from upstream main `369eaa06`:** it fails its own tests on macOS
+  (13 library tests plus the #549, #558 and #560 integration suites). The #558
+  IFS word-splitting series does not block on macOS
+  (`S=/tmp/a@/etc/profile; IFS=@; tee $S` is allowed) and over-blocks
+  `rm$IFSX -rf /tmp/x`. The #560 masking series hides the body of
+  `python3 <<'PY' script.py` from inspection and loses `node - <<'DOC' | sh`
+  eval visibility (#544). The tempfile change depends on both. They stay out
+  until upstream passes these tests on macOS.
+
 ## [v0.15.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.3) -- 2026-10-08 [Release]
 
 This release closes commands that ran unguarded (Claude Code's `Monitor`

@@ -238,6 +238,7 @@ These patterns match potentially destructive commands:
 |--------------|--------|----------|
 | `sed-exec-unverified` | GNU sed executes shell input that dcg cannot statically verify. | high |
 | `tar-exec-unverified` | GNU tar executes a helper whose command or executable input dcg cannot statically verify. | high |
+| `tar-options-unresolved` | GNU tar options contain unresolved values or unsupported option syntax; an unresolved value may be a helper option. | high |
 | `cp-sensitive-then-delete` | archive copy of a sensitive path into temp followed by forced recursive deletion is a cross-segment data-loss bypass. EXTREMELY DANGEROUS. | critical |
 | `ln-symlink-sensitive-then-delete` | symlink from a sensitive path into temp followed by forced recursive deletion can traverse and destroy the target. EXTREMELY DANGEROUS. | critical |
 | `rsync-sensitive-then-delete` | rsync archive of a sensitive path into temp followed by forced recursive deletion is a cross-segment data-loss bypass. EXTREMELY DANGEROUS. | critical |

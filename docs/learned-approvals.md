@@ -53,8 +53,19 @@ live focus recovery with Orca remains an operator acceptance step before install
 ## Approved scripts
 
 When script-file inspection cannot fully verify a command
-(`heredoc.script_files:unverified`) and you approve it with Touch ID, dcg remembers
-the approval as `approved_scripts` (dialog title **Skripte prüfen und merken**).
+(`heredoc.script_files:unverified`, or `core.filesystem:tar-options-unresolved` for
+a script whose tar options are only known at runtime) and you approve it with Touch
+ID, dcg remembers the approval as `approved_scripts` (dialog title **Skripte prüfen
+und merken**). A tar helper dcg identified but cannot verify
+(`core.filesystem:tar-exec-unverified`: `--to-command`, checkpoint actions,
+compression programs, volume/rmt scripts) is never covered, even inside an approved
+script. Existing allowlist and policy entries for `tar-exec-unverified` also cover
+`tar-options-unresolved` unless an entry names that rule itself.
+
+Long scripts are excerpted in the dialog: each shows its path, line count and a
+SHA-256 prefix, and a note says how many lines are hidden. The approval still binds
+every byte of every reviewed script. The exact command is always shown in full; if
+it alone does not fit, no dialog is offered.
 The approval binds:
 
 - the exact command text and its canonical working directory in the project;
