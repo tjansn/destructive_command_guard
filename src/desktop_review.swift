@@ -14,20 +14,21 @@ final class ReviewPanelSurface: NSView {
     static let padding: CGFloat = 20
     static let radius: CGFloat = 28
     let clip = NSView()
-    private let shadow = CALayer()
+    // Not `shadow`: that name would override NSView's NSShadow property.
+    private let shadowLayer = CALayer()
     private let shadowCutout = CAShapeLayer()
 
     init(material: NSView) {
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
-        shadow.shadowColor = NSColor.black.cgColor
-        shadow.shadowOpacity = 0.22
-        shadow.shadowRadius = 10
-        shadow.shadowOffset = CGSize(width: 0, height: -3)
+        shadowLayer.shadowColor = NSColor.black.cgColor
+        shadowLayer.shadowOpacity = 0.22
+        shadowLayer.shadowRadius = 10
+        shadowLayer.shadowOffset = CGSize(width: 0, height: -3)
         shadowCutout.fillRule = .evenOdd
-        shadow.mask = shadowCutout
-        layer?.addSublayer(shadow)
+        shadowLayer.mask = shadowCutout
+        layer?.addSublayer(shadowLayer)
         clip.wantsLayer = true
         clip.layer?.cornerRadius = Self.radius
         clip.layer?.masksToBounds = true
@@ -51,10 +52,10 @@ final class ReviewPanelSurface: NSView {
         clip.frame = panel
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        shadow.frame = bounds
+        shadowLayer.frame = bounds
         let outline = CGPath(roundedRect: panel, cornerWidth: Self.radius,
                              cornerHeight: Self.radius, transform: nil)
-        shadow.shadowPath = outline
+        shadowLayer.shadowPath = outline
         let cutout = CGMutablePath()
         cutout.addRect(bounds)
         cutout.addPath(outline)
