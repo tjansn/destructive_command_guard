@@ -4,7 +4,10 @@
 //! checks without shell-hook overhead.
 
 use crate::config::Config;
-use crate::evaluator::{EvaluationDecision, evaluate_command};
+use crate::evaluator::{
+    EvaluationDecision, evaluate_command_with_pack_order_at_path_in_dialect,
+};
+use crate::normalize::ShellDialect;
 use crate::packs::REGISTRY;
 use crate::scan::{
     ScanEvalContext, ScanFailOn, ScanFormat, ScanOptions, ScanRedactMode, ScanReport, scan_paths,
@@ -42,6 +45,7 @@ struct AllowlistInfo {
 struct CheckCommandResponse {
     allowed: bool,
     decision: String,
+    dialect: &'static str,
     mode: Option<String>,
     skipped_due_to_budget: bool,
     reason: Option<String>,
@@ -158,6 +162,27 @@ impl DcgMcpServer {
         map
     }
 
+    fn check_command_schema() -> ToolInputSchema {
+        let mut dialect = Self::string_schema(
+            "Execution shell: posix, powershell, cmd, or unknown. Supply a known dialect only when the executing shell is known; omission retains conservative multi-shell analysis.",
+        );
+        dialect.insert(
+            "enum".to_string(),
+            serde_json::json!(["unknown", "posix", "powershell", "cmd"]),
+        );
+        dialect.insert("default".to_string(), serde_json::json!("unknown"));
+        Self::tool_input_schema(
+            &["command"],
+            vec![
+                (
+                    "command",
+                    Self::string_schema("Command to evaluate without executing it"),
+                ),
+                ("dialect", dialect),
+            ],
+        )
+    }
+
     fn tool(name: &str, description: &str, schema: ToolInputSchema) -> Tool {
         Tool {
             name: name.to_string(),
@@ -191,6 +216,34 @@ impl DcgMcpServer {
         Ok(value.to_string())
     }
 
+    fn dialect_arg(args: Option<&Map<String, Value>>) -> Result<ShellDialect, CallToolError> {
+        // An omitted dialect is not evidence of POSIX, including on Unix.
+        // Conversely, reject an explicit unsupported value rather than
+        // silently evaluating a different shell from the caller's request.
+        match args.and_then(|args| args.get("dialect")) {
+            None => Ok(ShellDialect::Unknown),
+            Some(Value::String(value)) => match value.as_str() {
+                "unknown" => Ok(ShellDialect::Unknown),
+                "posix" => Ok(ShellDialect::Posix),
+                "powershell" => Ok(ShellDialect::PowerShell),
+                "cmd" => Ok(ShellDialect::Cmd),
+                _ => Err(Self::call_tool_error(
+                    "Invalid 'dialect': expected unknown, posix, powershell, or cmd",
+                )),
+            },
+            Some(_) => Err(Self::call_tool_error("Invalid 'dialect': expected a string")),
+        }
+    }
+
+    fn check_command_arguments(
+        &self,
+        args: Option<&Map<String, Value>>,
+    ) -> Result<CheckCommandResponse, CallToolError> {
+        let command = Self::string_arg(args, "command")?;
+        let dialect = Self::dialect_arg(args)?;
+        Ok(self.check_command(&command, dialect))
+    }
+
     fn rule_id_from_match(pack_id: Option<&str>, pattern_name: Option<&str>) -> Option<String> {
         match (pack_id, pattern_name) {
             (Some(pack), Some(name)) => Some(format!("{pack}:{name}")),
@@ -198,14 +251,23 @@ impl DcgMcpServer {
         }
     }
 
-    fn check_command(&self, command: &str) -> CheckCommandResponse {
+    fn check_command(&self, command: &str, dialect: ShellDialect) -> CheckCommandResponse {
+        // Preserve the policy scope and configured extraction budget used by
+        // evaluate_command; ScanEvalContext's larger scan-file timeout is not
+        // the command-check timeout.
+        let heredoc_settings = self.config.heredoc_settings();
+        let _rule_target_scope = crate::config::RuleTargetExemptionScope::install(&self.config);
         let evaluate = |command: &str, allowlists: &crate::allowlist::LayeredAllowlist| {
-            evaluate_command(
+            evaluate_command_with_pack_order_at_path_in_dialect(
                 command,
-                &self.config,
                 &self.scan_ctx.enabled_keywords,
+                &self.scan_ctx.ordered_packs,
+                self.scan_ctx.keyword_index.as_ref(),
                 &self.scan_ctx.compiled_overrides,
                 allowlists,
+                &heredoc_settings,
+                None,
+                dialect,
             )
         };
         // A warn/log/ask first match must not hide a later deny (#498).
@@ -225,6 +287,12 @@ impl DcgMcpServer {
         let mut response = CheckCommandResponse {
             allowed,
             decision: decision.to_string(),
+            dialect: match dialect {
+                ShellDialect::Unknown => "unknown",
+                ShellDialect::Posix => "posix",
+                ShellDialect::PowerShell => "powershell",
+                ShellDialect::Cmd => "cmd",
+            },
             mode,
             skipped_due_to_budget: result.skipped_due_to_budget,
             reason: None,
@@ -353,10 +421,7 @@ impl ServerHandler for DcgMcpServer {
             Self::tool(
                 "check_command",
                 "Evaluate a command using dcg policy",
-                Self::tool_input_schema(
-                    &["command"],
-                    vec![("command", Self::string_schema("Command to evaluate"))],
-                ),
+                Self::check_command_schema(),
             ),
             Self::tool(
                 "scan_file",
@@ -396,8 +461,7 @@ impl ServerHandler for DcgMcpServer {
     ) -> Result<CallToolResult, CallToolError> {
         match params.name.as_str() {
             "check_command" => {
-                let command = Self::string_arg(params.arguments.as_ref(), "command")?;
-                let response = self.check_command(&command);
+                let response = self.check_command_arguments(params.arguments.as_ref())?;
                 Self::tool_result_json(&response)
             }
             "scan_file" => {
@@ -512,6 +576,102 @@ mod tests {
         );
     }
 
+    #[test]
+    fn check_command_dialect_schema_and_parser_agree() {
+        let schema = serde_json::to_value(DcgMcpServer::check_command_schema()).unwrap();
+        assert_eq!(schema["required"], serde_json::json!(["command"]));
+        assert_eq!(schema["properties"]["dialect"]["default"], "unknown");
+        let spellings = schema["properties"]["dialect"]["enum"].as_array().unwrap();
+        assert_eq!(spellings.len(), 4);
+        for (name, expected) in [
+            ("unknown", ShellDialect::Unknown),
+            ("posix", ShellDialect::Posix),
+            ("powershell", ShellDialect::PowerShell),
+            ("cmd", ShellDialect::Cmd),
+        ] {
+            assert!(spellings.contains(&serde_json::json!(name)));
+            let args = serde_json::json!({"command": "git status", "dialect": name});
+            assert_eq!(DcgMcpServer::dialect_arg(args.as_object()).unwrap(), expected);
+        }
+        assert_eq!(
+            DcgMcpServer::dialect_arg(None).unwrap(),
+            ShellDialect::Unknown
+        );
+        assert_eq!(
+            DcgMcpServer::dialect_arg(Some(&Map::new())).unwrap(),
+            ShellDialect::Unknown
+        );
+    }
+
+    #[test]
+    fn check_command_rejects_explicit_invalid_dialects() {
+        for value in [
+            Value::Null,
+            serde_json::json!(false),
+            serde_json::json!(42),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!(""),
+            serde_json::json!("bash"),
+            serde_json::json!("POSIX"),
+            serde_json::json!("posix "),
+            serde_json::json!("future-shell"),
+        ] {
+            let args = serde_json::json!({"command": "git status", "dialect": value});
+            assert!(
+                DcgMcpServer::dialect_arg(args.as_object()).is_err(),
+                "an unsupported dialect must not silently select another shell: {args}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_command_arguments_preserve_shell_semantics_and_source() {
+        let mut server = DcgMcpServer::new();
+        let config = Config::default();
+        let mut context = ScanEvalContext::from_config(&config);
+        context.allowlists = crate::allowlist::LayeredAllowlist::default();
+        server.config = Arc::new(config);
+        server.scan_ctx = Arc::new(context);
+
+        // All commands are classifier data. In POSIX, the escaped ampersand
+        // remains echo's argument; cmd.exe still executes the git command.
+        for (command, dialect, allowed) in [
+            (r"echo ok \& git reset --hard", "posix", true),
+            (r"echo ok \& git reset --hard", "cmd", false),
+            (r"echo ok \& git reset --hard", "unknown", false),
+            ("echo ok & git reset --hard", "posix", false),
+            ("Write-Output ok; git reset --hard", "powershell", false),
+            ("git reset --hard", "posix", false),
+            ("git reset --hard", "cmd", false),
+            ("git reset --hard", "powershell", false),
+            ("git status", "posix", true),
+            ("git status", "cmd", true),
+            ("git status", "powershell", true),
+            ("git status", "unknown", true),
+        ] {
+            let args = serde_json::json!({"command": command, "dialect": dialect});
+            let original = args.clone();
+            let response = server.check_command_arguments(args.as_object()).unwrap();
+            assert_eq!(response.allowed, allowed, "{dialect}: {command}");
+            assert_eq!(response.decision, if allowed { "allow" } else { "deny" });
+            assert_eq!(response.dialect, dialect);
+            assert_eq!(args, original, "the adapter must preserve the command bytes");
+            if !allowed {
+                assert_eq!(response.rule_id.as_deref(), Some("core.git:reset-hard"));
+            }
+        }
+        let omitted = serde_json::json!({"command": r"echo ok \& git reset --hard"});
+        let response = server.check_command_arguments(omitted.as_object()).unwrap();
+        assert!(
+            !response.allowed,
+            "an omitted dialect retains the conservative union"
+        );
+        assert_eq!(response.dialect, "unknown");
+        assert!(server.check_command_arguments(None).is_err());
+        assert!(server.check_command_arguments(Some(&Map::new())).is_err());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn blocking_scan_worker_does_not_starve_lightweight_checks() {
         let server = DcgMcpServer::new();
@@ -533,7 +693,7 @@ mod tests {
                 while !scan_started.load(Ordering::SeqCst) {
                     tokio::task::yield_now().await;
                 }
-                server.check_command("git status")
+                server.check_command("git status", ShellDialect::Unknown)
             })
             .await
             .expect("blocking scan should not starve the async runtime");
