@@ -50,6 +50,14 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   for the project reuses them. Manage them with `dcg allowlist list|remove|prune`.
   See [approved scripts](docs/learned-approvals.md#approved-scripts).
 
+### 0.15.3+tom.18
+
+- **The Touch ID dialog is readable over any window.** Its clear Liquid Glass
+  let the backdrop through: nearly see-through over dark windows, and white
+  text on light grey over light ones. The panel now uses regular glass under
+  a mostly opaque (86 %) window-background fill, in light and dark mode and on
+  the older-macOS material; the paused panel stays fully opaque.
+
 ### 0.15.3+tom.17
 
 - **Security: a process substitution could move a script check to the wrong
