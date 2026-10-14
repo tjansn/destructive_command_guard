@@ -1,0 +1,1452 @@
+[
+  {
+    "history": "disabled",
+    "case": "short_ls",
+    "status": "available",
+    "measurement": {
+      "schema_version": 1,
+      "clock": "monotonic_wall",
+      "scope": "hook",
+      "total_ns": 2796451,
+      "uninstrumented_ns": 10254,
+      "phases": {
+        "input_read": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 5098,
+          "exclusive_ns": 5098
+        },
+        "request_parse": {
+          "calls": 2,
+          "completed_calls": 2,
+          "elapsed_ns": 41922,
+          "exclusive_ns": 41922
+        },
+        "config_load": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 96202,
+          "exclusive_ns": 96202
+        },
+        "request_setup": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 458766,
+          "exclusive_ns": 315043
+        },
+        "self_heal": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "evaluation": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 2327431,
+          "exclusive_ns": 32037
+        },
+        "normalization": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 201,
+          "exclusive_ns": 201
+        },
+        "heredoc_detect": {
+          "calls": 2,
+          "completed_calls": 2,
+          "elapsed_ns": 2292590,
+          "exclusive_ns": 2292590
+        },
+        "heredoc_extract": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_evaluation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_selection": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_preparation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_rules": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "shell_tokenization": {
+          "calls": 6,
+          "completed_calls": 6,
+          "elapsed_ns": 1051,
+          "exclusive_ns": 1051
+        },
+        "shell_segmentation": {
+          "calls": 6,
+          "completed_calls": 6,
+          "elapsed_ns": 2404,
+          "exclusive_ns": 1322
+        },
+        "heredoc_masking": {
+          "calls": 4,
+          "completed_calls": 4,
+          "elapsed_ns": 731,
+          "exclusive_ns": 731
+        },
+        "ast_parse": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "ast_pattern_compile": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "ast_match": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_init": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_record": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_flush": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        }
+      },
+      "worker_phases": {
+        "input_read": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "request_parse": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "config_load": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "request_setup": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "self_heal": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "evaluation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "normalization": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "heredoc_detect": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "heredoc_extract": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_evaluation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_selection": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_preparation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_rules": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "shell_tokenization": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "shell_segmentation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "heredoc_masking": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "ast_parse": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "ast_pattern_compile": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "ast_match": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_init": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_record": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_flush": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        }
+      }
+    },
+    "wire": {
+      "expected_decision": "allow",
+      "observed_decision": "allow",
+      "rule_id": null,
+      "returncode": 0,
+      "stdout_bytes": 0,
+      "stderr_bytes": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  {
+    "history": "disabled",
+    "case": "python_40_safe",
+    "status": "available",
+    "measurement": {
+      "schema_version": 1,
+      "clock": "monotonic_wall",
+      "scope": "hook",
+      "total_ns": 38879820,
+      "uninstrumented_ns": 25007,
+      "phases": {
+        "input_read": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 7011,
+          "exclusive_ns": 7011
+        },
+        "request_parse": {
+          "calls": 2,
+          "completed_calls": 2,
+          "elapsed_ns": 14282,
+          "exclusive_ns": 14282
+        },
+        "config_load": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 65166,
+          "exclusive_ns": 65166
+        },
+        "request_setup": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 732900,
+          "exclusive_ns": 464122
+        },
+        "self_heal": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "evaluation": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 38121913,
+          "exclusive_ns": 987962
+        },
+        "normalization": {
+          "calls": 3,
+          "completed_calls": 3,
+          "elapsed_ns": 1250764,
+          "exclusive_ns": 1190425
+        },
+        "heredoc_detect": {
+          "calls": 2,
+          "completed_calls": 2,
+          "elapsed_ns": 45958,
+          "exclusive_ns": 45958
+        },
+        "heredoc_extract": {
+          "calls": 2,
+          "completed_calls": 2,
+          "elapsed_ns": 8512255,
+          "exclusive_ns": 4208012
+        },
+        "pattern_evaluation": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 30274288,
+          "exclusive_ns": 3667
+        },
+        "pattern_selection": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 230750,
+          "exclusive_ns": 221886
+        },
+        "pattern_preparation": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 1079631,
+          "exclusive_ns": 922769
+        },
+        "pattern_rules": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 28960240,
+          "exclusive_ns": 28568925
+        },
+        "shell_tokenization": {
+          "calls": 1823,
+          "completed_calls": 1823,
+          "elapsed_ns": 258857,
+          "exclusive_ns": 258857
+        },
+        "shell_segmentation": {
+          "calls": 65,
+          "completed_calls": 65,
+          "elapsed_ns": 254184,
+          "exclusive_ns": 210119
+        },
+        "heredoc_masking": {
+          "calls": 11,
+          "completed_calls": 11,
+          "elapsed_ns": 690127,
+          "exclusive_ns": 292239
+        },
+        "ast_parse": {
+          "calls": 34,
+          "completed_calls": 34,
+          "elapsed_ns": 612081,
+          "exclusive_ns": 612081
+        },
+        "ast_pattern_compile": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 311850,
+          "exclusive_ns": 311850
+        },
+        "ast_match": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 469482,
+          "exclusive_ns": 469482
+        },
+        "history_init": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_record": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_flush": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        }
+      },
+      "worker_phases": {
+        "input_read": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "request_parse": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "config_load": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "request_setup": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "self_heal": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "evaluation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "normalization": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "heredoc_detect": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "heredoc_extract": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_evaluation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_selection": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_preparation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_rules": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "shell_tokenization": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "shell_segmentation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "heredoc_masking": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "ast_parse": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 181668,
+          "exclusive_ns": 181668
+        },
+        "ast_pattern_compile": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "ast_match": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 243639,
+          "exclusive_ns": 61971
+        },
+        "history_init": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_record": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_flush": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        }
+      }
+    },
+    "wire": {
+      "expected_decision": "allow",
+      "observed_decision": "allow",
+      "rule_id": null,
+      "returncode": 0,
+      "stdout_bytes": 0,
+      "stderr_bytes": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  {
+    "history": "disabled",
+    "case": "python_300_safe",
+    "status": "available",
+    "measurement": {
+      "schema_version": 1,
+      "clock": "monotonic_wall",
+      "scope": "hook",
+      "total_ns": 85356025,
+      "uninstrumented_ns": 95712,
+      "phases": {
+        "input_read": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 8863,
+          "exclusive_ns": 8863
+        },
+        "request_parse": {
+          "calls": 2,
+          "completed_calls": 2,
+          "elapsed_ns": 21471,
+          "exclusive_ns": 21471
+        },
+        "config_load": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 92176,
+          "exclusive_ns": 92176
+        },
+        "request_setup": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 812978,
+          "exclusive_ns": 570050
+        },
+        "self_heal": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "evaluation": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 84447335,
+          "exclusive_ns": 3351219
+        },
+        "normalization": {
+          "calls": 3,
+          "completed_calls": 3,
+          "elapsed_ns": 6960268,
+          "exclusive_ns": 6816678
+        },
+        "heredoc_detect": {
+          "calls": 2,
+          "completed_calls": 2,
+          "elapsed_ns": 36784,
+          "exclusive_ns": 36784
+        },
+        "heredoc_extract": {
+          "calls": 2,
+          "completed_calls": 2,
+          "elapsed_ns": 7947944,
+          "exclusive_ns": 3873318
+        },
+        "pattern_evaluation": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 66053417,
+          "exclusive_ns": 2924
+        },
+        "pattern_selection": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 1284603,
+          "exclusive_ns": 1253808
+        },
+        "pattern_preparation": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 995828,
+          "exclusive_ns": 720152
+        },
+        "pattern_rules": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 63770062,
+          "exclusive_ns": 55295161
+        },
+        "shell_tokenization": {
+          "calls": 52133,
+          "completed_calls": 52133,
+          "elapsed_ns": 4147088,
+          "exclusive_ns": 4147088
+        },
+        "shell_segmentation": {
+          "calls": 325,
+          "completed_calls": 325,
+          "elapsed_ns": 5300809,
+          "exclusive_ns": 5053464
+        },
+        "heredoc_masking": {
+          "calls": 11,
+          "completed_calls": 11,
+          "elapsed_ns": 969538,
+          "exclusive_ns": 212081
+        },
+        "ast_parse": {
+          "calls": 34,
+          "completed_calls": 34,
+          "elapsed_ns": 1169022,
+          "exclusive_ns": 1169022
+        },
+        "ast_pattern_compile": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 277759,
+          "exclusive_ns": 277759
+        },
+        "ast_match": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 2358295,
+          "exclusive_ns": 2358295
+        },
+        "history_init": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_record": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_flush": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        }
+      },
+      "worker_phases": {
+        "input_read": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "request_parse": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "config_load": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "request_setup": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "self_heal": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "evaluation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "normalization": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "heredoc_detect": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "heredoc_extract": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_evaluation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_selection": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_preparation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_rules": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "shell_tokenization": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "shell_segmentation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "heredoc_masking": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "ast_parse": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 1723660,
+          "exclusive_ns": 1723660
+        },
+        "ast_pattern_compile": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "ast_match": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 2154555,
+          "exclusive_ns": 430895
+        },
+        "history_init": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_record": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_flush": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        }
+      }
+    },
+    "wire": {
+      "expected_decision": "allow",
+      "observed_decision": "allow",
+      "rule_id": null,
+      "returncode": 0,
+      "stdout_bytes": 0,
+      "stderr_bytes": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  {
+    "history": "disabled",
+    "case": "quoted_data_300",
+    "status": "available",
+    "measurement": {
+      "schema_version": 1,
+      "clock": "monotonic_wall",
+      "scope": "hook",
+      "total_ns": 60264205,
+      "uninstrumented_ns": 274023,
+      "phases": {
+        "input_read": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 10215,
+          "exclusive_ns": 10215
+        },
+        "request_parse": {
+          "calls": 2,
+          "completed_calls": 2,
+          "elapsed_ns": 29775,
+          "exclusive_ns": 29775
+        },
+        "config_load": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 57515,
+          "exclusive_ns": 57515
+        },
+        "request_setup": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 1518338,
+          "exclusive_ns": 1200949
+        },
+        "self_heal": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "evaluation": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 58471844,
+          "exclusive_ns": 3729742
+        },
+        "normalization": {
+          "calls": 3,
+          "completed_calls": 3,
+          "elapsed_ns": 33635743,
+          "exclusive_ns": 30856416
+        },
+        "heredoc_detect": {
+          "calls": 2,
+          "completed_calls": 2,
+          "elapsed_ns": 29984,
+          "exclusive_ns": 29984
+        },
+        "heredoc_extract": {
+          "calls": 2,
+          "completed_calls": 2,
+          "elapsed_ns": 9756037,
+          "exclusive_ns": 4568484
+        },
+        "pattern_evaluation": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 12874193,
+          "exclusive_ns": 8583
+        },
+        "pattern_selection": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 8503802,
+          "exclusive_ns": 8239037
+        },
+        "pattern_preparation": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 1090507,
+          "exclusive_ns": 3624
+        },
+        "pattern_rules": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 3271301,
+          "exclusive_ns": 3013070
+        },
+        "shell_tokenization": {
+          "calls": 6086,
+          "completed_calls": 6086,
+          "elapsed_ns": 1114194,
+          "exclusive_ns": 1114194
+        },
+        "shell_segmentation": {
+          "calls": 31,
+          "completed_calls": 31,
+          "elapsed_ns": 2220680,
+          "exclusive_ns": 1148682
+        },
+        "heredoc_masking": {
+          "calls": 11,
+          "completed_calls": 11,
+          "elapsed_ns": 2823652,
+          "exclusive_ns": 834912
+        },
+        "ast_parse": {
+          "calls": 29,
+          "completed_calls": 29,
+          "elapsed_ns": 2867714,
+          "exclusive_ns": 2867714
+        },
+        "ast_pattern_compile": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "ast_match": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 2277286,
+          "exclusive_ns": 2277286
+        },
+        "history_init": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_record": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_flush": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        }
+      },
+      "worker_phases": {
+        "input_read": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "request_parse": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "config_load": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "request_setup": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "self_heal": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "evaluation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "normalization": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "heredoc_detect": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "heredoc_extract": {
+          "calls": 2,
+          "completed_calls": 2,
+          "elapsed_ns": 3827371,
+          "exclusive_ns": 1376048
+        },
+        "pattern_evaluation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_selection": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_preparation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_rules": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "shell_tokenization": {
+          "calls": 2,
+          "completed_calls": 2,
+          "elapsed_ns": 288085,
+          "exclusive_ns": 288085
+        },
+        "shell_segmentation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "heredoc_masking": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 262707,
+          "exclusive_ns": 114359
+        },
+        "ast_parse": {
+          "calls": 3,
+          "completed_calls": 3,
+          "elapsed_ns": 266752,
+          "exclusive_ns": 266752
+        },
+        "ast_pattern_compile": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "ast_match": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 2047408,
+          "exclusive_ns": 2164
+        },
+        "history_init": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_record": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_flush": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        }
+      }
+    },
+    "wire": {
+      "expected_decision": "allow",
+      "observed_decision": "allow",
+      "rule_id": null,
+      "returncode": 0,
+      "stdout_bytes": 0,
+      "stderr_bytes": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  {
+    "history": "enabled",
+    "case": "short_ls",
+    "status": "available",
+    "measurement": {
+      "schema_version": 1,
+      "clock": "monotonic_wall",
+      "scope": "hook",
+      "total_ns": 5783193,
+      "uninstrumented_ns": 11377,
+      "phases": {
+        "input_read": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 5478,
+          "exclusive_ns": 5478
+        },
+        "request_parse": {
+          "calls": 2,
+          "completed_calls": 2,
+          "elapsed_ns": 11016,
+          "exclusive_ns": 11016
+        },
+        "config_load": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 60138,
+          "exclusive_ns": 60138
+        },
+        "request_setup": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 722935,
+          "exclusive_ns": 501158
+        },
+        "self_heal": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "evaluation": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 2691387,
+          "exclusive_ns": 35614
+        },
+        "normalization": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 330,
+          "exclusive_ns": 330
+        },
+        "heredoc_detect": {
+          "calls": 2,
+          "completed_calls": 2,
+          "elapsed_ns": 2652850,
+          "exclusive_ns": 2652850
+        },
+        "heredoc_extract": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_evaluation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_selection": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_preparation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_rules": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "shell_tokenization": {
+          "calls": 6,
+          "completed_calls": 6,
+          "elapsed_ns": 961,
+          "exclusive_ns": 961
+        },
+        "shell_segmentation": {
+          "calls": 6,
+          "completed_calls": 6,
+          "elapsed_ns": 2552,
+          "exclusive_ns": 1391
+        },
+        "heredoc_masking": {
+          "calls": 4,
+          "completed_calls": 4,
+          "elapsed_ns": 732,
+          "exclusive_ns": 732
+        },
+        "ast_parse": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "ast_pattern_compile": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "ast_match": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_init": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 144654,
+          "exclusive_ns": 144654
+        },
+        "history_record": {
+          "calls": 2,
+          "completed_calls": 2,
+          "elapsed_ns": 1192798,
+          "exclusive_ns": 1192798
+        },
+        "history_flush": {
+          "calls": 1,
+          "completed_calls": 1,
+          "elapsed_ns": 1164696,
+          "exclusive_ns": 1164696
+        }
+      },
+      "worker_phases": {
+        "input_read": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "request_parse": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "config_load": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "request_setup": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "self_heal": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "evaluation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "normalization": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "heredoc_detect": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "heredoc_extract": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_evaluation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_selection": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_preparation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "pattern_rules": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "shell_tokenization": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "shell_segmentation": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "heredoc_masking": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "ast_parse": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "ast_pattern_compile": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "ast_match": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_init": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_record": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        },
+        "history_flush": {
+          "calls": 0,
+          "completed_calls": 0,
+          "elapsed_ns": 0,
+          "exclusive_ns": 0
+        }
+      }
+    },
+    "wire": {
+      "expected_decision": "allow",
+      "observed_decision": "allow",
+      "rule_id": null,
+      "returncode": 0,
+      "stdout_bytes": 0,
+      "stderr_bytes": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  }
+]

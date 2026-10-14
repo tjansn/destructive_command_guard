@@ -1,0 +1,18 @@
+{
+  "cpu_count": 9,
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "tmp_filesystem": "overlayfs",
+  "cpu.max": "800000 100000",
+  "cpu.stat": "usage_usec 12697340742\nuser_usec 9260183633\nsystem_usec 3437157109\nnice_usec 0\nnr_periods 44406\nnr_throttled 6224\nthrottled_usec 551157084\nnr_bursts 0\nburst_usec 0",
+  "memory.max": "8589934592"
+}
