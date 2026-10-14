@@ -600,6 +600,9 @@ mod macos {
             let started = Instant::now();
             while !stopped.load(Ordering::SeqCst) && started.elapsed().as_secs() < 20 {
                 if let Ok((mut stream, _)) = server.accept() {
+                    // Accepted sockets inherit the listener's non-blocking
+                    // mode on macOS; the read timeout needs a blocking socket.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(std::time::Duration::from_secs(1)))
                         .unwrap();

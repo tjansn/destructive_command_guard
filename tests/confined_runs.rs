@@ -632,6 +632,10 @@ mod macos {
                 let started = Instant::now();
                 while !stop.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(25) {
                     if let Ok((mut stream, _)) = listener.accept() {
+                        // macOS hands out accepted sockets non-blocking like
+                        // the listener: an early read saw WouldBlock, dropped
+                        // the connection and the client failed with ECONNRESET.
+                        stream.set_nonblocking(false).unwrap();
                         stream
                             .set_read_timeout(Some(Duration::from_millis(500)))
                             .unwrap();
