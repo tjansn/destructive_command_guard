@@ -240,6 +240,27 @@ final class ReviewCard: NSView {
     }
 }
 
+// The material alone lets the backdrop through: nearly see-through over dark
+// windows and without text contrast over light ones. Lay a mostly opaque
+// window-background fill over it; a paused panel is fully opaque.
+@MainActor
+final class ReviewPanelContent: NSView {
+    static let activeOpacity: CGFloat = 0.86
+    var paused = false { didSet { needsDisplay = true } }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        layer?.backgroundColor = NSColor.windowBackgroundColor
+            .withAlphaComponent(paused ? 1 : Self.activeOpacity).cgColor
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+}
+
 @MainActor
 final class ReviewController: NSObject, NSWindowDelegate {
     private static let width: CGFloat = 460
@@ -252,7 +273,7 @@ final class ReviewController: NSObject, NSWindowDelegate {
     private var authContainer: NSView?
     private var authInstruction: NSTextField?
     private var authDetail: NSTextField?
-    private var panelContent: NSView?
+    private var panelContent: ReviewPanelContent?
     private var window: ReviewWindow?
     private var details: NSScrollView?
     private var detailsButton: NSButton?
@@ -534,14 +555,14 @@ final class ReviewController: NSObject, NSWindowDelegate {
         window.delegate = self
         window.cancel = { [weak self] in self?.authentication.deny() }
 
-        let content = NSView()
+        let content = ReviewPanelContent()
         panelContent = content
         content.wantsLayer = true
         content.layer?.cornerRadius = 28
         content.layer?.masksToBounds = true
         if #available(macOS 26.0, *) {
             let glass = NSGlassEffectView()
-            glass.style = .clear
+            glass.style = .regular
             glass.cornerRadius = 28
             glass.contentView = content
             window.contentView = ReviewPanelSurface(material: glass)
@@ -633,7 +654,7 @@ final class ReviewController: NSObject, NSWindowDelegate {
             ])
         }
         // Preserve readable contrast when inactive glass changes its tint.
-        panelContent?.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        panelContent?.paused = true
         resizeToFit()
     }
 
@@ -665,7 +686,7 @@ final class ReviewController: NSObject, NSWindowDelegate {
                 view.bottomAnchor.constraint(equalTo: container.bottomAnchor),
             ])
         }
-        panelContent?.layer?.backgroundColor = NSColor.clear.cgColor
+        panelContent?.paused = false
         authInstruction?.stringValue = "Finger auflegen"
         authDetail?.stringValue = "Diesen Vorgang freigeben"
         resizeToFit()

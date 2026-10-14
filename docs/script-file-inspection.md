@@ -108,9 +108,11 @@ shown when none is found.
 **Details** expands the exact execution directory and complete
 command, all literal target paths/search roots and Git names, rule and the full
 contents of small inspected scripts. Nothing is discarded from those details.
-On macOS 26 or newer the surface uses native **Liquid Glass**; older supported
-systems use a native translucent material. System appearance and accessibility
-preferences remain in control of the material.
+On macOS 26 or newer the surface uses native regular **Liquid Glass**; older
+supported systems use a native translucent material. A mostly opaque window
+background fill (86 %) lies over the material, so text keeps its contrast over
+light and dark windows alike; the paused panel is fully opaque. System
+appearance and accessibility preferences remain in control of the material.
 Agent and project form one quiet inset surface; the action and consequences
 have stronger visual weight. The footer combines the real Touch ID view and
 the reject button. The 460-point-wide layout uses concentric 28/12-point corners

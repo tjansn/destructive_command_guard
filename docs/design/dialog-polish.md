@@ -102,8 +102,14 @@ The active-state square outline is addressed at the compositing boundary:
 the borderless window has no window-server shadow, and both material variants
 sit inside the same 28-point rounded clipping view. A transparent 20-point
 margin holds an explicit rounded Core Animation shadow. Its interior is cut
-out so it does not darken the glass. macOS 26 glass uses the clear style; the
+out so it does not darken the glass. macOS 26 glass used the clear style; the
 existing readable paused-state fill and all Touch ID focus behavior are retained.
+
+2026-10-14 (tom.18): Tom found the clear glass nearly see-through over dark
+windows and without contrast over light ones. The panel now uses the regular
+style under an 86 % window-background fill (`ReviewPanelContent`); a side-by-side
+capture over white, black and multicolour backdrops in both appearances showed
+clear and unfilled regular glass losing text contrast, and the fill keeping it.
 
 The native focus helper asserts the rounded surface, clipping, padding and
 disabled window shadow in every capture. Visual acceptance still requires the
