@@ -2499,6 +2499,9 @@ static PACK_ENTRIES: [PackEntry; 103] = [
         // `upstart` is here only so the row covers the pack's own list. It matches
         // no real command — upstart's CLI is `initctl` — and no rule covers
         // `initctl` at all, so that is a coverage gap rather than a gate problem.
+        //
+        // `modprobe` and `rmmod` are the command words of the kernel-module
+        // unload rules, which no other word here would let through.
         &[
             "systemctl",
             "service",
@@ -2506,6 +2509,8 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "upstart",
             "shutdown",
             "reboot",
+            "modprobe",
+            "rmmod",
         ],
         system::services::create_pack,
     ),

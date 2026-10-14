@@ -4,6 +4,7 @@
 //! - systemctl stop/disable on critical services
 //! - service stop on critical services
 //! - init system modifications
+//! - unloading kernel modules (`modprobe -r`, `rmmod`), locally or over ssh
 
 use crate::packs::regex_engine::LazyCompiledRegex;
 use crate::packs::{DestructivePattern, Pack, SafePattern};
@@ -42,6 +43,8 @@ pub fn create_pack() -> Pack {
             "upstart",
             "shutdown",
             "reboot",
+            "modprobe",
+            "rmmod",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -237,6 +240,52 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Check current runlevel:\n  \
              runlevel"
         ),
+        // modprobe -r / --remove (also clustered short flags such as -rf)
+        destructive_pattern!(
+            "modprobe-remove",
+            r#"modprobe\b(?:[ \t]+[^;&|\n'"]*?)?[ \t]-(?:-remove\b|[a-zA-Z]*r[a-zA-Z]*\b)"#,
+            "Unloading a kernel module on a running host can crash or wedge the kernel.",
+            High,
+            "Removing a driver from a live kernel is not a safe reset. Unloading a GPU/DRM \
+             driver (nvidia, amdgpu, i915, ...) tears down the framebuffer console; on some \
+             kernels that teardown Oopses while holding the console lock, after which every \
+             new terminal, every tty close and `ps aux` hang in uninterruptible sleep until \
+             the machine is rebooted. Storage and network drivers can take their devices \
+             down with them.\n\n\
+             An nvidia-smi \"driver/library version mismatch\" means userspace was upgraded \
+             under a loaded module: schedule a reboot instead.\n\n\
+             Inspect without changing anything:\n  \
+             lsmod\n  \
+             modinfo <module>\n  \
+             modprobe -n -v -r <module>   (dry run)",
+            executables = ["modprobe"]
+        ),
+        // rmmod
+        destructive_pattern!(
+            "rmmod",
+            r"rmmod\b[ \t]+[^\s;&|]",
+            "Unloading a kernel module on a running host can crash or wedge the kernel.",
+            High,
+            "rmmod removes a driver from the running kernel. Unloading GPU/DRM, storage or \
+             network drivers can Oops the kernel or leave the console and tty layer wedged \
+             until reboot.\n\n\
+             Inspect without changing anything:\n  \
+             lsmod\n  \
+             modinfo <module>",
+            executables = ["rmmod"]
+        ),
+        // `ssh host sudo modprobe -r x`: an unquoted remote command is part of the ssh
+        // segment, so the two executable-scoped rules above never see it.
+        destructive_pattern!(
+            "ssh-remote-module-unload",
+            r#"ssh\b[^;&|\n]*?[ \t](?:sudo[ \t]+(?:-[a-zA-Z]+[ \t]+)*)?(?:modprobe\b[^;&|\n'"]*?[ \t]-(?:-remove\b|[a-zA-Z]*r[a-zA-Z]*\b)|rmmod[ \t]+[^\s;&|])"#,
+            "Unloading a kernel module on a remote host can crash or wedge its kernel.",
+            High,
+            "The remote command unloads a kernel module (modprobe -r / rmmod). Unloading \
+             GPU/DRM, storage or network drivers on a running host can Oops the kernel or \
+             leave the console and tty layer wedged until reboot.",
+            executables = ["ssh"]
+        ),
     ]
 }
 
@@ -427,5 +476,61 @@ mod tests {
         let pack = create_pack();
         assert_no_match(&pack, "git status");
         assert_no_match(&pack, "echo hello");
+    }
+
+    #[test]
+    fn kernel_module_unloads_are_blocked() {
+        let pack = create_pack();
+        for (command, rule) in [
+            (
+                "sudo modprobe -r nvidia_uvm nvidia_drm nvidia_modeset nvidia",
+                "modprobe-remove",
+            ),
+            ("modprobe --remove nvidia", "modprobe-remove"),
+            ("sudo modprobe -rf amdgpu", "modprobe-remove"),
+            ("modprobe -v -r i915", "modprobe-remove"),
+            ("/usr/sbin/modprobe -r snd_hda_intel", "modprobe-remove"),
+            ("rmmod nvidia_drm", "rmmod"),
+            ("sudo rmmod -f i915", "rmmod"),
+            (
+                "ssh gpu-host sudo modprobe -r nvidia",
+                "ssh-remote-module-unload",
+            ),
+            (
+                "ssh -i key gpu-host sudo -n rmmod nvidia",
+                "ssh-remote-module-unload",
+            ),
+        ] {
+            assert!(
+                pack.might_match(command),
+                "{command:?} must pass the keyword gate"
+            );
+            assert_blocks_with_pattern(&pack, command, rule);
+            assert_blocks_with_severity(&pack, command, Severity::High);
+        }
+    }
+
+    #[test]
+    fn kernel_module_inspection_and_loading_stay_allowed() {
+        let pack = create_pack();
+        for command in [
+            "sudo modprobe nvidia",
+            "modprobe -a snd_seq snd_rawmidi",
+            "modprobe -c",
+            "lsmod",
+            "modinfo nvidia",
+            "cat /etc/modprobe.d/blacklist.conf",
+            "ls /etc/modprobe.d",
+            // The words as argument data, not as the program being run.
+            "grep -rn \"modprobe -r\" /etc",
+            "pgrep -f \"modprobe -r nvidia\"",
+            "echo use rmmod carefully",
+            "ssh gpu-host lsmod",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command:?} must not be blocked"
+            );
+        }
     }
 }
