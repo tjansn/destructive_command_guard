@@ -24,7 +24,13 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Deliberately exhaustive: inline/remote/SQL unknowns are not trial grants.
-pub const TRIAL_RULES: &[(&str, &str)] = &[("heredoc.script_files", "unverified")];
+///
+/// Unresolved tar option text is reviewable like an unverified script; a tar
+/// helper dcg identified (`tar-exec-unverified`) never is (fork issue #1).
+pub const TRIAL_RULES: &[(&str, &str)] = &[
+    ("heredoc.script_files", "unverified"),
+    ("core.filesystem", "tar-options-unresolved"),
+];
 #[cfg(target_os = "macos")]
 const OUTPUT_CAP: usize = 64 * 1024;
 #[cfg(target_os = "macos")]

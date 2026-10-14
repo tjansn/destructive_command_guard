@@ -779,6 +779,19 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         ],
     );
     m.insert(
+        "core.filesystem:tar-options-unresolved",
+        vec![
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Pass tar its options and operands as literal values (module constants in a script count), so dcg can see that no helper option is present",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "If the values must stay dynamic, approve the exact command or script in the desktop review; the approval lasts until a reviewed script changes",
+            ),
+        ],
+    );
+    m.insert(
         "core.filesystem:sed-exec-unverified",
         vec![
             Suggestion::new(
@@ -2391,6 +2404,7 @@ mod tests {
         let expected_rules = [
             "core.filesystem:sed-exec-unverified",
             "core.filesystem:tar-exec-unverified",
+            "core.filesystem:tar-options-unresolved",
             "core.filesystem:rm-rf-root-home",
             "core.filesystem:rm-r-f-separate-root-home",
             "core.filesystem:rm-recursive-force-root-home",

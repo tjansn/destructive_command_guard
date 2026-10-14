@@ -15127,7 +15127,10 @@ fn evaluate_command_in_single_dialect_view(
         Some(result)
             if result.pattern_info.as_ref().is_some_and(|hit| {
                 hit.pack_id.as_deref() == Some("core.filesystem")
-                    && hit.pattern_name.as_deref() == Some(TAR_EXEC_UNVERIFIED_RULE)
+                    && matches!(
+                        hit.pattern_name.as_deref(),
+                        Some(TAR_EXEC_UNVERIFIED_RULE | TAR_OPTIONS_UNRESOLVED_RULE)
+                    )
             }) =>
         {
             Some(result)
@@ -18886,6 +18889,15 @@ fn decode_backslash_escapes(value: &str) -> Option<String> {
 }
 
 const TAR_EXEC_UNVERIFIED_RULE: &str = "tar-exec-unverified";
+/// Unresolved or unsupported option text, as opposed to a helper dcg found.
+/// Its own rule id lets review and sandbox trials resolve only this
+/// uncertainty: a literal `--to-command` or checkpoint helper keeps
+/// `tar-exec-unverified` (fork issue #1).
+const TAR_OPTIONS_UNRESOLVED_RULE: &str = "tar-options-unresolved";
+const TAR_OPTIONS_UNRESOLVED_DETAIL: &str =
+    "tar options contain values that are only known at runtime";
+const TAR_OPTIONS_UNVERIFIED_DETAIL: &str =
+    "tar options contain unresolved expansion or unsupported option syntax";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TarHelperSource {
@@ -18906,6 +18918,11 @@ struct TarHelperOptions {
     force_local: bool,
     terminal: bool,
     uncertain: bool,
+    /// Uncertainty from literal text this parser does not model (unknown or
+    /// incomplete options, `TAR_OPTIONS`, suffix compression), as opposed to
+    /// runtime values. Such text can spell a helper, so it is never reviewed
+    /// as merely unresolved.
+    uncertain_literal: bool,
     auto_compress: bool,
     writes_local_files: bool,
     literal_home_members: bool,
@@ -19250,6 +19267,7 @@ impl TarHelperOptions {
                     .map_or((long, None), |(name, value)| (name, Some(value)));
                 let Some((name, required)) = tar_long_option(name) else {
                     self.uncertain = true;
+                    self.uncertain_literal = true;
                     continue;
                 };
                 let value = if required && attached.is_none() {
@@ -19262,6 +19280,7 @@ impl TarHelperOptions {
                     }
                     if value.is_none() {
                         self.uncertain = true;
+                        self.uncertain_literal = true;
                     }
                     value
                 } else {
@@ -19296,6 +19315,7 @@ impl TarHelperOptions {
                             operand_index = operand_index.saturating_add(1);
                             if value.is_none() {
                                 self.uncertain = true;
+                                self.uncertain_literal = true;
                             }
                             value
                         } else {
@@ -19802,10 +19822,12 @@ fn collect_tar_helper_sources(
             // it never reads the hook process's ambient TAR_OPTIONS.
             if tar_value_is_dynamic(&value, &masked) || value.contains('\\') {
                 options.uncertain = true;
+                options.uncertain_literal = true;
             } else if let Ok(defaults) = shell_words::split(&value) {
                 options.parse(&defaults, false, &masked);
             } else {
                 options.uncertain = true;
+                options.uncertain_literal = true;
             }
         }
         options.parse(&args, true, &masked);
@@ -19816,13 +19838,24 @@ fn collect_tar_helper_sources(
             // Suffix-driven compressor selection is outside this bounded
             // parser. Preserve the visible helper as well as the uncertainty.
             options.uncertain = true;
+            options.uncertain_literal = true;
         }
         if options.uncertain {
+            // Only runtime values, with no helper visible anywhere, form the
+            // reviewable class; anything else keeps the helper rule.
+            let helper_visible = !options.checkpoints.is_empty()
+                || !options.to_commands.is_empty()
+                || !options.compressors.is_empty()
+                || !options.info_scripts.is_empty()
+                || !options.rmt_commands.is_empty()
+                || options.rsh_command.is_some();
             push_tar_helper(
                 &mut sources,
-                TarHelperSource::Unverified(
-                    "tar options contain unresolved expansion or unsupported option syntax",
-                ),
+                TarHelperSource::Unverified(if options.uncertain_literal || helper_visible {
+                    TAR_OPTIONS_UNVERIFIED_DETAIL
+                } else {
+                    TAR_OPTIONS_UNRESOLVED_DETAIL
+                }),
             );
         }
         // Creation/update can overwrite the archive before a callback reads
@@ -20067,21 +20100,30 @@ fn evaluate_tar_helper_sources(
         if !filesystem_enabled {
             continue;
         }
-        let reason =
-            format!("GNU tar executes a helper that dcg cannot statically verify: {detail}.");
+        let (rule, reason, explanation) = if detail == TAR_OPTIONS_UNRESOLVED_DETAIL {
+            (
+                TAR_OPTIONS_UNRESOLVED_RULE,
+                format!(
+                    "GNU tar options cannot be statically verified: {detail}; an unresolved value may be a helper option."
+                ),
+                "Pass tar literal options and operands, or review the exact command; unresolved option values are reviewed as a whole, never as a helper allowance.",
+            )
+        } else {
+            (
+                TAR_EXEC_UNVERIFIED_RULE,
+                format!("GNU tar executes a helper that dcg cannot statically verify: {detail}."),
+                "Inspect the fully resolved tar helper and any archive data it executes before using an exact-command allow-once review. Prefer literal helper commands; archive bytes are not verified shell or database input.",
+            )
+        };
         let mut result = EvaluationResult::denied_by_pack_pattern(
             "core.filesystem",
-            TAR_EXEC_UNVERIFIED_RULE,
+            rule,
             &reason,
-            Some(
-                "Inspect the fully resolved tar helper and any archive data it executes before using an exact-command allow-once review. Prefer literal helper commands; archive bytes are not verified shell or database input.",
-            ),
+            Some(explanation),
             crate::packs::Severity::High,
             &[],
         );
-        if let Some(hit) =
-            allowlists.match_rule_at_path("core.filesystem", TAR_EXEC_UNVERIFIED_RULE, project_path)
-        {
+        if let Some(hit) = allowlists.match_rule_at_path("core.filesystem", rule, project_path) {
             if first_allowlist_hit.is_none()
                 && let Some(matched) = result.pattern_info.take()
             {
@@ -20230,6 +20272,46 @@ mod tar_helper_tests {
                 .iter()
                 .any(|source| matches!(source, TarHelperSource::Unverified(_)))
         );
+    }
+
+    /// Fork issue #1: only runtime values with no helper in sight form the
+    /// reviewable `tar-options-unresolved` class. Literal text the parser does
+    /// not model, or any visible helper, keeps the helper rule.
+    #[test]
+    fn only_runtime_values_without_a_visible_helper_are_merely_unresolved() {
+        let detail = |command: &str| {
+            collect_tar_helper_sources(command, ShellDialect::Posix, false)
+                .into_iter()
+                .find_map(|source| match source {
+                    TarHelperSource::Unverified(detail) => Some(detail),
+                    _ => None,
+                })
+        };
+        for command in [
+            "tar -cf - -C /tmp/x \"$MEMBER\"",
+            "tar -cf out.tar \"$@\"",
+            "tar \"$MODE\" -f archive file",
+        ] {
+            assert_eq!(
+                detail(command),
+                Some(super::TAR_OPTIONS_UNRESOLVED_DETAIL),
+                "{command}"
+            );
+        }
+        for command in [
+            "tar -cf - \"$MEMBER\" --to-command=sh",
+            "tar -cf out \"$PREFIX\" --checkpoint-action=exec=sh file",
+            "tar -cf out -I gzip \"$MEMBER\"",
+            "TAR_OPTIONS='--checkpoint-action=exec=sh' tar -cf out \"$MEMBER\"",
+            "tar --definitely-unknown \"$MEMBER\" -cf out",
+            "tar -cf out --exclude",
+        ] {
+            assert_eq!(
+                detail(command),
+                Some(super::TAR_OPTIONS_UNVERIFIED_DETAIL),
+                "{command}"
+            );
+        }
     }
 
     #[test]

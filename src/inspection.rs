@@ -28,7 +28,10 @@ impl Outcome {
         self == Self::Dangerous
             || (self == Self::Dynamic
                 && pack == Some("core.filesystem")
-                && pattern == Some("tar-exec-unverified"))
+                && matches!(
+                    pattern,
+                    Some("tar-exec-unverified" | "tar-options-unresolved")
+                ))
     }
 
     pub fn rule_remediation(self, pack: Option<&str>, pattern: Option<&str>) -> &'static str {

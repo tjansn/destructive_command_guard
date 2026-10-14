@@ -1547,10 +1547,14 @@ const CAREFUL_COMPANY_PRESET_MEMBERS: &[&str] = &[
 ///
 /// - `core.git:branch-delete` (merge-checked `git branch -d`) was reported as
 ///   `core.git:branch-force-delete` until #509.
+/// - `core.filesystem:tar-options-unresolved` (unresolved tar option text, no
+///   helper identified) was reported as `core.filesystem:tar-exec-unverified`
+///   until fork issue #1.
 #[must_use]
 pub fn legacy_rule_names(pack_id: &str, pattern_name: &str) -> &'static [&'static str] {
     match (pack_id, pattern_name) {
         ("core.git", "branch-delete") => &["branch-force-delete"],
+        ("core.filesystem", "tar-options-unresolved") => &["tar-exec-unverified"],
         _ => &[],
     }
 }

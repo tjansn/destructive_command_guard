@@ -4988,6 +4988,16 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             High,
             "Inspect the fully resolved tar helper and any archive data it executes before using an exact-command allow-once review. Prefer literal helper commands; archive bytes are not verified shell or database input."
         ),
+        // Unresolved or unsupported tar option text (no helper identified).
+        // Separate from tar-exec-unverified so review and sandbox trials can
+        // resolve only this uncertainty, never a helper dcg found.
+        destructive_pattern!(
+            "tar-options-unresolved",
+            r"(?!)",
+            "GNU tar options contain unresolved values or unsupported option syntax; an unresolved value may be a helper option.",
+            High,
+            "Pass tar literal options and operands, or review the exact command; unresolved option values are reviewed as a whole, never as a helper allowance."
+        ),
         // ----- cross-segment sensitive propagation before rm fallbacks -----
         //
         // These patterns must run before the general rm rules below. Otherwise

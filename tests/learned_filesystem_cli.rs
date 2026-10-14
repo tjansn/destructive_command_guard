@@ -334,3 +334,39 @@ fn approved_scripts_hold_until_a_reviewed_script_changes() {
     fixture.cli(&["allowlist", "prune", "--user"]);
     assert!(fixture.store.list_scripts().unwrap().is_empty());
 }
+
+/// Fork issue #1: a script whose tar arguments are only known at runtime can
+/// be approved like any unverified script, but an approval never covers a
+/// tar helper dcg identified in that script.
+#[test]
+fn approved_scripts_cover_unresolved_tar_values_but_never_a_tar_helper() {
+    let fixture = Fixture::new();
+    let script = fixture.project.join("archive.py");
+    let command = "python3 ./archive.py";
+    let approve = |source: &str| {
+        fs::write(&script, source).unwrap();
+        let version = fixture
+            .store
+            .script_version(command, &fixture.project, std::slice::from_ref(&script))
+            .unwrap();
+        fixture.store.approve_scripts(&version, "Touch ID").unwrap();
+    };
+    let decision = |output: &std::process::Output| {
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        (stdout.contains("\"deny\""), stdout)
+    };
+
+    approve(
+        "import subprocess, sys\nsubprocess.run(['tar', '-cf', '-', '-C', '/tmp/x', sys.argv[1]])\n",
+    );
+    let unresolved = fixture.hook(command);
+    assert!(!decision(&unresolved).0, "{:?}", decision(&unresolved).1);
+    assert!(String::from_utf8_lossy(&unresolved.stderr).contains("scripts unchanged"));
+
+    // Same review route, approved too, but the helper is definite.
+    approve("import subprocess\nsubprocess.run(['tar', '-xf', 'a.tar', '--to-command=sh'])\n");
+    let helper = fixture.hook(command);
+    let (denied, stdout) = decision(&helper);
+    assert!(denied, "{stdout}");
+    assert!(stdout.contains("tar-exec-unverified"), "{stdout}");
+}
