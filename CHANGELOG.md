@@ -50,6 +50,26 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   for the project reuses them. Manage them with `dcg allowlist list|remove|prune`.
   See [approved scripts](docs/learned-approvals.md#approved-scripts).
 
+### 0.15.3+tom.16
+
+- **An unbindable project version now says no review can start (fork #2
+  follow-up).** When dcg cannot bind the exact project, working directory and
+  executables (a missing file, a dynamic program, a `cd` combined with a pipe),
+  a hook with `--desktop-review` denied with "desktop approval unavailable" and
+  the `unsupported-dynamic` advice to use `--desktop-review`, which it already
+  had. It now reports `review-not-started` with the cause and a next step. A
+  hook without the dialog still names the missing flag. The
+  `heredoc.script_files:unverified` explanation states what a trial or review
+  needs instead of advising every hook to enable `--desktop-review`.
+- **Correction to the tom.15 notes on upstream #558.** The IFS word-splitting
+  series does split destinations: `S=/tmp/a@/etc/passwd; IFS=@; tee $S` is
+  denied on upstream main and allowed before it. The allowed example in the
+  tom.15 notes writes `/etc/profile`, which the credential policy does not
+  protect on any platform, and upstream's #558 tests use that path. The IFS
+  series stays held back because it denies `rm$IFSX -rf /tmp/x` as a
+  credential-file write; the #560 masking series and the tempfile change stay
+  held back for the reasons given under tom.15.
+
 ### 0.15.3+tom.15
 
 - **Archive-only tar from Python with constant argv is no longer a tar
