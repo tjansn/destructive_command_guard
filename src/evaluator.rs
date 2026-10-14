@@ -4613,7 +4613,16 @@ fn parse_powershell_launcher(
 }
 
 fn cmd_host_switch(raw: &str, outer_dialect: ShellDialect) -> Option<String> {
-    shell_word_value(raw, outer_dialect).map(|word| word.to_ascii_lowercase())
+    let mut option = shell_word_value(raw, outer_dialect)?.to_ascii_lowercase();
+    // MSYS2/Git Bash rewrites a leading /x argument as a path. Its documented
+    // escape hatch is //x, which reaches cmd.exe as /x. Normalize that spelling
+    // only when the *outer* shell is POSIX; native Cmd and PowerShell retain
+    // their own argv semantics. Unknown doubled switches stay unknown after
+    // normalization and therefore continue to fail closed below.
+    if outer_dialect == ShellDialect::Posix && option.starts_with("//") {
+        option.remove(0);
+    }
+    Some(option)
 }
 
 fn cmd_switch_is_non_executing(option: &str) -> bool {
@@ -51958,5 +51967,60 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+}
+
+#[cfg(test)]
+mod issue_561_git_bash_cmd_switch_tests {
+    use super::*;
+
+    fn parsed(segment: &str, dialect: ShellDialect) -> WindowsLauncherParse {
+        parse_windows_launcher_segment(segment, dialect, 16 * 1024)
+    }
+
+    #[test]
+    fn git_bash_double_slash_c_and_k_are_cmd_execution_switches() {
+        for (switch, expected_launcher) in [
+            ("//c", "cmd /c"),
+            ("//C", "cmd /c"),
+            ("//k", "cmd /k"),
+            ("//K", "cmd /k"),
+        ] {
+            let segment = format!("cmd {switch} \"ver\"");
+            let WindowsLauncherParse::Envelope(envelope) =
+                parsed(&segment, ShellDialect::Posix)
+            else {
+                panic!("Git Bash spelling was not recognized: {segment}");
+            };
+            assert_eq!(envelope.launcher, expected_launcher);
+            assert_eq!(envelope.dialect, ShellDialect::Cmd);
+            assert_eq!(envelope.command, "ver");
+        }
+    }
+
+    #[test]
+    fn git_bash_nonexecuting_switches_can_precede_double_slash_c() {
+        let WindowsLauncherParse::Envelope(envelope) =
+            parsed("cmd //d //s //c \"echo safe\"", ShellDialect::Posix)
+        else {
+            panic!("Git Bash cmd switches were not normalized");
+        };
+        assert_eq!(envelope.command, "echo safe");
+    }
+
+    #[test]
+    fn unknown_double_slash_switches_stay_fail_closed() {
+        assert!(matches!(
+            parsed("cmd //definitely-unknown value", ShellDialect::Posix),
+            WindowsLauncherParse::Unverified(_)
+        ));
+    }
+
+    #[test]
+    fn native_cmd_does_not_borrow_git_bash_switch_normalization() {
+        assert!(!matches!(
+            parsed("cmd //c \"ver\"", ShellDialect::Cmd),
+            WindowsLauncherParse::Envelope(_)
+        ));
     }
 }
