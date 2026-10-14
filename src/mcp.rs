@@ -4,9 +4,7 @@
 //! checks without shell-hook overhead.
 
 use crate::config::Config;
-use crate::evaluator::{
-    EvaluationDecision, evaluate_command_with_pack_order_at_path_in_dialect,
-};
+use crate::evaluator::{EvaluationDecision, evaluate_command_with_pack_order_at_path_in_dialect};
 use crate::normalize::ShellDialect;
 use crate::packs::REGISTRY;
 use crate::scan::{
@@ -231,7 +229,9 @@ impl DcgMcpServer {
                     "Invalid 'dialect': expected unknown, posix, powershell, or cmd",
                 )),
             },
-            Some(_) => Err(Self::call_tool_error("Invalid 'dialect': expected a string")),
+            Some(_) => Err(Self::call_tool_error(
+                "Invalid 'dialect': expected a string",
+            )),
         }
     }
 
@@ -591,7 +591,10 @@ mod tests {
         ] {
             assert!(spellings.contains(&serde_json::json!(name)));
             let args = serde_json::json!({"command": "git status", "dialect": name});
-            assert_eq!(DcgMcpServer::dialect_arg(args.as_object()).unwrap(), expected);
+            assert_eq!(
+                DcgMcpServer::dialect_arg(args.as_object()).unwrap(),
+                expected
+            );
         }
         assert_eq!(
             DcgMcpServer::dialect_arg(None).unwrap(),
@@ -656,7 +659,10 @@ mod tests {
             assert_eq!(response.allowed, allowed, "{dialect}: {command}");
             assert_eq!(response.decision, if allowed { "allow" } else { "deny" });
             assert_eq!(response.dialect, dialect);
-            assert_eq!(args, original, "the adapter must preserve the command bytes");
+            assert_eq!(
+                args, original,
+                "the adapter must preserve the command bytes"
+            );
             if !allowed {
                 assert_eq!(response.rule_id.as_deref(), Some("core.git:reset-hard"));
             }
