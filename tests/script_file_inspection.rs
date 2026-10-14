@@ -1605,7 +1605,7 @@ fn hook_outcomes_distinguish_findings_limits_and_unavailable_review() {
             ),
             (
                 "git reset --hard",
-                "review-unavailable-or-cancelled",
+                "review-not-started",
                 "no approval was recorded",
                 true,
             ),
@@ -1658,6 +1658,151 @@ fn hook_outcomes_distinguish_findings_limits_and_unavailable_review() {
             );
         }
     }
+}
+
+/// Fork issue #2, Case B, through the Pi bridge's exact arguments and payload:
+/// a remote script cannot be inspected, so no dialog is attempted and the
+/// denial names that limitation and a next step instead of advising a retry.
+/// A remote operation with a definite finding keeps that finding.
+#[test]
+fn remote_scripts_report_why_review_cannot_start() {
+    let fixture = version_review_fixture();
+    // The helper directory is a regular file: any dialog attempt fails closed
+    // (with a different tag) instead of opening Touch ID during the test.
+    for blocker in [
+        "home/Library/Application Support/dcg/desktop-review",
+        "home/.config/dcg/desktop-review",
+    ] {
+        fixture.write(blocker, "");
+    }
+    let hook = |candidate: &str, desktop_review: bool| {
+        let input = json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": candidate},
+            "cwd": fixture.root,
+            "dcg_explicit_verdict": true,
+            "dcg_input_rewrite": true,
+        });
+        let mut command = fixture.command();
+        if desktop_review {
+            command.arg("--desktop-review");
+        }
+        let mut child = command
+            .args(["--no-color", "--agent", "pi"])
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        for attempt in ["Warte auf", "Touch-ID-Dialog"] {
+            assert!(!stderr.contains(attempt), "{candidate}: {stderr}");
+        }
+        let verdict: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{candidate}: {error}: {stderr}"));
+        assert_eq!(
+            verdict["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{verdict}"
+        );
+        verdict
+    };
+    let verdict = hook(
+        "ssh -o BatchMode=yes deploy@example.invalid 'readlink /srv/app/current; \
+         /usr/libexec/PlistBuddy -c Print:EnvironmentVariables:PUBLIC_ORIGIN /srv/app.plist; \
+         launchctl list com.example.app'",
+        true,
+    );
+    let reason = verdict["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert!(reason.contains("[dcg:review-not-started]"), "{reason}");
+    assert!(reason.contains("entfernten Rechnern"), "{reason}");
+    assert!(reason.contains("Nächster Schritt"), "{reason}");
+    assert!(reason.contains("no approval was recorded"), "{reason}");
+    for misleading in [
+        "review-unavailable-or-cancelled",
+        "zu umfangreich",
+        "and retry ",
+        "allow-once",
+    ] {
+        assert!(!reason.contains(misleading), "{misleading}: {reason}");
+    }
+    let verdict = hook(
+        "ssh deploy@example.invalid 'rm -rf /srv/app/releases'",
+        false,
+    );
+    let rule = verdict["hookSpecificOutput"]["ruleId"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(rule.starts_with("core.filesystem:"), "{verdict}");
+}
+
+/// Fork issue #2, Case A: a reviewable script larger than the dialog text
+/// limit used to make dcg refuse to build the dialog and then report
+/// "unavailable, declined or expired". It is now excerpted and the dialog is
+/// attempted; the blocked helper makes that attempt fail closed with its own
+/// cause instead of opening Touch ID.
+#[test]
+fn large_reviewable_scripts_reach_the_dialog_and_fail_closed_without_helper() {
+    let fixture = version_review_fixture();
+    for blocker in [
+        "home/Library/Application Support/dcg/desktop-review",
+        "home/.config/dcg/desktop-review",
+    ] {
+        fixture.write(blocker, "");
+    }
+    let padding = "// isolated server fixture; nothing here runs during the hook\n".repeat(120);
+    fixture.write(
+        "tests/app.test.mjs",
+        format!(
+            "{padding}import {{ spawn }} from 'node:child_process';\n\
+             const port = 40000 + Math.floor(Math.random() * 1000);\n\
+             spawn(process.execPath, ['server' + '.mjs'], {{ env: {{ ...process.env, PORT: String(port) }} }});\n"
+        ),
+    );
+    fixture.write("server.mjs", "console.log('fixture');\n");
+    let input = json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": "node --test tests/app.test.mjs"},
+        "cwd": fixture.root,
+        "dcg_explicit_verdict": true,
+        "dcg_input_rewrite": true,
+    });
+    let mut child = fixture
+        .command()
+        .args(["--desktop-review", "--no-color", "--agent", "pi"])
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.to_string().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let verdict: Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| panic!("{error}: {stderr}"));
+    assert_eq!(
+        verdict["hookSpecificOutput"]["permissionDecision"], "deny",
+        "{verdict}"
+    );
+    let reason = verdict["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert!(
+        reason.contains("[dcg:review-unavailable-or-cancelled]")
+            && reason.contains("Touch-ID-Dialog ist nicht verfügbar"),
+        "{reason}\n{stderr}"
+    );
+    for misleading in ["declined or expired", "review-not-started", "and retry "] {
+        assert!(!reason.contains(misleading), "{misleading}: {reason}");
+    }
+    assert!(!fixture.root.join("home/.config/dcg/trials").exists());
 }
 
 #[test]

@@ -105,7 +105,19 @@ prevent orderly cleanup; this is not a service lifecycle implementation.
 ## Static inspection outcomes and finite inputs
 
 Hook denials identify `definite-dangerous-operation`, `unsupported-dynamic`,
-`analysis-limit`, or `review-unavailable-or-cancelled`. Claude receives `outcomeCode`;
+`analysis-limit`, or a desktop-review outcome. Review outcomes name their own cause,
+and none of them tells an agent to retry the same request:
+
+| Code | Meaning |
+|------|---------|
+| `review-not-started` | No dialog was shown and none can be for this request: hook not eligible (several commands, script scanning off, no absolute cwd), inspection incomplete, a remote/namespace script, or a command too long to show in full. The reason names the next step. |
+| `review-declined` | The user declined in the dialog. |
+| `review-expired` | No decision within the 120-second dialog deadline. |
+| `review-unavailable-or-cancelled` | Another dialog was open, the Touch ID helper is missing or changed (`dcg doctor`), or reviewed inputs changed during the dialog. |
+
+Long script sources are excerpted in the dialog, with their path, line count and
+SHA-256 prefix and a note that lines are hidden; the approval still binds every byte
+of each reviewed script. The exact command is never excerpted. Claude receives `outcomeCode`;
 strict protocols retain their schemas and carry `[dcg:<code>]` in the reason. Robot
 `dcg test` output includes `outcome_code`. Incomplete script-file inspection does not
 advertise an ineffective command-only code or broad rule allowlist as a remedy.

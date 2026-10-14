@@ -246,6 +246,9 @@ final class ReviewController: NSObject, NSWindowDelegate {
     private static let inset: CGFloat = 16
     private let request: ReviewRequest
     private var timer: Timer?
+    // Set only by the 120-second deadline, so dcg can tell an unanswered
+    // dialog from an explicit decline.
+    private var expired = false
     private var authContainer: NSView?
     private var authInstruction: NSTextField?
     private var authDetail: NSTextField?
@@ -280,7 +283,7 @@ final class ReviewController: NSObject, NSWindowDelegate {
 
     private func finish(_ approved: Bool) -> Never {
         timer?.invalidate()
-        print(approved ? "approved:\(request.nonce)" : "denied")
+        print(approved ? "approved:\(request.nonce)" : expired ? "expired" : "denied")
         exit(0)
     }
 
@@ -675,6 +678,7 @@ final class ReviewController: NSObject, NSWindowDelegate {
 
         let timer = Timer(timeInterval: 120, repeats: false) { [weak self] _ in
             DispatchQueue.main.async {
+                self?.expired = true
                 self?.authentication.deny()
             }
         }

@@ -2487,17 +2487,19 @@ fn main() {
         if let Some(assessment) = &filesystem_effect {
             allow_filesystem_effect(&eval_context, &mut outcome, shell_dialect, assessment);
         }
+        // Every reason names its own cause and `[dcg:...]` tag (fork issue
+        // #2); only a hook without --desktop-review stays untagged.
         let mut review_unavailable = if !cli.desktop_review {
             (heredoc_settings.scan_script_files || hook_protocol == hook::HookProtocol::Codex).then_some(
                 "Desktop-Freigabe nicht gestartet: --desktop-review fehlt im aktiven Hook-Aufruf.",
             )
         } else if !desktop_review_eligible {
             Some(
-                "Desktop-Freigabe nicht gestartet: mehrere Befehle im Hook-Aufruf oder Skriptprüfung deaktiviert.",
+                "[dcg:review-not-started] Desktop-Freigabe nicht gestartet: mehrere Befehle im Hook-Aufruf oder Skriptprüfung deaktiviert.",
             )
         } else if scope_base.is_none() {
             Some(
-                "Desktop-Freigabe nicht gestartet: kein gültiger absoluter Arbeitsordner im Hook-Aufruf.",
+                "[dcg:review-not-started] Desktop-Freigabe nicht gestartet: kein gültiger absoluter Arbeitsordner im Hook-Aufruf.",
             )
         } else {
             None
@@ -2513,8 +2515,9 @@ fn main() {
             let Some(mut description) = snapshot.description(
                 &resolved.command, cwd, info, cli.agent.as_deref().unwrap_or(history_agent_type),
             ) else {
-                review_unavailable = Some("Desktop-Freigabe nicht gestartet: Die Prüfung ist unvollständig oder der Vorgang ist zu umfangreich für einen vollständigen Dialog.");
-                emit_stderr!("[dcg] Keine Desktop-Freigabe: Prüfung unvollständig oder Vorgang zu umfangreich für einen vollständigen Dialog.");
+                let reason = snapshot.not_reviewable(info);
+                review_unavailable = Some(reason);
+                emit_stderr!("[dcg] {reason}");
                 return false;
             };
             if let Some(assessment) = &filesystem_effect {
@@ -2522,17 +2525,28 @@ fn main() {
             }
             let store = destructive_command_guard::trial_store::TrialStore::user().ok();
             emit_stderr!("[dcg] Warte auf deine Freigabe im macOS-Dialog (maximal 120 Sekunden).");
+            // review_with only learns approved or not; keep the cause.
+            let failure = std::cell::Cell::new(None);
+            let request = |scoped: &destructive_command_guard::desktop_review::ReviewDescription| {
+                snapshot.request(scoped, cwd).inspect_err(|cause| failure.set(Some(*cause))).is_ok()
+            };
             let accepted = filesystem_effect.as_ref().map_or_else(
-                || snapshot.request(&description, cwd),
+                || request(&description),
                 |assessment| assessment.review_with(store.as_ref(), |scope| {
                     let mut scoped = description.clone();
                     scoped.set_scope(scope);
-                    snapshot.request(&scoped, cwd)
+                    request(&scoped)
                 }),
             );
             if !accepted {
-                review_unavailable = Some("Nicht per Fingerabdruck freigegeben: abgelehnt, abgelaufen, Dialog nicht verfügbar oder geprüfte Dateien geändert.");
-                emit_stderr!("[dcg] Nicht freigegeben: abgelehnt, abgelaufen, Dialog nicht verfügbar oder geprüfte Dateien geändert. Nicht durch Umformulieren erneut versuchen.");
+                // No dialog failure: the filesystem targets changed around
+                // the dialog or the learned approval could not be stored.
+                let reason = failure.get().map_or(
+                    "[dcg:review-unavailable-or-cancelled] Freigabe verworfen: Dateisystemziele haben sich geändert oder die Freigabe ließ sich nicht speichern.",
+                    destructive_command_guard::desktop_review::ReviewFailure::diagnostic,
+                );
+                review_unavailable = Some(reason);
+                emit_stderr!("[dcg] {reason} Nicht durch Umformulieren erneut versuchen.");
                 return false;
             }
             let learned = filesystem_effect.as_ref().is_some_and(|assessment| store.as_ref().is_some_and(|store| assessment.learned(store)));
@@ -2557,11 +2571,7 @@ fn main() {
                 && matches!(resolved.mode, DecisionMode::Deny | DecisionMode::Ask)
                 && let Some(info) = resolved.result.pattern_info.as_mut()
             {
-                info.reason.push_str(if cli.desktop_review {
-                    "\n\n[dcg:review-unavailable-or-cancelled] "
-                } else {
-                    "\n\n"
-                });
+                info.reason.push_str("\n\n");
                 info.reason.push_str(reason);
             }
             publish_decisive_response(&eval_context, outcome, &mut history_writer)
@@ -2847,21 +2857,21 @@ fn attempt_sandbox_trial(
                         details: &str,
                         explanation: &str|
          -> Result<bool, String> {
-            if !desktop
-                || !desktop_review::request_trial(
-                    &command,
-                    cwd,
-                    details,
-                    agent,
-                    desktop_review::ApprovalScope::ApprovedScripts,
-                    &version.executables,
-                    evidence.as_ref(),
-                )
-            {
-                return Err(format!(
-                    "{explanation}\n[dcg:review-unavailable-or-cancelled] Desktop review unavailable, declined or expired."
-                ));
+            // Without the dialog the hook caller already appends why no
+            // review started; the trial path adds no second, vaguer reason.
+            if !desktop {
+                return Err(explanation.to_owned());
             }
+            desktop_review::request_trial(
+                &command,
+                cwd,
+                details,
+                agent,
+                desktop_review::ApprovalScope::ApprovedScripts,
+                &version.executables,
+                evidence.as_ref(),
+            )
+            .map_err(|failure| format!("{explanation}\n{}", failure.diagnostic()))?;
             // The consented scope is "remember": a failed write keeps the
             // request blocked instead of silently becoming a one-time approval.
             store
@@ -2922,21 +2932,19 @@ fn attempt_sandbox_trial(
                     "Sandbox-Tests sind deaktiviert. Gespeicherte Freigaben werden nicht verwendet. Bitte prüfe den genauen Aufruf und seine Folgen für diese einmalige Freigabe.",
                 )
             };
-            if !desktop
-                || !desktop_review::request_trial(
-                    &command,
-                    cwd,
-                    german,
-                    agent,
-                    scope,
-                    &before.resolved_executables,
-                    evidence.as_ref(),
-                )
-            {
-                return Err(format!(
-                    "{explanation}\n[dcg:review-unavailable-or-cancelled] Desktop review unavailable, declined or expired."
-                ));
+            if !desktop {
+                return Err(explanation.to_owned());
             }
+            desktop_review::request_trial(
+                &command,
+                cwd,
+                german,
+                agent,
+                scope,
+                &before.resolved_executables,
+                evidence.as_ref(),
+            )
+            .map_err(|failure| format!("{explanation}\n{}", failure.diagnostic()))?;
             let after = fingerprint().map_err(|e| e.to_string())?;
             if before != after {
                 return Err("Runtime inputs changed during review; approval rejected.".to_owned());
@@ -2995,21 +3003,19 @@ fn attempt_sandbox_trial(
                 if let Some(version) = &scripts {
                     return remember(version, &report.review_details(), &summary);
                 }
-                if !desktop
-                    || !desktop_review::request_trial(
-                        &command,
-                        cwd,
-                        &report.review_details(),
-                        agent,
-                        scope,
-                        &before.resolved_executables,
-                        evidence.as_ref(),
-                    )
-                {
-                    return Err(format!(
-                        "{summary}\n[dcg:review-unavailable-or-cancelled] Desktop review unavailable, declined or expired."
-                    ));
+                if !desktop {
+                    return Err(summary);
                 }
+                desktop_review::request_trial(
+                    &command,
+                    cwd,
+                    &report.review_details(),
+                    agent,
+                    scope,
+                    &before.resolved_executables,
+                    evidence.as_ref(),
+                )
+                .map_err(|failure| format!("{summary}\n{}", failure.diagnostic()))?;
                 "user-review"
             }
         };

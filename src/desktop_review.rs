@@ -111,6 +111,52 @@ pub struct ReviewSnapshot {
     incomplete: bool,
 }
 
+/// Why a desktop review did not approve (fork issue #2).
+///
+/// Each cause has its own diagnostic, so an agent is never told to retry a
+/// dialog that did not start, and a decline is never reported as an
+/// unavailable helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewFailure {
+    /// Another review dialog is still open.
+    Busy,
+    /// No complete dialog can be built for this request.
+    NotShowable,
+    /// The native Touch ID helper is missing, changed or failed.
+    HelperUnavailable,
+    /// The reviewer declined.
+    Declined,
+    /// No decision within the dialog deadline.
+    Expired,
+    /// The working directory or a reviewed input changed during the dialog.
+    Changed,
+}
+
+impl ReviewFailure {
+    /// The `[dcg:...]` tag and the reason appended to the denial.
+    #[must_use]
+    pub const fn diagnostic(self) -> &'static str {
+        match self {
+            Self::Busy => {
+                "[dcg:review-unavailable-or-cancelled] Desktop-Freigabe nicht gestartet: Ein anderer Freigabedialog ist noch offen."
+            }
+            Self::NotShowable => {
+                "[dcg:review-not-started] Desktop-Freigabe nicht gestartet: Für diesen Aufruf lässt sich kein vollständiger Dialog erstellen."
+            }
+            Self::HelperUnavailable => {
+                "[dcg:review-unavailable-or-cancelled] Desktop-Freigabe nicht gestartet: Der Touch-ID-Dialog ist nicht verfügbar oder verändert (`dcg doctor`)."
+            }
+            Self::Declined => "[dcg:review-declined] Im Dialog abgelehnt.",
+            Self::Expired => {
+                "[dcg:review-expired] Keine Entscheidung im Dialog innerhalb von 120 Sekunden."
+            }
+            Self::Changed => {
+                "[dcg:review-unavailable-or-cancelled] Freigabe verworfen: Arbeitsordner oder geprüfte Dateien haben sich während des Dialogs geändert."
+            }
+        }
+    }
+}
+
 /// The authorization scope controls both consent wording and persistence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -211,8 +257,9 @@ impl ReviewSnapshot {
         })
     }
 
-    /// Human-readable effect, working directory, exact command and full small
-    /// script sources. Oversized reviews are refused rather than truncated.
+    /// Human-readable effect, working directory, exact command and targets in
+    /// full; script sources are excerpted to fit. A command or context that
+    /// does not fit by itself is refused rather than truncated.
     pub fn description(
         &self,
         command: &str,
@@ -226,10 +273,7 @@ impl ReviewSnapshot {
         let pattern = info.pattern_name.as_deref()?;
         // A human cannot approve "the checked contents" when inspection did
         // not finish or an executable source/target remains unknown.
-        if ["unverified", "dynamic", "unknown", "parse-error", "timeout"]
-            .iter()
-            .any(|word| pattern.contains(word))
-        {
+        if unreviewable_rule(pattern) {
             return None;
         }
         let pack = info.pack_id.as_deref()?;
@@ -290,21 +334,6 @@ impl ReviewSnapshot {
         if command.contains("ssh ") || command.contains("scp ") {
             text.push_str("\nAchtung: Der Aufruf kann auf einem entfernten Rechner wirken. Host und Ziel im Aufruf prüfen.\n");
         }
-        for item in &self.scripts {
-            let _ = write!(
-                text,
-                "\nSkript {} (vollständiger geprüfter Inhalt):\n",
-                visible(&item.path.display().to_string()),
-            );
-            for line in item.source.lines() {
-                text.push_str("  | ");
-                text.push_str(&visible(line));
-                text.push('\n');
-                if text.len() > MAX_REVIEW_TEXT {
-                    return None;
-                }
-            }
-        }
         let executables =
             crate::invocation::bound_environment(command, &crate::trial::agent_environment())
                 .ok()?
@@ -323,9 +352,18 @@ impl ReviewSnapshot {
                         Some(vec![visible(&executable.display().to_string())])
                     },
                 )?;
+        let mut executable_text = String::new();
         for executable in &executables {
-            let _ = write!(text, "\nAufgelöste ausführbare Datei:\n{executable}\n");
+            let _ = write!(
+                executable_text,
+                "\nAufgelöste ausführbare Datei:\n{executable}\n"
+            );
         }
+        // Context, command, targets and executables are shown in full; only
+        // script bodies are excerpted to fit.
+        let budget = MAX_REVIEW_TEXT.checked_sub(text.len() + executable_text.len())?;
+        text.push_str(&script_excerpts(&self.scripts, budget));
+        text.push_str(&executable_text);
         (text.len() <= MAX_REVIEW_TEXT).then(|| ReviewDescription {
             agent,
             host,
@@ -349,11 +387,30 @@ impl ReviewSnapshot {
         })
     }
 
+    /// Why [`Self::description`] built no dialog for this match, as a tagged
+    /// diagnostic (fork issue #2). It names the actual cause instead of
+    /// calling every refusal "too large", and never suggests retrying a review
+    /// that cannot start.
+    #[must_use]
+    pub fn not_reviewable(&self, info: &PatternMatch) -> &'static str {
+        if info.reason.contains("remote/namespace script") {
+            "[dcg:review-not-started] Keine Desktop-Freigabe möglich: dcg kann Skripte auf entfernten Rechnern oder in anderen Namespaces nicht prüfen, ein Dialog könnte den freizugebenden Inhalt nicht zeigen. Nächster Schritt: getrennte ssh-Aufrufe mit wörtlichen, nur lesenden Befehlen verwenden oder den Befehl vom Nutzer selbst ausführen lassen."
+        } else if self.incomplete || info.pattern_name.as_deref().is_none_or(unreviewable_rule) {
+            "[dcg:review-not-started] Keine Desktop-Freigabe möglich: Die statische Prüfung ist unvollständig, ein Dialog könnte den freizugebenden Inhalt nicht vollständig zeigen. Nächster Schritt: den Befehl vom Nutzer selbst ausführen lassen."
+        } else {
+            "[dcg:review-not-started] Keine Desktop-Freigabe möglich: Ziele oder ausführbare Datei lassen sich nicht statisch bestimmen, oder Aufruf und Kontext sind allein schon zu lang für einen vollständigen Dialog. Nächster Schritt: den Befehl vom Nutzer selbst ausführen lassen."
+        }
+    }
+
     /// Show the context first, begin embedded Touch ID without a consent click,
     /// then recheck every captured source byte and cwd identity.
-    pub fn request(&self, description: &ReviewDescription, cwd: &Path) -> bool {
+    pub fn request(
+        &self,
+        description: &ReviewDescription,
+        cwd: &Path,
+    ) -> Result<(), ReviewFailure> {
         let Some(_lock) = review_lock() else {
-            return false;
+            return Err(ReviewFailure::Busy);
         };
         self.request_with(description, cwd, native_dialog)
     }
@@ -362,18 +419,22 @@ impl ReviewSnapshot {
         &self,
         description: &ReviewDescription,
         cwd: &Path,
-        dialog: impl FnOnce(&ReviewDescription, &str) -> bool,
-    ) -> bool {
-        let Some(before) = directory_identity(cwd) else {
-            return false;
-        };
-        if !self.unchanged() || description.text.len() > MAX_REVIEW_TEXT {
-            return false;
+        dialog: impl FnOnce(&ReviewDescription, &str) -> Result<(), ReviewFailure>,
+    ) -> Result<(), ReviewFailure> {
+        let before = directory_identity(cwd).ok_or(ReviewFailure::NotShowable)?;
+        if !self.unchanged() {
+            return Err(ReviewFailure::Changed);
+        }
+        if description.text.len() > MAX_REVIEW_TEXT {
+            return Err(ReviewFailure::NotShowable);
         }
         let nonce = format!("{:032x}", rand::random::<u128>());
-        dialog(description, &nonce)
-            && self.unchanged()
-            && directory_identity(cwd).as_ref() == Some(&before)
+        dialog(description, &nonce)?;
+        if self.unchanged() && directory_identity(cwd).as_ref() == Some(&before) {
+            Ok(())
+        } else {
+            Err(ReviewFailure::Changed)
+        }
     }
 }
 
@@ -390,20 +451,19 @@ pub fn request_trial(
     scope: ApprovalScope,
     executables: &[PathBuf],
     evidence: Option<&ReviewSnapshot>,
-) -> bool {
+) -> Result<(), ReviewFailure> {
     let Some(_lock) = review_lock() else {
-        return false;
+        return Err(ReviewFailure::Busy);
     };
-    let Some(before) = directory_identity(cwd) else {
-        return false;
-    };
-    let Some(description) =
-        trial_description(command, cwd, summary, agent, scope, executables, evidence)
-    else {
-        return false;
-    };
-    native_dialog(&description, &format!("{:032x}", rand::random::<u128>()))
-        && directory_identity(cwd).as_ref() == Some(&before)
+    let before = directory_identity(cwd).ok_or(ReviewFailure::NotShowable)?;
+    let description = trial_description(command, cwd, summary, agent, scope, executables, evidence)
+        .ok_or(ReviewFailure::NotShowable)?;
+    native_dialog(&description, &format!("{:032x}", rand::random::<u128>()))?;
+    if directory_identity(cwd).as_ref() == Some(&before) {
+        Ok(())
+    } else {
+        Err(ReviewFailure::Changed)
+    }
 }
 
 fn trial_description(
@@ -428,23 +488,13 @@ fn trial_description(
             visible(&path.display().to_string())
         );
     }
-    if let Some(evidence) = evidence {
-        for item in &evidence.scripts {
-            let _ = write!(
-                text,
-                "\n\nSkript {} (vollständiger geprüfter Inhalt):\n",
-                visible(&item.path.display().to_string())
-            );
-            for line in item.source.lines() {
-                let _ = writeln!(text, "  | {}", visible(line));
-                if text.len() > MAX_REVIEW_TEXT {
-                    return None;
-                }
-            }
-        }
-    }
+    // The exact command must be visible in full; script bodies may be excerpted.
     if text.len() > MAX_REVIEW_TEXT {
         return None;
+    }
+    if let Some(evidence) = evidence {
+        let excerpts = script_excerpts(&evidence.scripts, MAX_REVIEW_TEXT - text.len());
+        text.push_str(&excerpts);
     }
     Some(ReviewDescription {
         agent: agent_label(agent),
@@ -470,6 +520,77 @@ fn trial_description(
         scope,
         scope_text: scope.sentence().to_owned(),
     })
+}
+
+/// Reviewed script sources within `budget` bytes (fork issue #2). A source
+/// that does not fit is shown in part, with its path, line count and hash, and
+/// a note that the rest is hidden. Approvals bind every byte of each reviewed
+/// script, so a shortened display never widens what an approval covers;
+/// refusing the dialog instead left real projects without any review route.
+fn script_excerpts(scripts: &[ScriptEvidence], budget: usize) -> String {
+    let mut out = String::new();
+    for (index, item) in scripts.iter().enumerate() {
+        let path = visible(&item.path.display().to_string());
+        let lines: Vec<&str> = item.source.lines().collect();
+        let mut digest = String::with_capacity(12);
+        for byte in &item.digest[..6] {
+            let _ = write!(digest, "{byte:02x}");
+        }
+        let header = format!(
+            "\n\nSkript {path} ({} Zeilen, SHA-256 {digest}…):\n",
+            lines.len()
+        );
+        let hidden_scripts = format!(
+            "\n\n… {} weitere geprüfte Skripte nicht angezeigt; die Freigabe bindet auch deren vollständigen Inhalt.",
+            scripts.len() - index
+        );
+        let hidden_lines = format!(
+            "  … gekürzt: {} weitere Zeilen nicht angezeigt; vollständiger Inhalt in {path}. Die Freigabe bindet den ganzen Inhalt.\n",
+            lines.len()
+        );
+        // Every later script must still be able to report itself as hidden.
+        if out.len() + header.len() + hidden_lines.len() + hidden_scripts.len() > budget {
+            if out.len() + hidden_scripts.len() <= budget {
+                out.push_str(&hidden_scripts);
+            }
+            break;
+        }
+        out.push_str(&header);
+        let mut shown = 0;
+        for line in &lines {
+            let rendered = format!("  | {}\n", visible(line));
+            if out.len() + rendered.len() + hidden_lines.len() + hidden_scripts.len() > budget {
+                break;
+            }
+            out.push_str(&rendered);
+            shown += 1;
+        }
+        if shown < lines.len() {
+            let _ = writeln!(
+                out,
+                "  … gekürzt: {} weitere Zeilen nicht angezeigt; vollständiger Inhalt in {path}. Die Freigabe bindet den ganzen Inhalt.",
+                lines.len() - shown
+            );
+        }
+    }
+    out
+}
+
+/// Rules whose finding is that a source, value or target stays unknown. Their
+/// only review route is the bound trial/script review, never this dialog;
+/// `unresolved` keeps tar-options-unresolved out just as tar-exec-unverified,
+/// from which it was split, always was.
+fn unreviewable_rule(pattern: &str) -> bool {
+    [
+        "unverified",
+        "unresolved",
+        "dynamic",
+        "unknown",
+        "parse-error",
+        "timeout",
+    ]
+    .iter()
+    .any(|word| pattern.contains(word))
 }
 
 fn repository_root(cwd: &Path) -> Option<PathBuf> {
@@ -798,38 +919,38 @@ fn prepare_native_helper_in(base: &Path) -> Option<PathBuf> {
     (bytes == DIALOG_HELPER).then_some(path)
 }
 
-#[cfg(target_os = "macos")]
-fn approved_reply(success: bool, output: &str, nonce: &str) -> bool {
-    success && output.trim() == format!("approved:{nonce}")
+/// The helper answers `approved:<nonce>`, `expired` (its own deadline) or
+/// `denied`. Anything but the exact approval for this nonce is no approval.
+#[cfg(any(target_os = "macos", test))]
+fn dialog_reply(output: &str, nonce: &str) -> Result<(), ReviewFailure> {
+    match output.trim() {
+        reply if reply == format!("approved:{nonce}") => Ok(()),
+        "expired" => Err(ReviewFailure::Expired),
+        _ => Err(ReviewFailure::Declined),
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn native_dialog(description: &ReviewDescription, nonce: &str) -> bool {
-    let Some(base) = crate::config::user_config_dir() else {
-        return false;
-    };
+fn native_dialog(description: &ReviewDescription, nonce: &str) -> Result<(), ReviewFailure> {
+    let base = crate::config::user_config_dir().ok_or(ReviewFailure::HelperUnavailable)?;
     let Some(helper) = prepare_native_helper_in(&base.join("dcg/desktop-review")) else {
         crate::emit_stderr!(
             "[dcg] Touch-ID-Dialog nicht verfügbar oder verändert. Der Vorgang bleibt gestoppt."
         );
-        return false;
+        return Err(ReviewFailure::HelperUnavailable);
     };
-    let Ok(payload) =
+    let payload =
         serde_json::to_vec(&serde_json::json!({"description": description, "nonce": nonce}))
-    else {
-        return false;
-    };
+            .map_err(|_| ReviewFailure::NotShowable)?;
     if payload.len() > 32_768 {
-        return false;
+        return Err(ReviewFailure::NotShowable);
     }
-    let Ok(mut child) = Command::new(helper)
+    let mut child = Command::new(helper)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-    else {
-        return false;
-    };
+        .map_err(|_| ReviewFailure::HelperUnavailable)?;
     // Full commands and script contents travel through stdin, never through
     // shell interpolation or process-list-visible command-line arguments.
     if child
@@ -839,7 +960,7 @@ fn native_dialog(description: &ReviewDescription, nonce: &str) -> bool {
     {
         let _ = child.kill();
         let _ = child.wait();
-        return false;
+        return Err(ReviewFailure::HelperUnavailable);
     }
     let start = Instant::now();
     loop {
@@ -854,30 +975,42 @@ fn native_dialog(description: &ReviewDescription, nonce: &str) -> bool {
                             visible(&error)
                         );
                     }
-                    return false;
+                    // Exit 2: the helper rejected the request as not displayable.
+                    return Err(if status.code() == Some(2) {
+                        ReviewFailure::NotShowable
+                    } else {
+                        ReviewFailure::HelperUnavailable
+                    });
                 }
                 let mut output = String::new();
-                return child.stdout.take().is_some_and(|stream| {
-                    stream.take(129).read_to_string(&mut output).is_ok()
-                        && output.len() <= 128
-                        && approved_reply(status.success(), &output, nonce)
+                let readable = child.stdout.take().is_some_and(|stream| {
+                    stream.take(129).read_to_string(&mut output).is_ok() && output.len() <= 128
                 });
+                if !readable {
+                    return Err(ReviewFailure::HelperUnavailable);
+                }
+                return dialog_reply(&output, nonce);
             }
             Ok(None) if start.elapsed() < Duration::from_secs(DIALOG_SECONDS + 5) => {
                 std::thread::sleep(Duration::from_millis(25));
             }
-            _ => {
+            Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return false;
+                return Err(ReviewFailure::Expired);
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ReviewFailure::HelperUnavailable);
             }
         }
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn native_dialog(_: &ReviewDescription, _: &str) -> bool {
-    false
+fn native_dialog(_: &ReviewDescription, _: &str) -> Result<(), ReviewFailure> {
+    Err(ReviewFailure::HelperUnavailable)
 }
 
 #[cfg(test)]
@@ -1107,33 +1240,98 @@ mod tests {
         let description = snapshot
             .description("rm -rf old", &cwd, &match_info("rm-rf"), "Codex")
             .unwrap();
-        assert!(snapshot.request_with(&description, &cwd, |text, nonce| {
-            assert_eq!(nonce.len(), 32);
-            assert!(!text.text.contains(nonce));
-            assert_eq!(text.agent, "Codex");
-            true
-        }));
-        assert!(!snapshot.request_with(&description, &cwd, |_, _| false));
+        assert_eq!(
+            snapshot.request_with(&description, &cwd, |text, nonce| {
+                assert_eq!(nonce.len(), 32);
+                assert!(!text.text.contains(nonce));
+                assert_eq!(text.agent, "Codex");
+                Ok(())
+            }),
+            Ok(())
+        );
+        for failure in [ReviewFailure::Declined, ReviewFailure::Expired] {
+            assert_eq!(
+                snapshot.request_with(&description, &cwd, |_, _| Err(failure)),
+                Err(failure)
+            );
+        }
         assert_eq!(fs::read_dir(cwd).unwrap().count(), 0);
     }
 
     #[test]
-    fn oversized_review_is_refused_without_hiding_source() {
+    fn long_scripts_are_excerpted_and_marked_instead_of_refused() {
         let root = tempfile::tempdir().unwrap();
         let cwd = root.path().canonicalize().unwrap();
         let capture = ReviewCapture::start();
-        record_script(
-            &cwd.join("long.sh"),
-            &"# long source\n".repeat(500),
-            &cwd,
-            ScriptLanguage::Bash,
-        );
+        let source = "# long source\n".repeat(500);
+        record_script(&cwd.join("long.sh"), &source, &cwd, ScriptLanguage::Bash);
+        record_script(&cwd.join("next.sh"), &source, &cwd, ScriptLanguage::Bash);
+        let snapshot = capture.snapshot();
+        let description = snapshot
+            .description(
+                "bash long.sh && bash next.sh",
+                &cwd,
+                &match_info("rm-rf"),
+                "Codex",
+            )
+            .unwrap();
+        assert!(description.text.len() <= MAX_REVIEW_TEXT);
+        assert!(description.text.contains("bash long.sh && bash next.sh"));
+        assert!(description.text.contains("long.sh (500 Zeilen, SHA-256 "));
+        assert!(description.text.contains("weitere Zeilen nicht angezeigt"));
         assert!(
-            capture
-                .snapshot()
-                .description("bash long.sh", &cwd, &match_info("rm-rf"), "Codex")
-                .is_none()
+            description
+                .text
+                .contains("1 weitere geprüfte Skripte nicht angezeigt")
         );
+        let trial = trial_description(
+            "bash long.sh && bash next.sh",
+            &cwd,
+            "summary",
+            "Codex",
+            ApprovalScope::ApprovedScripts,
+            &[],
+            Some(&snapshot),
+        )
+        .unwrap();
+        assert!(trial.text.len() <= MAX_REVIEW_TEXT);
+        assert!(trial.text.contains("gekürzt"));
+        // The exact command itself is never excerpted.
+        assert!(
+            trial_description(
+                &"x".repeat(MAX_REVIEW_TEXT),
+                &cwd,
+                "summary",
+                "Codex",
+                ApprovalScope::OneTime,
+                &[],
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn excerpts_never_exceed_their_budget() {
+        let evidence = |name: &str, source: String| ScriptEvidence {
+            path: PathBuf::from(name),
+            source,
+            digest: [7; 32],
+            cwd: PathBuf::from("/"),
+            shell: true,
+        };
+        let scripts = vec![
+            evidence("a.sh", "echo a\n".repeat(400)),
+            evidence("b.sh", "x".repeat(9_000)),
+            evidence("c.sh", "echo c\n".to_owned()),
+        ];
+        for budget in [0, 40, 200, 1_000, 2_999, 5_000, 40_000] {
+            assert!(
+                script_excerpts(&scripts, budget).len() <= budget,
+                "{budget}"
+            );
+        }
+        assert!(script_excerpts(&scripts, 40_000).contains("  | echo c\n"));
     }
 
     #[test]
@@ -1169,8 +1367,8 @@ mod tests {
             .unwrap();
         description.title = "Harmloser Dialogtest".to_owned();
         description.effect = "Es wird kein Befehl ausgeführt und nichts gelöscht. Finger auflegen testet nur diesen Dialog.".to_owned();
-        let approved = native_dialog(&description, "00000000000000000000000000000001");
-        eprintln!("Manual preview approved: {approved}");
+        let result = native_dialog(&description, "00000000000000000000000000000001");
+        eprintln!("Manual preview result: {result:?}");
     }
 
     #[cfg(target_os = "macos")]
@@ -1251,16 +1449,25 @@ mod tests {
             assert!(!output.status.success());
             assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "denied");
         }
+    }
+
+    #[test]
+    fn dialog_reply_requires_the_bound_nonce_and_separates_expiry() {
         let nonce = "00000000000000000000000000000001";
-        assert!(approved_reply(true, &format!("approved:{nonce}\n"), nonce));
-        assert!(!approved_reply(false, &format!("approved:{nonce}"), nonce));
+        assert_eq!(dialog_reply(&format!("approved:{nonce}\n"), nonce), Ok(()));
+        assert_eq!(
+            dialog_reply("expired\n", nonce),
+            Err(ReviewFailure::Expired)
+        );
         for reply in [
             "denied",
+            "",
             "approved:other",
             "approved:",
+            "expired:00000000000000000000000000000001",
             "approved:other\napproved:00000000000000000000000000000001",
         ] {
-            assert!(!approved_reply(true, reply, nonce));
+            assert_eq!(dialog_reply(reply, nonce), Err(ReviewFailure::Declined));
         }
     }
 
@@ -1338,10 +1545,13 @@ mod tests {
         let description = snapshot
             .description("bash script.sh", &cwd, &match_info("rm-rf"), "Codex")
             .unwrap();
-        assert!(!snapshot.request_with(&description, &cwd, |_, _| {
-            fs::write(&path, "git clean -fd").unwrap();
-            true
-        }));
+        assert_eq!(
+            snapshot.request_with(&description, &cwd, |_, _| {
+                fs::write(&path, "git clean -fd").unwrap();
+                Ok(())
+            }),
+            Err(ReviewFailure::Changed)
+        );
     }
 
     #[test]

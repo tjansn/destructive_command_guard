@@ -16,6 +16,12 @@ pub enum Outcome {
     Dynamic,
     BoundInputs,
     Limit,
+    /// No dialog was shown, and retrying the same request cannot show one.
+    ReviewNotStarted,
+    ReviewDeclined,
+    ReviewExpired,
+    /// The dialog could not complete: busy, helper unavailable, or reviewed
+    /// inputs changed while it was open.
     ReviewUnavailable,
     InternalCommand,
 }
@@ -48,6 +54,9 @@ impl Outcome {
             Self::Dynamic => "unsupported-dynamic",
             Self::BoundInputs => "bound-input-review",
             Self::Limit => "analysis-limit",
+            Self::ReviewNotStarted => "review-not-started",
+            Self::ReviewDeclined => "review-declined",
+            Self::ReviewExpired => "review-expired",
             Self::ReviewUnavailable => "review-unavailable-or-cancelled",
             Self::InternalCommand => "internal-hook-command",
         }
@@ -59,6 +68,9 @@ impl Outcome {
             Self::Dynamic => "Inspection Incomplete",
             Self::BoundInputs => "Literal Inputs Need Review",
             Self::Limit => "Analysis Limit Reached",
+            Self::ReviewNotStarted => "Review Not Started",
+            Self::ReviewDeclined => "Review Declined",
+            Self::ReviewExpired => "Review Expired",
             Self::ReviewUnavailable => "Review Not Approved",
             Self::InternalCommand => "Internal Hook Command",
         }
@@ -78,8 +90,17 @@ impl Outcome {
             Self::Limit => {
                 "Static analysis reached a resource limit. A bounded parse-only retry cannot authorize execution; reduce the input or request desktop review."
             }
+            Self::ReviewNotStarted => {
+                "No review dialog was shown, and retrying or rephrasing this request cannot show one. Follow the next step named in the reason or ask the user to run the command; no approval was recorded."
+            }
+            Self::ReviewDeclined => {
+                "The user declined this request in the desktop dialog. Do not retry or rephrase it; ask the user how to proceed. No approval was recorded."
+            }
+            Self::ReviewExpired => {
+                "The desktop dialog received no decision within 120 seconds. Ask the user before requesting the same review again; no approval was recorded."
+            }
             Self::ReviewUnavailable => {
-                "The desktop review was unavailable, cancelled, declined or expired. Restore the review route and retry for an explicit decision; no approval was recorded."
+                "The desktop review could not complete: another dialog was open, the Touch ID helper is unavailable (`dcg doctor`), or reviewed inputs changed during the dialog. Resolve that cause before requesting review again; no approval was recorded."
             }
             Self::InternalCommand => {
                 "Submit the original finite command to the hook. Only the hook may construct its confined replacement; direct runner requests cannot be approved or learned."
@@ -93,8 +114,18 @@ pub fn outcome(pack: Option<&str>, pattern: Option<&str>, reason: &str) -> Outco
     if pack == Some("dcg.internal") && pattern == Some("confined-runner") {
         return Outcome::InternalCommand;
     }
-    if reason.contains("[dcg:review-unavailable-or-cancelled]") {
-        return Outcome::ReviewUnavailable;
+    for (tag, review) in [
+        ("[dcg:review-not-started]", Outcome::ReviewNotStarted),
+        ("[dcg:review-declined]", Outcome::ReviewDeclined),
+        ("[dcg:review-expired]", Outcome::ReviewExpired),
+        (
+            "[dcg:review-unavailable-or-cancelled]",
+            Outcome::ReviewUnavailable,
+        ),
+    ] {
+        if reason.contains(tag) {
+            return review;
+        }
     }
     if reason.contains("[dcg:bound-input-review]") {
         return Outcome::BoundInputs;
@@ -246,14 +277,42 @@ mod tests {
             ("[dcg:unsupported-dynamic]", Outcome::Dynamic),
             ("[dcg:bound-input-review]", Outcome::BoundInputs),
             ("[dcg:analysis-limit]", Outcome::Limit),
+            ("[dcg:review-not-started]", Outcome::ReviewNotStarted),
+            ("[dcg:review-declined]", Outcome::ReviewDeclined),
+            ("[dcg:review-expired]", Outcome::ReviewExpired),
             (
                 "[dcg:review-unavailable-or-cancelled]",
                 Outcome::ReviewUnavailable,
             ),
         ] {
             assert_eq!(outcome(None, None, reason), expected);
+            assert!(reason == "destructive" || reason == format!("[dcg:{}]", expected.code()));
             assert!(!expected.code().is_empty());
             assert!(!expected.remediation().is_empty());
+        }
+        // Every review outcome says no approval was recorded, and none of them
+        // tells an agent to simply retry (fork issue #2).
+        for review in [
+            Outcome::ReviewNotStarted,
+            Outcome::ReviewDeclined,
+            Outcome::ReviewExpired,
+            Outcome::ReviewUnavailable,
+        ] {
+            let text = review.remediation().to_lowercase();
+            assert!(text.contains("no approval was recorded"), "{text}");
+            assert!(!text.contains("and retry "), "{text}");
+        }
+        // Every diagnostic the review code emits maps to its own outcome.
+        for failure in [
+            crate::desktop_review::ReviewFailure::Busy,
+            crate::desktop_review::ReviewFailure::NotShowable,
+            crate::desktop_review::ReviewFailure::HelperUnavailable,
+            crate::desktop_review::ReviewFailure::Declined,
+            crate::desktop_review::ReviewFailure::Expired,
+            crate::desktop_review::ReviewFailure::Changed,
+        ] {
+            let code = outcome(None, None, failure.diagnostic()).code();
+            assert!(failure.diagnostic().starts_with(&format!("[dcg:{code}] ")));
         }
         assert!(
             !Outcome::BoundInputs
