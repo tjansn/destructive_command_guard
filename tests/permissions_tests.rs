@@ -444,3 +444,106 @@ fn setfacl_hook_does_not_assume_gnu_ordering_for_bsd_operands() {
         fixture.allowed(command);
     }
 }
+
+#[test]
+fn symbolic_special_bits_survive_mode_order_and_unresolved_tails() {
+    let fixture = Fixture::new(&[]);
+    for (mode, rule) in [
+        ("u+s", "chmod-setuid"),
+        ("u+xs", "chmod-setuid"),
+        ("u+rws", "chmod-setuid"),
+        ("g+s", "chmod-setgid"),
+        ("g+xs", "chmod-setgid"),
+        ("g+rs", "chmod-setgid"),
+        ("a+s", "chmod-setuid"),
+        ("+s", "chmod-setuid"),
+        ("a+xs", "chmod-setuid"),
+    ] {
+        for suffix in ["", " \"$EXTRA\""] {
+            fixture.denied(&format!("chmod {mode} /tmp/file{suffix}"), rule);
+        }
+    }
+    for command in [
+        "chmod u-s /tmp/file",
+        "chmod g-s /tmp/file",
+        "chmod a-s /tmp/file",
+        "chmod o+s /tmp/file",
+        "chmod u+x /tmp/file",
+        "chmod u+xs ./file",
+    ] {
+        fixture.allowed(command);
+    }
+}
+
+#[test]
+fn unresolved_tails_do_not_drop_recursive_alias_or_bundle_checks() {
+    let fixture = Fixture::new(&[]);
+    for (command, rule) in [
+        ("chmod -R 000 /tmp/../etc", "chmod-recursive-root"),
+        ("chmod -R 000 /./etc", "chmod-recursive-root"),
+        ("chown -R nobody /tmp/../etc", "chown-recursive-root"),
+        ("chgrp -R staff /home//user", "chgrp-recursive-root"),
+        ("setfacl -bR /etc", "setfacl-all"),
+        ("setfacl -bR /tmp/../etc", "setfacl-all"),
+        ("setfacl -R -b ~/project/..", "setfacl-all"),
+        ("setfacl -R -b \"${HOME}/project/..\"", "setfacl-all"),
+    ] {
+        for suffix in [" \"$EXTRA\"", " $EXTRA"] {
+            fixture.denied(&format!("{command}{suffix}"), rule);
+        }
+    }
+    fixture.denied(
+        "true && chmod -R 000 /tmp/../etc \"$EXTRA\"",
+        "chmod-recursive-root",
+    );
+    fixture.denied(
+        "'setfacl' -bR /tmp/../etc \"$EXTRA\"",
+        "setfacl-all",
+    );
+}
+
+#[test]
+fn independent_special_bit_grants_remain_separate_in_the_fallback() {
+    let recursive_grant = Fixture::new(&["chmod-recursive-root"]);
+    recursive_grant.denied(
+        "chmod -R 6755 /tmp/../etc \"$EXTRA\"",
+        "chmod-setuid",
+    );
+    let recursive_uid_grant = Fixture::new(&["chmod-recursive-root", "chmod-setuid"]);
+    recursive_uid_grant.denied(
+        "chmod -R 6755 /tmp/../etc \"$EXTRA\"",
+        "chmod-setgid",
+    );
+
+    let uid_grant = Fixture::new(&["chmod-setuid"]);
+    let gid_grant = Fixture::new(&["chmod-setgid"]);
+    let both_grants = Fixture::new(&["chmod-setuid", "chmod-setgid"]);
+    for mode in ["a+s", "+s", "a+xs"] {
+        for suffix in ["", " \"$EXTRA\""] {
+            let command = format!("chmod {mode} /tmp/file{suffix}");
+            uid_grant.denied(&command, "chmod-setgid");
+            gid_grant.denied(&command, "chmod-setuid");
+        }
+        // A complete invocation may use both exact grants. Do not infer the
+        // same safety from an incomplete list of effects in a truncated argv.
+        both_grants.allowed(&format!("chmod {mode} /tmp/file"));
+    }
+    both_grants.denied("chmod -R 6755 /tmp/../etc", "chmod-recursive-root");
+}
+
+#[test]
+fn complete_permission_operands_retain_scope_and_inert_data_roles() {
+    let fixture = Fixture::new(&[]);
+    for command in [
+        "chmod -R 755 /tmp/./project",
+        "chown -R nobody /tmp/project/..",
+        "chgrp -R staff /home/user/project/src/..",
+        "setfacl -Rb /tmp//project",
+        "chmod u+xs ./file",
+        "chmod u-s /tmp/file",
+        "printf '%s' 'setfacl -bR /tmp/../etc \"$EXTRA\"'",
+        "printf '%s' 'chmod a+s /tmp/file'",
+    ] {
+        fixture.allowed(command);
+    }
+}
