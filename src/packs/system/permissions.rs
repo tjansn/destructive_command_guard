@@ -299,6 +299,58 @@ impl SetfaclState {
     }
 }
 
+/// Add a denial for an explicit protected target under FreeBSD's operand
+/// ordering. Its getopt stops at the first filename: later -P/--test/--help
+/// words are filenames, not GNU option events that reset or end the sequence.
+/// A GNU-only non-destructive interpretation cannot exempt that mutation.
+///
+/// This is a deny-only check, not proof that other BSD invocations are safe.
+/// Unknown options and indirect target streams retain the existing fallback.
+/// Borrow the decoded words; do not clone argv or inspect the host filesystem.
+fn setfacl_bsd_protected_target(words: &[PermissionWord]) -> Option<usize> {
+    let mut recursive = false;
+    let mut operation = false;
+    let mut symlink_only = false;
+    let mut index = 0;
+    while let Some(word) = words.get(index) {
+        if word.text == "--" {
+            index += 1;
+            break;
+        }
+        if !word.text.starts_with('-') || word.text == "-" {
+            break;
+        }
+        index += 1;
+        for (offset, option) in word.text[1..].char_indices() {
+            match option {
+                'R' => recursive = true,
+                'b' | 'k' => operation = true,
+                'h' => symlink_only = true,
+                'H' | 'L' | 'P' | 'n' | 'd' => {}
+                'm' | 'M' | 'x' | 'X' => {
+                    if offset + 2 == word.text.len() {
+                        words.get(index)?;
+                        index += 1;
+                    }
+                    operation = true;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+    }
+    // FreeBSD rejects -R with -h before opening any target. Unlike GNU's
+    // help option, -h alone controls symlinks, but it cannot enable recursion.
+    // A leading '-' selects stdin targets, not the later argv filenames.
+    if !recursive || !operation || symlink_only || words.get(index)?.text == "-" {
+        return None;
+    }
+    words[index..]
+        .iter()
+        .position(protected_permission_target)
+        .map(|offset| index + offset)
+}
+
 /// Project an ordered ACL invocation onto the recursive effects this pack
 /// already claims. `targets` contains only a target reached with an ACL
 /// operation, recursion enabled and test mode disabled; it is NOT a bag of
@@ -309,7 +361,7 @@ impl SetfaclState {
 /// an earlier target. Return the first proven protected mutation before any
 /// subsequent option can discard it. Unsupported argv retains regex fallback.
 fn setfacl_invocation(
-    mut words: impl Iterator<Item = PermissionWord>,
+    mut words: std::vec::IntoIter<PermissionWord>,
 ) -> Option<PermissionInvocation> {
     let mut invocation = PermissionInvocation {
         executable: "setfacl".to_string(),
@@ -317,6 +369,10 @@ fn setfacl_invocation(
         mode_or_owner: None,
         targets: Vec::new(),
     };
+    if let Some(index) = setfacl_bsd_protected_target(words.as_slice()) {
+        invocation.targets.push(words.nth(index)?);
+        return Some(invocation);
+    }
     let mut state = SetfaclState::default();
     let mut options = true;
     while let Some(word) = words.next() {
@@ -571,7 +627,7 @@ pub(crate) fn posix_permission_decision(
 ///
 /// Mirrors `system::disk`'s macro of the same shape. The sudo group admits only
 /// `-n`, never arbitrary options: `sudo -u stat chmod -R 777 /etc` passes `stat`
-/// as `-u`'s *value*, so a prefix that skipped `-\S+` would find the tool name
+/// as `-u`'s *value*, so a prefix that skipped `-\S+` options would find the tool name
 /// it was looking for and exempt the chmod behind it. The evaluator's sudo table
 /// knows `-u` consumes a value and normalises that command to `chmod …` today,
 /// which is why nothing was reachable through it — but an exemption that can
@@ -1038,10 +1094,11 @@ mod tests {
         let pack = create_pack();
         for command in [
             "setfacl -b /etc -R -b ./project",
-            // Any option after a target clears the ACL sequence. A new
-            // operation is required before the next target can be processed.
+            // Any option after a target clears the GNU ACL sequence. When
+            // recursion already applies, a BSD target interpretation can still
+            // mutate /etc, so only the explicit leading test form is harmless.
             "setfacl -b ./project -R /etc",
-            "setfacl -Rb ./project -P /etc",
+            "setfacl --test -Rb ./project -P /etc",
             // -- does not clear the current operation sequence.
             "setfacl -b ./project -- /etc",
             // Invalid leading operands stop before later options can run.
@@ -1062,6 +1119,41 @@ mod tests {
             "setfacl -Rb ./project -- --test /etc",
         ] {
             assert_blocks_with_pattern(&pack, command, "setfacl-all");
+        }
+    }
+
+    #[test]
+    fn bsd_setfacl_operands_cannot_inherit_gnu_option_exemptions() {
+        let pack = create_pack();
+        for command in [
+            "setfacl -Rb ./project -P /etc",
+            "setfacl -Rb ./project --test -b /etc",
+            "setfacl -Rb ./project --help /etc",
+            "setfacl -Rb ./project --version /etc",
+            "setfacl -Rb ./project -M /tmp/../etc",
+            "setfacl -HRb /etc",
+            "setfacl -Rb ./project --restore=/tmp/backup /etc",
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::Destructive(vec!["setfacl-all"]),
+                "{command:?}"
+            );
+            assert_blocks_with_pattern(&pack, command, "setfacl-all");
+        }
+        for command in [
+            "setfacl --test -Rb ./project -P /etc",
+            "setfacl --help -Rb /etc",
+            "setfacl -hRb /etc",
+            "setfacl -Rb ./project -P ./second",
+            "setfacl -R -M /etc/acl ./project",
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::NonDestructive,
+                "{command:?}"
+            );
+            assert_allows(&pack, command);
         }
     }
 

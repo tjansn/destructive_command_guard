@@ -382,7 +382,7 @@ fn setfacl_hook_preserves_operation_order_and_compound_boundaries() {
     }
     for command in [
         "setfacl -b ./project -R /etc",
-        "setfacl -Rb ./project -P /etc",
+        "setfacl --test -Rb ./project -P /etc",
         "setfacl /tmp/file -Rb /etc",
         "setfacl --test -Rb /etc; printf done",
         "printf '%s' 'setfacl -Rb /etc'",
@@ -418,4 +418,29 @@ fn setfacl_rule_grants_do_not_exempt_other_permission_effects() {
         "setfacl -Rb /etc; chmod -R 000 /etc; chown -R nobody /etc",
         "chown-recursive-root",
     );
+}
+
+#[test]
+fn setfacl_hook_does_not_assume_gnu_ordering_for_bsd_operands() {
+    let fixture = Fixture::new(&[]);
+    for command in [
+        "setfacl -Rb ./project -P /etc",
+        "setfacl -Rb ./project --test -b /etc",
+        "setfacl -Rb ./project --help /etc",
+        "setfacl -Rb ./project --version /etc",
+        "setfacl -Rb ./project -M /tmp/../etc",
+        "setfacl -HRb /etc",
+        "setfacl -Rb ./project --restore=/tmp/backup /etc",
+    ] {
+        fixture.denied(command, "setfacl-all");
+    }
+    for command in [
+        "setfacl --test -Rb ./project -P /etc",
+        "setfacl --help -Rb /etc",
+        "setfacl -hRb /etc",
+        "setfacl -Rb ./project -P ./second",
+        "setfacl -R -M /etc/acl ./project",
+    ] {
+        fixture.allowed(command);
+    }
 }
