@@ -564,10 +564,11 @@ fn push_oversized_scan_windows(out: &mut Vec<String>, command: &str, max_command
 /// every pack: the oversized input failed open (by default) without any
 /// evaluation. The JSON prefix that WAS read usually still contains
 /// `tool_input.command`, so extract it leniently and run it through the
-/// normal evaluation pipeline. A proven Deny/Ask publishes the ordinary
-/// protocol response and returns `true`; every other outcome — nothing
-/// extractable, benign command, warn/log match, deadline exhausted — returns
-/// `false` so the caller keeps the historic fail-open warning path.
+/// normal evaluation pipeline. A proven Deny/Ask, or a deadline exhausted
+/// before or during any window, publishes the ordinary protocol response;
+/// every other outcome — nothing extractable, benign command, warn/log
+/// match — returns `None` so the caller keeps the historic fail-open warning
+/// path.
 ///
 /// Two attribution rules keep this from over-denying and from under-scanning:
 /// - The prefix must name a recognized SHELL tool (`tool_name`/`toolName`).
@@ -734,25 +735,30 @@ fn try_deny_unparseable_payload(
         // inert unknown binary — reopening the #322 hole on the oversized path.
         let refined_dialect = hook::refine_shell_dialect(command, shell_dialect);
         let outcome = resolve_hook_command(&eval_context, command, refined_dialect, None);
-        if let ResolvedCommandOutcome::DenyFamily(resolved) = outcome {
-            if matches!(resolved.mode, DecisionMode::Deny | DecisionMode::Ask) {
-                let mut history_writer = if config.history.enabled {
-                    let mut writer = create_history_writer(&config.history);
-                    writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
-                    Some(writer)
-                } else {
-                    None
-                };
-                let exit_code = publish_decisive_response(
-                    &eval_context,
-                    ResolvedCommandOutcome::DenyFamily(resolved),
-                    &mut history_writer,
-                );
-                // Dropped here, before the caller can `process::exit`: the
-                // audit row must be flushed first.
-                drop_history_writer(history_writer);
-                return Some(exit_code);
+        // A deadline that expires WHILE a window is evaluated leaves it as
+        // unscanned as one that expired before it. On the last window that
+        // outcome used to fall out of the loop into the fail-open allow, which
+        // is how the #475 test still failed on a loaded host.
+        let decisive = match &outcome {
+            ResolvedCommandOutcome::DeadlineExhausted { .. } => true,
+            ResolvedCommandOutcome::DenyFamily(resolved) => {
+                matches!(resolved.mode, DecisionMode::Deny | DecisionMode::Ask)
             }
+            _ => false,
+        };
+        if decisive {
+            let mut history_writer = if config.history.enabled {
+                let mut writer = create_history_writer(&config.history);
+                writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
+                Some(writer)
+            } else {
+                None
+            };
+            let exit_code = publish_decisive_response(&eval_context, outcome, &mut history_writer);
+            // Dropped here, before the caller can `process::exit`: the
+            // audit row must be flushed first.
+            drop_history_writer(history_writer);
+            return Some(exit_code);
         }
     }
     None
