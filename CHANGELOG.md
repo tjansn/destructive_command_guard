@@ -50,6 +50,23 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   for the project reuses them. Manage them with `dcg allowlist list|remove|prune`.
   See [approved scripts](docs/learned-approvals.md#approved-scripts).
 
+### 0.15.3+tom.17
+
+- **Security: a process substitution could move a script check to the wrong
+  directory (tom.14–tom.16).** For `cd DIR && cat <(cd OTHER && bash x.sh) | cat`,
+  the leading-`cd` proof bound every script to `DIR`, so a harmless `DIR/x.sh`
+  vouched for the `OTHER/x.sh` that actually runs, and the command was
+  allowed. The proof's token check never saw a `cd` inside a substitution. Any
+  command or process substitution, subshell, group or function after the
+  leading `cd` now voids the proof, as its documentation always said. The
+  `$(…)` and backtick spellings were already denied by a later check.
+- **A leading `cd DIR &&` before a pipe now binds for trials and review.**
+  `cd /abs/project && node --test … | cat` was reported as a dynamic working
+  directory, so it could not get a sandbox trial, a Touch ID dialog or a
+  remembered script approval. Version binding now uses the same leading-`cd`
+  proof as script inspection; a `cd` after another command, inside a pipeline
+  stage or inside a substitution still cannot be bound.
+
 ### 0.15.3+tom.16
 
 - **An unbindable project version now says no review can start (fork #2
