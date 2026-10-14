@@ -28,7 +28,19 @@ mod macos {
             let project = fs::canonicalize(project_path).unwrap();
             fs::write(project.join("run.sh"), script).unwrap();
             fs::write(project.join("source.txt"), "original source").unwrap();
-            let store = TrialStore::new(temp.path().join("state"));
+            let agent_home = temp.path().join("agent-home");
+            fs::create_dir(&agent_home).unwrap();
+            // The agent session the trial reproduces, not cargo's test process:
+            // its CARGO_*/DYLD_* additions would make every run inconclusive.
+            let store = TrialStore::new(temp.path().join("state")).with_environment(
+                [
+                    ("PATH", std::env::var_os("PATH").unwrap_or_default()),
+                    ("HOME", agent_home.into_os_string()),
+                ]
+                .into_iter()
+                .map(|(key, value)| (key.into(), value))
+                .collect(),
+            );
             Self {
                 temp,
                 project,
@@ -922,7 +934,10 @@ mod macos {
     #[test]
     fn preview_service_requests_review_without_starting_or_minting_a_code() {
         let fixture = Fixture::new("printf safe");
-        let log = fixture.temp.path().join("preview.log");
+        // Under the hook's HOME: a truncating redirect into the macOS temp root
+        // (/var/folders) is denied by its own rule before the service shape is
+        // considered, and that is not what this test is about.
+        let log = fixture.temp.path().join("home/preview.log");
         let command = format!(
             "nohup python3 -m http.server 18476 --bind 127.0.0.1 --directory {} > {} 2>&1 < /dev/null &",
             shell_words::quote(&fixture.project.display().to_string()),
