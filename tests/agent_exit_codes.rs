@@ -17,16 +17,30 @@ fn dcg_binary() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
 
-/// A `dcg` invocation that cannot rewrite the caller's real agent settings.
+/// A `dcg` invocation isolated from the developer's machine.
 ///
 /// Self-heal writes the invoked binary's own path into the user's agent hook
 /// configuration. Every spawn in this file therefore has to disable it:
 /// otherwise running the test suite registers `target/release/dcg` as a global
 /// Claude Code PreToolUse hook on the developer's machine, and every shell
 /// command they run afterwards is screened by an unreviewed dev build.
+///
+/// The developer's own config, allowlists and `DCG_*` variables must not decide
+/// protocol tests either: a user policy with `fail_closed = true` answers empty
+/// input with a written denial.
 fn dcg_command() -> Command {
+    let home = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("agent_exit_codes-home");
+    std::fs::create_dir_all(&home).expect("isolated home");
     let mut command = Command::new(dcg_binary());
-    command.env("DCG_SELF_HEAL_HOOK", "0");
+    command
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_HISTORY_DISABLED", "1")
+        .env("DCG_SELF_HEAL_HOOK", "0");
     command
 }
 
