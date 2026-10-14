@@ -34,18 +34,24 @@ use std::process::Command;
 /// The driver is JavaScript because the thing under test is a JavaScript module:
 /// only a real loader proves it parses, and only a real call proves it denies.
 const DRIVER: &str = r#"
+import { pathToFileURL } from "node:url";
+
 const [pluginPath, dcgBin, fakesDir] = process.argv.slice(2);
 process.env.DCG_BIN = dcgBin;
+delete process.env.DCG_BYPASS;
+delete process.env.DCG_BRIDGE_CRASH_DECISION;
 
 const DESTRUCTIVE = "rm -rf /";
 const SAFE = "git status";
 let failures = 0;
+let checks = 0;
 const check = (name, ok, detail = "") => {
+  checks += 1;
   if (!ok) { failures += 1; console.error(`FAIL ${name}${detail ? ` — ${detail}` : ""}`); }
 };
 const threw = async (fn) => { try { await fn(); return null; } catch (e) { return e; } };
 
-const mod = await import(pluginPath);
+const mod = await import(pathToFileURL(pluginPath).href);
 
 check("DcgGuard is a function", typeof mod.DcgGuard === "function", typeof mod.DcgGuard);
 check("default export is an object", mod.default && typeof mod.default === "object");
@@ -141,7 +147,8 @@ check("v1 exposes tool.execute.before", typeof v1 === "function", typeof v1);
 if (typeof v1 === "function") {
   check("v1 denies destructive", (await threw(() => v1({ tool: "bash" }, { args: { command: DESTRUCTIVE } }))) !== null);
   check("v1 allows safe", (await threw(() => v1({ tool: "bash" }, { args: { command: SAFE } }))) === null);
-  check("v1 ignores non-command tools", (await threw(() => v1({ tool: "read" }, { args: { path: "/tmp/x" } }))) === null);\n  check("v1 guards command-bearing renamed tools", (await threw(() => v1({ tool: "future-shell" }, { args: { command: DESTRUCTIVE } }))) !== null);
+  check("v1 ignores non-command tools", (await threw(() => v1({ tool: "read" }, { args: { path: "/tmp/x" } }))) === null);
+  check("v1 guards unfamiliar command tools", (await threw(() => v1({ tool: "future-shell" }, { args: { command: DESTRUCTIVE } }))) !== null);
   check("v1 blocks malformed shell payload", (await threw(() => v1({ tool: "bash" }, {}))) !== null);
 }
 
@@ -154,10 +161,75 @@ const v2 = registered[0]?.[1];
 if (typeof v2 === "function") {
   check("v2 shell denies destructive (#547)", (await threw(() => v2({ tool: "shell", input: { command: DESTRUCTIVE } }))) !== null);
   check("v2 shell allows safe", (await threw(() => v2({ tool: "shell", input: { command: SAFE } }))) === null);
-  check("v2 ignores non-command tools", (await threw(() => v2({ tool: "read", input: { path: "/tmp/x" } }))) === null);\n  check("v2 guards command-bearing renamed tools", (await threw(() => v2({ tool: "future-shell", input: { command: DESTRUCTIVE } }))) !== null);
+  check("v2 ignores non-command tools", (await threw(() => v2({ tool: "read", input: { path: "/tmp/x" } }))) === null);
+  check("v2 guards unfamiliar command tools", (await threw(() => v2({ tool: "future-shell", input: { command: DESTRUCTIVE } }))) !== null);
   check("v2 blocks malformed shell payload", (await threw(() => v2({ tool: "shell" }))) !== null);
   check("v2 tolerates undefined event", (await threw(() => v2(undefined))) === null);
 }
+
+// #547: exercise every loader, both real shell tool names, and a renamed
+// command-bearing tool. Never execute destructive text: the sentinel models
+// the host executor and must remain unreachable when the hook vetoes a call.
+const adapters = [
+  ["v1 server", (tool, args) => v1({ tool }, { args })],
+  ["v1 named", (tool, args) => legacy["tool.execute.before"]({ tool }, { args })],
+  ["v2", (tool, args) => v2({ tool, input: args })],
+];
+for (const [adapter, invoke] of adapters) {
+  for (const tool of ["bash", "shell", "terminal", "future-shell", "read"]) {
+    const warnings = [];
+    const originalError = console.error;
+    console.error = (...parts) => warnings.push(parts.join(" "));
+    try {
+      for (const command of [DESTRUCTIVE, "git reset --hard", SAFE]) {
+        let executed = false;
+        const args = { command };
+        const error = await threw(async () => {
+          await invoke(tool, args);
+          executed = true;
+        });
+        const allowed = command === SAFE;
+        check(`${adapter}/${tool}: ${command}`, (error === null) === allowed, String(error?.message));
+        check(`${adapter}/${tool}: interception precedes execution`, executed === allowed);
+        check(`${adapter}/${tool}: command is not rewritten`, args.command === command);
+      }
+      const unfamiliar = tool !== "bash" && tool !== "shell";
+      check(`${adapter}/${tool}: fallback is visible`, unfamiliar
+        ? warnings.some((line) => line.includes("Unrecognized command-bearing OpenCode tool") && line.includes(tool))
+        : warnings.length === 0, warnings.join("\n"));
+    } finally {
+      console.error = originalError;
+    }
+  }
+  for (const tool of ["bash", "shell"]) {
+    for (const args of [undefined, null, {}, [], "git status", { command: null }, { command: 42 },
+      { command: [] }, { command: {} }, { command: "" }, { command: " \t\n" }]) {
+      let executed = false;
+      const error = await threw(async () => { await invoke(tool, args); executed = true; });
+      check(`${adapter}/${tool}: malformed payload fails visibly`,
+        !executed && String(error?.message).includes("incompatible OpenCode shell payload"), String(error?.message));
+    }
+  }
+  check(`${adapter}: non-command tool is unaffected`,
+    (await threw(() => invoke("read", { filePath: "README.md" }))) === null);
+  for (const bypass of ["1", " true ", "YES", "y", "on"]) {
+    process.env.DCG_BYPASS = bypass;
+    check(`${adapter}: explicit bypass ${bypass}`,
+      (await threw(() => invoke("shell", { command: DESTRUCTIVE }))) === null);
+    check(`${adapter}: explicit bypass also skips incompatible payload`,
+      (await threw(() => invoke("shell", {}))) === null);
+  }
+  delete process.env.DCG_BYPASS;
+}
+for (const context of [undefined, null, {}, { tool: null }, { tool: {} }, { tool: { hook: true } }]) {
+  const error = await threw(() => loadV2(mod).setup(context));
+  check("unsupported v2 hook interface fails visibly",
+    String(error?.message).includes("command protection could not be activated"), String(error?.message));
+}
+const registrationError = new Error("host refused hook registration");
+check("v2 propagates registration failure", (await threw(() => loadV2(mod).setup({
+  tool: { hook: async () => { throw registrationError; } },
+}))) === registrationError);
 
 // dcg's escape hatch exits before reading its input, so it never answers; the
 // plugin honours it instead of reading the silence as a crash.
@@ -201,6 +273,7 @@ if (fakesDir) {
   delete process.env.DCG_BRIDGE_CRASH_DECISION;
 }
 
+console.log(`OpenCode adapter: ${checks} checks, ${failures} failures`);
 process.exit(failures === 0 ? 0 : 1);
 "#;
 
@@ -419,9 +492,9 @@ fn generated_opencode_plugin_loads_and_denies_under_both_contracts() {
 }
 
 /// A one-shot OpenAI-compatible chat endpoint for [`real_opencode_blocks_through_the_plugin_516`]:
-/// the first request that offers tools gets one `bash` tool call carrying
-/// `command`; every other request (the tool result, a title request) gets
-/// plain text. Returns the port and the bodies of every request it served.
+/// the first request offering a shell tool gets one call carrying `command`.
+/// Prefer the advertised v2 `shell` tool, falling back to v1 `bash` (#547).
+/// Every other request gets plain text. Returns the port and request bodies.
 fn spawn_fake_llm(
     command: &str,
 ) -> (
@@ -458,7 +531,13 @@ fn spawn_fake_llm(
             }
             let request: serde_json::Value =
                 serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-            let offers_tools = request["tools"].as_array().is_some_and(|t| !t.is_empty());
+            let shell_tool = request["tools"].as_array().and_then(|tools| {
+                ["shell", "bash"].into_iter().find(|name| {
+                    tools
+                        .iter()
+                        .any(|tool| tool["function"]["name"].as_str() == Some(*name))
+                })
+            });
             let has_tool_result = request["messages"]
                 .as_array()
                 .is_some_and(|m| m.iter().any(|m| m["role"] == "tool"));
@@ -469,12 +548,12 @@ fn spawn_fake_llm(
                     "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }],
                 })
             };
-            let events = if offers_tools && !has_tool_result {
+            let events = if let Some(tool) = shell_tool.filter(|_| !has_tool_result) {
                 vec![
                     chunk(
                         serde_json::json!({ "role": "assistant", "content": null, "tool_calls": [{
                             "index": 0, "id": "call_1", "type": "function",
-                            "function": { "name": "bash", "arguments": arguments },
+                            "function": { "name": tool, "arguments": arguments },
                         }]}),
                         serde_json::Value::Null,
                     ),
@@ -559,7 +638,7 @@ fn real_opencode_blocks_through_the_plugin_516() {
             "$schema": "https://opencode.ai/config.json",
             "model": "fake/m",
             "small_model": "fake/m",
-            "permission": { "bash": "allow", "edit": "allow" },
+            "permission": { "bash": "allow", "shell": "allow", "edit": "allow" },
             "provider": { "fake": {
                 "npm": "@ai-sdk/openai-compatible",
                 "name": "Fake",

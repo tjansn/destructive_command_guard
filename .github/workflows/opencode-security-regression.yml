@@ -1,16 +1,16 @@
-name: OpenCode 547 reviewed security correction
+name: OpenCode security regression
 
 on:
-  issue_comment:
-    types: [created]
+  push:
+    branches: [main]
+    paths:
+      - src/cli.rs
+      - tests/repro_419_opencode_plugin_executes.rs
+      - .github/workflows/opencode-security-regression.yml
   workflow_dispatch:
 
 permissions:
   contents: read
-
-concurrency:
-  group: dcg-547-reviewed-security-correction
-  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,86 +18,31 @@ env:
   CARGO_BUILD_JOBS: 2
 
 jobs:
-  land-reviewed-fix:
-    if: >-
-      github.event_name == 'issue_comment' &&
-      github.repository == 'Dicklesworthstone/destructive_command_guard' &&
-      github.event.issue.number == 547 &&
-      github.event.comment.user.login == github.repository_owner &&
-      github.event.comment.body == 'dcg-547-apply-reviewed-patch:8f6114b9235ca56e8901a90fa0443dba5272526e'
+  adapter-regression:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
-          fetch-depth: 0
-      - name: Apply the reviewed patch to exactly the inspected source blobs
-        env:
-          GH_TOKEN: ${{ github.token }}
+          persist-credentials: false
+      - name: Require JavaScript and syntax-check the actual embedded driver
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD:src/cli.rs)" = 5647a4de7b546742af7fb23ed70ff165afc4fff5
-          test "$(git rev-parse HEAD:tests/repro_419_opencode_plugin_executes.rs)" = cc46c451c4c648860cb629f0108c1218a99936c3
-          gh api repos/Dicklesworthstone/destructive_command_guard/git/blobs/8f6114b9235ca56e8901a90fa0443dba5272526e --jq .content | base64 --decode > "$RUNNER_TEMP/dcg547.patch"
-          test "$(git hash-object "$RUNNER_TEMP/dcg547.patch")" = 8f6114b9235ca56e8901a90fa0443dba5272526e
-          git apply --check --whitespace=error "$RUNNER_TEMP/dcg547.patch"
-          git apply --whitespace=error "$RUNNER_TEMP/dcg547.patch"
-          git diff --check
-          test "$(git diff --name-only)" = $'src/cli.rs\ntests/repro_419_opencode_plugin_executes.rs'
-          git diff --stat
+          node --version
+          python3 - <<'PY'
+          import os, pathlib
+          source = pathlib.Path('tests/repro_419_opencode_plugin_executes.rs').read_text()
+          driver = source.split('const DRIVER: &str = r#"', 1)[1].split('"#;', 1)[0]
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'dcg-opencode-driver.mjs').write_text(driver)
+          PY
+          node --check "$RUNNER_TEMP/dcg-opencode-driver.mjs"
       - name: Install the repository's pinned Rust toolchain
-        run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt,clippy
-      - name: Require JavaScript rather than silently skipping the regression
-        run: node --version
+        run: rustup show active-toolchain
       - name: Exercise the installed adapter with compiled DCG
-        id: adapter
         run: cargo test --locked --test repro_419_opencode_plugin_executes -- --nocapture
       - name: Check formatting
         run: cargo fmt --check
-      - name: Commit the validated source correction directly to main
-        run: |
-          set -euo pipefail
-          git diff --check
-          test "$(git diff --name-only)" = $'src/cli.rs\ntests/repro_419_opencode_plugin_executes.rs'
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -- src/cli.rs tests/repro_419_opencode_plugin_executes.rs
-          git commit -m 'fix(opencode): intercept v2 shell execution and compatible command tools (#547)' -m 'Share the command guard across v1 and v2; reject incompatible shell payloads and hook APIs visibly. Preserve the canonical DCG protocol, bypass, and crash/verdict policy. Exercise v2 via shell and assert the before-hook vetoes execution. Select the advertised shell/bash tool in the live-host fixture.' -m 'Validation: cargo test --locked --test repro_419_opencode_plugin_executes -- --nocapture; cargo fmt --check; git diff --check. No live-host or full-suite result is claimed by this commit.'
-          for attempt in 1 2 3; do
-            git fetch origin main
-            test "$(git rev-parse origin/main:src/cli.rs)" = 5647a4de7b546742af7fb23ed70ff165afc4fff5
-            test "$(git rev-parse origin/main:tests/repro_419_opencode_plugin_executes.rs)" = cc46c451c4c648860cb629f0108c1218a99936c3
-            git rebase origin/main
-            if git push origin HEAD:main; then
-              echo "DCG547_PRODUCTION_COMMIT=$(git rev-parse HEAD)"
-              exit 0
-            fi
-          done
-          echo 'main kept moving; no force push attempted' >&2
-          exit 1
       - name: Check all Rust targets
         run: cargo check --locked --all-targets
       - name: Check Clippy
-        if: ${{ !cancelled() && steps.adapter.outcome == 'success' }}
         run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Attempt live OpenCode v1 verification
-        if: ${{ !cancelled() && steps.adapter.outcome == 'success' }}
-        continue-on-error: true
-        timeout-minutes: 6
-        run: |
-          npm install --prefix "$RUNNER_TEMP/opencode-v1" opencode-ai@1.18.33
-          export DCG_TEST_OPENCODE_BIN="$RUNNER_TEMP/opencode-v1/node_modules/.bin/opencode"
-          "$DCG_TEST_OPENCODE_BIN" --version
-          timeout 180s cargo test --locked --test repro_419_opencode_plugin_executes real_opencode_blocks_through_the_plugin_516 -- --ignored --exact --nocapture
-      - name: Attempt live OpenCode v2 verification
-        if: ${{ !cancelled() && steps.adapter.outcome == 'success' }}
-        continue-on-error: true
-        timeout-minutes: 6
-        run: |
-          npm install --prefix "$RUNNER_TEMP/opencode-v2" @opencode/cli@2.0.26
-          export DCG_TEST_OPENCODE_BIN="$RUNNER_TEMP/opencode-v2/node_modules/.bin/opencode"
-          "$DCG_TEST_OPENCODE_BIN" --version
-          timeout 180s cargo test --locked --test repro_419_opencode_plugin_executes real_opencode_blocks_through_the_plugin_516 -- --ignored --exact --nocapture
