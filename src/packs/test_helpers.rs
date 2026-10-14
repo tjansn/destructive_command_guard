@@ -1081,6 +1081,19 @@ pub fn corpus_config() -> Config {
     config
 }
 
+/// One evaluation at a time per process, as in a hook.
+///
+/// The optional interpreter-literal and documentation parsers allow one live
+/// worker per process and answer "busy" with an indeterminate result. Under
+/// `cargo test` every corpus test in a binary shares one process, so
+/// concurrent tests made each other's interpreter heredoc cases indeterminate.
+fn serial_evaluation() -> std::sync::MutexGuard<'static, ()> {
+    static EVALUATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    EVALUATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Evaluate a command with a specific configuration and return a snapshot.
 #[must_use]
 pub fn eval_snapshot_with_config(command: &str, config: &Config) -> EvalSnapshot {
@@ -1092,6 +1105,7 @@ pub fn eval_snapshot_with_config(command: &str, config: &Config) -> EvalSnapshot
     let allowlists = crate::LayeredAllowlist::default();
     let heredoc_settings = config.heredoc_settings();
 
+    let _serial = serial_evaluation();
     let result = evaluate_command_with_pack_order(
         command,
         &enabled_keywords,
@@ -1195,6 +1209,7 @@ pub fn verify_corpus_case(case: &CorpusTestCase, category: CorpusCategory) -> Re
     let allowlists = crate::LayeredAllowlist::default();
     let heredoc_settings = config.heredoc_settings();
 
+    let serial = serial_evaluation();
     let result = evaluate_command_with_pack_order(
         &case.command,
         &enabled_keywords,
@@ -1204,6 +1219,7 @@ pub fn verify_corpus_case(case: &CorpusTestCase, category: CorpusCategory) -> Re
         &allowlists,
         &heredoc_settings,
     );
+    drop(serial);
     let snapshot = EvalSnapshot::from_result(&case.command, &result);
 
     // Get full reason for reason_contains check (not truncated)
