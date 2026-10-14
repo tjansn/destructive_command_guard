@@ -2907,7 +2907,7 @@ fn attempt_sandbox_trial(
             }
             Err(e) => {
                 return Err(format!(
-                    "[dcg:review-not-started] Keine Desktop-Freigabe möglich: Projektstand, Arbeitsordner und ausführbare Dateien lassen sich für diesen Aufruf nicht genau binden ({e}), eine Freigabe könnte nicht an den geprüften Stand gebunden werden. Nächster Schritt: diese Ursache beheben (fehlende Dateien prüfen, Programme wörtlich angeben, einen Verzeichniswechsel nur als führendes `cd <Pfad> &&` ohne Pipe im Aufruf) oder den Befehl vom Nutzer selbst ausführen lassen."
+                    "[dcg:review-not-started] Keine Desktop-Freigabe möglich: Projektstand, Arbeitsordner und ausführbare Dateien lassen sich für diesen Aufruf nicht genau binden ({e}), eine Freigabe könnte nicht an den geprüften Stand gebunden werden. Nächster Schritt: diese Ursache beheben (fehlende Dateien prüfen, Programme wörtlich angeben, einen Verzeichniswechsel nur als führendes `cd <absoluter Pfad> &&` vor allen anderen Befehlen) oder den Befehl vom Nutzer selbst ausführen lassen."
                 ));
             }
         };

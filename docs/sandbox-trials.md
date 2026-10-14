@@ -110,7 +110,7 @@ and none of them tells an agent to retry the same request:
 
 | Code | Meaning |
 |------|---------|
-| `review-not-started` | No dialog was shown and none can be for this request: hook not eligible (several commands, script scanning off, no absolute cwd), inspection incomplete, a remote/namespace script, a command too long to show in full, or a project version dcg cannot bind (a missing file, a dynamic program, a `cd` combined with a pipe). The reason names the cause and the next step. |
+| `review-not-started` | No dialog was shown and none can be for this request: hook not eligible (several commands, script scanning off, no absolute cwd), inspection incomplete, a remote/namespace script, a command too long to show in full, or a project version dcg cannot bind (a missing file, a program named only at run time). The reason names the cause and the next step. |
 | `review-declined` | The user declined in the dialog. |
 | `review-expired` | No decision within the 120-second dialog deadline. |
 | `review-unavailable-or-cancelled` | Another dialog was open, the Touch ID helper is missing or changed (`dcg doctor`), or reviewed inputs changed during the dialog. |

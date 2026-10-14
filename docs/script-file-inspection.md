@@ -59,8 +59,11 @@ actual shell expansions and interpreter execution sinks still receive their
 independent checks. Documentation strings and literal argv data remain data.
 
 A leading literal absolute `cd … && …` can establish an inspection-only directory
-for a following pipeline. This does not supply a blanket path-scoped allowlist
-exception. Backgrounding, OR/semicolon branches, later directory changes,
+for a following pipeline. Sandbox trials, desktop review and remembered script
+approvals bind the pipeline's executables in that same directory. This does not
+supply a blanket path-scoped allowlist exception. Backgrounding, OR/semicolon
+branches, later directory changes, any command or process substitution
+(`$(…)`, backticks, `<(…)`), subshell or group after the leading `cd`,
 `eval`/sourcing and ambiguous executable sources still require verification.
 When the directory is unknown, an absolute native executable can be recognized
 without inventing an execution directory for a script.

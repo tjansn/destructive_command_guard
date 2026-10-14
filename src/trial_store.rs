@@ -1507,6 +1507,10 @@ fn resolved_executables(
     let mut result = BTreeSet::new();
     let parent_path = parent.get(OsStr::new("PATH")).cloned().unwrap_or_default();
     let mut local_environment = false;
+    // The per-prefix walk refuses any pipe, but a leading absolute `cd DIR &&`
+    // that only `&&` and pipes follow runs every later command in DIR. Script
+    // inspection binds its inputs with the same proof.
+    let mut guarded_cwd = None;
     while let Some(node) = pending.pop() {
         pending.extend(node.children());
         if node.kind().as_ref() == "variable_assignment"
@@ -1571,6 +1575,11 @@ fn resolved_executables(
                 &command[..node.range().end],
                 crate::normalize::ShellDialect::Posix,
             )
+            .or_else(|| {
+                guarded_cwd
+                    .get_or_insert_with(|| crate::script_files::guarded_absolute_cwd(command))
+                    .clone()
+            })
             .ok_or_else(|| io::Error::other("dynamic working directory cannot be fingerprinted"))?;
             if let Some(bound) = bound {
                 if let Some((wrapper, path)) = bound.wrapper {
@@ -1777,6 +1786,43 @@ mod tests {
             "/usr/bin/env -i /usr/bin/env NODE_OPTIONS=--require=./startup.js node check.js",
         ] {
             assert!(resolved_executables(command, &project, &BTreeMap::new()).is_err());
+        }
+    }
+
+    /// A leading absolute `cd DIR &&` binds piped stages in DIR, not beside the
+    /// hook's cwd. A `cd` after another command, inside a substitution or in a
+    /// pipeline stage stays unbindable.
+    #[cfg(unix)]
+    #[test]
+    fn leading_directory_change_binds_piped_stages_in_that_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let (temp, project, _) = fixture();
+        let work = temp.path().join("work");
+        fs::create_dir(&work).unwrap();
+        for path in [work.join("tool"), project.join("tool")] {
+            fs::write(&path, "fixture executable").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let dir = shell_words::quote(work.canonicalize().unwrap().to_str().unwrap()).into_owned();
+        let parent = BTreeMap::from([(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))]);
+        let (files, _) = resolved_executables(
+            &format!("cd {dir} && cat input | ./tool --check"),
+            &project,
+            &parent,
+        )
+        .unwrap();
+        assert!(files.contains(&work.join("tool").canonicalize().unwrap()));
+        assert!(!files.contains(&project.join("tool").canonicalize().unwrap()));
+        for command in [
+            format!("echo start; cd {dir} && cat input | ./tool"),
+            format!("cd {dir} && cat <(cd / && ./tool) | cat"),
+            format!("cd {dir} | ./tool"),
+        ] {
+            let error = resolved_executables(&command, &project, &parent).unwrap_err();
+            assert!(
+                error.to_string().contains("dynamic working directory"),
+                "{command}: {error}"
+            );
         }
     }
 

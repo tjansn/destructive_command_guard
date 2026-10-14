@@ -145,6 +145,17 @@ fn routine_pipelines_bind_sources_without_guessing_allowlist_scope() {
     fixture.unverified(&format!("cd {root} && 'eval' 'cd /' && bash safe.sh | cat"));
     fixture.unverified(&format!("cd {root} && bash safe.sh | cat; cd /"));
     fixture.unverified(&format!("cd {root} && ./safe.sh | cat; cd /"));
+    // A substitution runs its own `cd`: the namesake it reaches is not the
+    // file beside the leading directory, so that file must not vouch for it.
+    fixture.write("other/safe.sh", "git reset --hard\n");
+    let other = shell_words::quote(fixture.root.join("other").to_str().unwrap()).into_owned();
+    for nested in [
+        format!("cd {root} && echo $(cd {other} && bash safe.sh) | cat"),
+        format!("cd {root} && echo `cd {other} && bash safe.sh` | cat"),
+        format!("cd {root} && cat <(cd {other} && bash safe.sh) | cat"),
+    ] {
+        fixture.denied(&nested);
+    }
     #[cfg(unix)]
     {
         // /bin is a distro-owned symlink on many Linux systems. This probe
@@ -1805,14 +1816,14 @@ fn large_reviewable_scripts_reach_the_dialog_and_fail_closed_without_helper() {
     assert!(!fixture.root.join("home/.config/dcg/trials").exists());
 }
 
-/// A directory change before a pipe leaves the working directory of the later
-/// stages unbound, so neither a trial nor a dialog can bind this version. A
-/// hook with --desktop-review used to call that "desktop approval
-/// unavailable" and advise --desktop-review; it now says no dialog can start
-/// and why. A hook without the dialog keeps naming the missing flag.
+/// A missing test file cannot be bound, so neither a trial nor a dialog can
+/// bind this version. A hook with --desktop-review used to call that "desktop
+/// approval unavailable" and advise --desktop-review; it now says no dialog
+/// can start and why. A hook without the dialog keeps naming the missing flag.
+/// A leading `cd DIR &&` before a pipe binds, and reaches the (blocked) dialog.
 #[test]
 fn unbindable_versions_report_why_review_cannot_start() {
-    let hook = |fixture: &Fixture, desktop_review: bool| {
+    let hook = |fixture: &Fixture, desktop_review: bool, test_file: &str| {
         for blocker in [
             "home/Library/Application Support/dcg/desktop-review",
             "home/.config/dcg/desktop-review",
@@ -1826,7 +1837,7 @@ fn unbindable_versions_report_why_review_cannot_start() {
         );
         fixture.write("server.mjs", "console.log('fixture');\n");
         let candidate = format!(
-            "cd '{}' && node --test tests/app.test.mjs | cat",
+            "cd '{}' && node --test {test_file} | cat",
             fixture.root.display()
         );
         let input = json!({
@@ -1851,9 +1862,6 @@ fn unbindable_versions_report_why_review_cannot_start() {
             .unwrap();
         let output = child.wait_with_output().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        for attempt in ["Warte auf", "Touch-ID-Dialog"] {
-            assert!(!stderr.contains(attempt), "{candidate}: {stderr}");
-        }
         let verdict: Value = serde_json::from_slice(&output.stdout)
             .unwrap_or_else(|error| panic!("{candidate}: {error}: {stderr}"));
         let denial = &verdict["hookSpecificOutput"];
@@ -1874,25 +1882,43 @@ fn unbindable_versions_report_why_review_cannot_start() {
         ] {
             assert!(!reason.contains(misleading), "{misleading}: {reason}");
         }
-        reason
+        (reason, stderr)
+    };
+    let no_dialog = |stderr: &str| {
+        for attempt in ["Warte auf", "Touch-ID-Dialog"] {
+            assert!(!stderr.contains(attempt), "{stderr}");
+        }
     };
 
-    let reason = hook(&version_review_fixture(), true);
+    let (reason, stderr) = hook(&version_review_fixture(), true, "tests/missing.test.mjs");
+    no_dialog(&stderr);
     assert!(reason.contains("[dcg:review-not-started]"), "{reason}");
     assert!(reason.contains("nicht genau binden"), "{reason}");
-    assert!(reason.contains("working directory"), "{reason}");
     assert!(reason.contains("Nächster Schritt"), "{reason}");
     assert!(reason.contains("no approval was recorded"), "{reason}");
     assert!(!reason.contains("--desktop-review fehlt"), "{reason}");
 
     // Trials stay enabled here, so the sandbox path reaches the same binding.
-    let reason = hook(&Fixture::new(), false);
+    let (reason, stderr) = hook(&Fixture::new(), false, "tests/missing.test.mjs");
+    no_dialog(&stderr);
     assert!(
         reason.contains("Cannot bind an exact project version for a sandbox trial"),
         "{reason}"
     );
     assert!(reason.contains("--desktop-review fehlt"), "{reason}");
     assert!(!reason.contains("[dcg:review-"), "{reason}");
+
+    // An existing test file binds through the leading `cd` despite the pipe,
+    // so the dialog is tried; the blocked helper makes it fail closed.
+    let fixture = version_review_fixture();
+    let (reason, _) = hook(&fixture, true, "tests/app.test.mjs");
+    assert!(
+        reason.contains("[dcg:review-unavailable-or-cancelled]")
+            && reason.contains("Touch-ID-Dialog ist nicht verfügbar"),
+        "{reason}"
+    );
+    assert!(!reason.contains("nicht genau binden"), "{reason}");
+    assert!(!fixture.root.join("home/.config/dcg/trials").exists());
 }
 
 #[test]

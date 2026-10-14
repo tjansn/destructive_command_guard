@@ -491,7 +491,7 @@ fn definite(result: &EvaluationResult) -> bool {
 /// Bind only a leading absolute change whose successful branch contains all
 /// inspected commands. Semicolons, OR, backgrounding, groups, subsequent
 /// directory changes and expansions cannot supply this proof.
-fn guarded_absolute_cwd(command: &str) -> Option<PathBuf> {
+pub(crate) fn guarded_absolute_cwd(command: &str) -> Option<PathBuf> {
     let tokens = tokenize_for_shell_dialect(command, ShellDialect::Posix);
     let first_separator = tokens
         .iter()
@@ -530,6 +530,21 @@ fn guarded_absolute_cwd(command: &str) -> Option<PathBuf> {
         ) {
             return None;
         }
+    }
+    // The tokens keep a substitution whole, so a `cd` inside `$(…)`, backticks
+    // or `<(…)` is invisible above while its commands run elsewhere.
+    let ast = AstGrep::new(command, SupportLang::Bash);
+    if ast.root().dfs().any(|node| {
+        matches!(
+            node.kind().as_ref(),
+            "command_substitution"
+                | "process_substitution"
+                | "subshell"
+                | "compound_statement"
+                | "function_definition"
+        )
+    }) {
+        return None;
     }
     crate::rebase_recovery::resolve_effective_cwd(Path::new("/"), prefix, ShellDialect::Posix)
 }
@@ -1672,6 +1687,43 @@ fn native_binary(magic: &[u8; 4]) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// The guarded proof is shared by script inspection and version binding:
+    /// every later command must run in the leading directory.
+    #[test]
+    fn guarded_cwd_binds_only_a_leading_change_that_every_command_inherits() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().canonicalize().unwrap();
+        let root = shell_words::quote(work.to_str().unwrap()).into_owned();
+        for command in [
+            format!("cd {root} && node --test a.mjs | cat"),
+            format!("cd -- {root} && bash a.sh 2>&1 | tail -1"),
+            format!("cd {root} && make test | tee log && cat log"),
+        ] {
+            assert_eq!(
+                guarded_absolute_cwd(&command).as_deref(),
+                Some(work.as_path()),
+                "{command}"
+            );
+        }
+        for command in [
+            format!("cd {root} | bash a.sh"),
+            "cd work && bash a.sh | cat".to_owned(),
+            format!("cd {root}; bash a.sh | cat"),
+            format!("cd {root} || bash a.sh | cat"),
+            format!("cd {root} && bash a.sh | cat; cd /"),
+            format!("cd {root} && bash a.sh & cat"),
+            format!("cd {root} && eval 'cd /' && bash a.sh | cat"),
+            format!("cd {root} && (cd /tmp && bash a.sh) | cat"),
+            format!("cd {root} && {{ cd /tmp; bash a.sh; }} | cat"),
+            format!("cd {root} && echo $(cd /tmp && bash a.sh) | cat"),
+            format!("cd {root} && echo `cd /tmp && bash a.sh` | cat"),
+            format!("cd {root} && cat <(cd /tmp && bash a.sh) | cat"),
+            "cd $DIR && bash a.sh | cat".to_owned(),
+        ] {
+            assert_eq!(guarded_absolute_cwd(&command), None, "{command}");
+        }
+    }
 
     #[test]
     #[allow(clippy::literal_string_with_formatting_args)] // JavaScript `{recursive:true}`, not a format
