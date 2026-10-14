@@ -2,15 +2,20 @@
 #![cfg(unix)]
 
 use destructive_command_guard::{effects, trial_store::TrialStore};
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 struct Fixture {
     temp: tempfile::TempDir,
     project: PathBuf,
     home: PathBuf,
+    /// The spawned dcg's whole environment. In-process approvals bind against
+    /// it too, so both sides fingerprint the same inherited state.
+    environment: BTreeMap<OsString, OsString>,
     store: TrialStore,
 }
 
@@ -27,11 +32,13 @@ impl Fixture {
             "[general]\nunverified_decision = 'deny'\n[heredoc]\nscan_script_files = true\n[trial]\nenabled = false\n",
         ).unwrap();
         let home = home.canonicalize().unwrap();
-        let store = TrialStore::new(home.join(".config/dcg"));
+        let environment = environment(temp.path(), &home);
+        let store = TrialStore::new(home.join(".config/dcg")).with_environment(environment.clone());
         Self {
             temp,
             project: project.canonicalize().unwrap(),
             home,
+            environment,
             store,
         }
     }
@@ -40,20 +47,7 @@ impl Fixture {
         let mut process = Command::new(env!("CARGO_BIN_EXE_dcg"));
         process
             .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .env("HOME", &self.home)
-            .env("USERPROFILE", &self.home)
-            .env("XDG_CONFIG_HOME", self.home.join(".config"))
-            .env("TMPDIR", self.temp.path())
-            .env("TEMP", self.temp.path())
-            .env("TMP", self.temp.path())
-            .env("DCG_CONFIG", self.temp.path().join("config.toml"))
-            .env("DCG_SELF_HEAL_HOOK", "0")
-            .env("DCG_HOOK_TIMEOUT_MS", "10000")
-            .env(
-                "DCG_ALLOWLIST_SYSTEM_PATH",
-                self.temp.path().join("no-system.toml"),
-            )
+            .envs(&self.environment)
             .current_dir(&self.project);
         process
     }
@@ -106,6 +100,28 @@ impl Fixture {
     }
 }
 
+fn environment(temp: &Path, home: &Path) -> BTreeMap<OsString, OsString> {
+    [
+        ("PATH", std::env::var_os("PATH").unwrap_or_default()),
+        ("HOME", home.into()),
+        ("USERPROFILE", home.into()),
+        ("XDG_CONFIG_HOME", home.join(".config").into()),
+        ("TMPDIR", temp.into()),
+        ("TEMP", temp.into()),
+        ("TMP", temp.into()),
+        ("DCG_CONFIG", temp.join("config.toml").into()),
+        ("DCG_SELF_HEAL_HOOK", "0".into()),
+        ("DCG_HOOK_TIMEOUT_MS", "10000".into()),
+        (
+            "DCG_ALLOWLIST_SYSTEM_PATH",
+            temp.join("no-system.toml").into(),
+        ),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.into(), value))
+    .collect()
+}
+
 #[test]
 fn learned_filesystem_cli_lists_removes_and_prunes_separately_from_trials() {
     let fixture = Fixture::new();
@@ -114,6 +130,7 @@ fn learned_filesystem_cli_lists_removes_and_prunes_separately_from_trials() {
         &command,
         &fixture.project,
         "core.filesystem:rm-recursive-general",
+        &fixture.environment,
     )
     .unwrap();
     let entry = fixture

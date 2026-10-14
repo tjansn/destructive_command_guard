@@ -128,12 +128,25 @@ impl Default for StoreData {
 #[derive(Debug, Clone)]
 pub struct TrialStore {
     directory: PathBuf,
+    /// What fingerprinted commands inherit; see [`crate::trial::agent_environment`].
+    environment: BTreeMap<OsString, OsString>,
 }
 
 impl TrialStore {
     #[must_use]
-    pub const fn new(directory: PathBuf) -> Self {
-        Self { directory }
+    pub fn new(directory: PathBuf) -> Self {
+        Self {
+            directory,
+            environment: crate::trial::agent_environment(),
+        }
+    }
+
+    /// Bind versions against an explicit inherited environment instead of
+    /// dcg's own, e.g. the hermetic environment of a spawned dcg process.
+    #[must_use]
+    pub fn with_environment(mut self, environment: BTreeMap<OsString, OsString>) -> Self {
+        self.environment = environment;
+        self
     }
 
     /// Use the same trusted user directory as ordinary allowlist entries.
@@ -184,22 +197,22 @@ impl TrialStore {
             .map(|source| cwd.join(source).canonicalize())
             .collect::<io::Result<Vec<_>>>()?;
         let manifest = source_manifest(&project_root)?;
-        let parent_environment: BTreeMap<_, _> = std::env::vars_os().collect();
+        let parent_environment = &self.environment;
+        let search_path = parent_environment
+            .get(OsStr::new("PATH"))
+            .cloned()
+            .unwrap_or_default();
         let (resolved, local_environment) =
-            resolved_executables(command, &cwd, &parent_environment)?;
+            resolved_executables(command, &cwd, parent_environment)?;
         let reviewed_executables = resolved.iter().cloned().collect();
         let mut executables = BTreeSet::new();
         executables.insert(shell.clone());
         executables.extend(sources.iter().cloned());
-        resolve_interpreters(
-            &mut executables,
-            &cwd,
-            &std::env::var_os("PATH").unwrap_or_default(),
-        )?;
+        resolve_interpreters(&mut executables, &cwd, &search_path)?;
         executables.extend(resolved);
-        let (environment_digest, environment_reproduced) = runtime_environment(&parent_environment);
+        let (environment_digest, environment_reproduced) = runtime_environment(parent_environment);
         let mut runtime = ignored_runtime_inputs(&project_root);
-        let startup = shell_startup_inputs(&shell, &parent_environment);
+        let startup = shell_startup_inputs(&shell, parent_environment);
         let public_config = existing_runtime_inputs(PUBLIC_RUNTIME_CONFIGS.map(PathBuf::from));
         // Overrides are bound, but are not the sanitized trial environment.
         let mut reproducible = !local_environment
@@ -226,12 +239,7 @@ impl TrialStore {
             // elsewhere. Exact approvals must retain their original semantics.
             hash_field(&mut hasher, command.as_bytes());
             hash_field(&mut hasher, environment_digest.as_bytes());
-            hash_field(
-                &mut hasher,
-                std::env::var_os("PATH")
-                    .unwrap_or_default()
-                    .as_encoded_bytes(),
-            );
+            hash_field(&mut hasher, search_path.as_encoded_bytes());
             let mut dirty = false;
             let mut runtime_bytes = 0_u64;
             for (index, path) in runtime.files.iter().enumerate() {
@@ -411,6 +419,7 @@ impl TrialStore {
             &fingerprint.command,
             &fingerprint.cwd,
             &fingerprint.rule_id,
+            &self.environment,
         )?;
         if current != *fingerprint {
             return Err(io::Error::other(
@@ -503,7 +512,12 @@ impl TrialStore {
             if project.is_some_and(|project| !entry.cwd.starts_with(project)) {
                 continue;
             }
-            let current = crate::effects::fingerprint(&entry.command, &entry.cwd, &entry.rule_id);
+            let current = crate::effects::fingerprint(
+                &entry.command,
+                &entry.cwd,
+                &entry.rule_id,
+                &self.environment,
+            );
             if !current.is_ok_and(|value| value.digest == entry.fingerprint) {
                 stale_learned.insert(entry.fingerprint);
             }
@@ -1749,6 +1763,7 @@ mod tests {
             ),
             &project.canonicalize().unwrap(),
             "core.filesystem:rm-recursive-general",
+            &crate::trial::agent_environment(),
         )
         .unwrap()
     }

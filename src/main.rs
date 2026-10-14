@@ -2625,6 +2625,7 @@ fn assess_filesystem_outcome(
         &resolved.command,
         ctx.scope_base?,
         &rule,
+        &destructive_command_guard::trial::agent_environment(),
     ))
 }
 
@@ -2666,6 +2667,7 @@ fn allow_filesystem_effect(
             &version.command,
             &version.cwd,
             &version.rule_id,
+            &destructive_command_guard::trial::agent_environment(),
         )
         .is_ok_and(|current| current == *version)
     {

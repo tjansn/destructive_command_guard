@@ -301,7 +301,7 @@ impl ReviewSnapshot {
             }
         }
         let executables =
-            crate::invocation::bound_environment(command, &std::env::vars_os().collect())
+            crate::invocation::bound_environment(command, &crate::trial::agent_environment())
                 .ok()?
                 .map_or_else(
                     || Some(Vec::new()),

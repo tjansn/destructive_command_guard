@@ -280,6 +280,29 @@ impl TrialReport {
     }
 }
 
+/// The environment a reviewed command inherits.
+///
+/// That is dcg's own, because the agent starts the hook with the environment
+/// its tool commands run in. Policy that depends on inherited variables reads
+/// this, never the process directly.
+///
+/// The lib's unit tests see only an ordinary session baseline. Cargo and rustup
+/// add `CARGO_*`, `OUT_DIR`, `DYLD_FALLBACK_LIBRARY_PATH` and `LD_LIBRARY_PATH`
+/// to every test process; no agent environment carries them, and they made each
+/// inherited-preload and reproducibility check fail under `cargo test`.
+#[must_use]
+pub fn agent_environment() -> BTreeMap<OsString, OsString> {
+    let environment = std::env::vars_os();
+    #[cfg(test)]
+    let environment = environment.filter(|(key, _)| {
+        matches!(
+            key.to_str(),
+            Some("PATH" | "HOME" | "USER" | "LOGNAME" | "SHELL" | "LANG" | "TERM" | "TMPDIR")
+        )
+    });
+    environment.collect()
+}
+
 /// No broad environment forwarding. NODE_OPTIONS is intentionally excluded:
 /// it can inject un-fingerprinted preloads and read credentials at startup.
 pub fn trial_environment(

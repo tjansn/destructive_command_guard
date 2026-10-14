@@ -478,7 +478,7 @@ fn references(
     }
     let mut references = Vec::new();
     let mut review_reason = None;
-    let environment = std::env::vars_os().collect();
+    let environment = crate::trial::agent_environment();
     let mut pending = vec![ast.root()];
     while let Some(node) = pending.pop() {
         if deadline.is_exceeded() {
@@ -1383,16 +1383,24 @@ fn inspect_js_inputs(
 }
 
 fn verify_syntax_interpreter(program: &str, cwd: &Path) -> Result<(), String> {
-    if std::env::vars_os().any(|(key, value)| {
-        !value.is_empty() && {
-            let key = key.to_string_lossy();
-            matches!(
-                key.as_ref(),
-                "NODE_OPTIONS" | "BASH_ENV" | "ENV" | "ZDOTDIR" | "LD_PRELOAD" | "LD_LIBRARY_PATH"
-            ) || key.starts_with("DYLD_")
-                || key.starts_with("BASH_FUNC_")
-        }
-    }) {
+    if crate::trial::agent_environment()
+        .iter()
+        .any(|(key, value)| {
+            !value.is_empty() && {
+                let key = key.to_string_lossy();
+                matches!(
+                    key.as_ref(),
+                    "NODE_OPTIONS"
+                        | "BASH_ENV"
+                        | "ENV"
+                        | "ZDOTDIR"
+                        | "LD_PRELOAD"
+                        | "LD_LIBRARY_PATH"
+                ) || key.starts_with("DYLD_")
+                    || key.starts_with("BASH_FUNC_")
+            }
+        })
+    {
         return Err("syntax-only invocation has unverified startup/preload context".to_owned());
     }
     let path = if program.contains('/') {

@@ -1,6 +1,8 @@
 //! Bounded filesystem evidence for literal commands. Never executes a candidate.
 //! A version grant resolves one rule, not sibling rules or an entire shell program.
 
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read};
@@ -31,6 +33,8 @@ pub struct Assessment {
     pub self_protected: bool,
     pub summary: Option<String>,
     pub version: Option<OperandFingerprint>,
+    /// The inherited environment `version` was bound under; rechecks reuse it.
+    environment: BTreeMap<OsString, OsString>,
 }
 
 #[derive(Debug)]
@@ -430,11 +434,18 @@ fn definite_filesystem_rule(rule_id: &str) -> bool {
             .any(|part| rule_id.contains(part))
 }
 
-pub fn fingerprint(command: &str, cwd: &Path, rule_id: &str) -> io::Result<OperandFingerprint> {
+/// `environment` is what the command inherits; see
+/// [`crate::trial::agent_environment`].
+pub fn fingerprint(
+    command: &str,
+    cwd: &Path,
+    rule_id: &str,
+    environment: &BTreeMap<OsString, OsString>,
+) -> io::Result<OperandFingerprint> {
     if !definite_filesystem_rule(rule_id) {
         return Err(unsupported("not a definite filesystem rule"));
     }
-    if std::env::vars_os().any(|(key, value)| {
+    if environment.iter().any(|(key, value)| {
         !value.is_empty() && {
             let key = key.to_string_lossy();
             matches!(
@@ -480,9 +491,9 @@ pub fn fingerprint(command: &str, cwd: &Path, rule_id: &str) -> io::Result<Opera
         field(&mut hash, name.as_bytes());
         field(
             &mut hash,
-            std::env::var_os(name)
-                .unwrap_or_default()
-                .as_encoded_bytes(),
+            environment
+                .get(OsStr::new(name))
+                .map_or(&[][..], |value| value.as_encoded_bytes()),
         );
     }
     let mut manifest = Manifest::default();
@@ -551,7 +562,12 @@ fn single_file_effect(parsed: &Invocation, home: &Path) -> bool {
                 .is_some_and(|parent| !sensitive_directory(parent, home)))
 }
 
-pub fn assess(command: &str, cwd: &Path, rule_id: &str) -> Assessment {
+pub fn assess(
+    command: &str,
+    cwd: &Path,
+    rule_id: &str,
+    environment: &BTreeMap<OsString, OsString>,
+) -> Assessment {
     if changes_self(command) {
         return Assessment {
             self_protected: true,
@@ -572,7 +588,7 @@ pub fn assess(command: &str, cwd: &Path, rule_id: &str) -> Assessment {
             ..Assessment::default()
         };
     }
-    let version = match fingerprint(command, cwd, rule_id) {
+    let version = match fingerprint(command, cwd, rule_id, environment) {
         Ok(version) => Some(version),
         Err(error) if error.to_string() == SELF_PROTECTION => {
             return Assessment {
@@ -606,6 +622,7 @@ pub fn assess(command: &str, cwd: &Path, rule_id: &str) -> Assessment {
         self_protected: false,
         summary,
         version,
+        environment: environment.clone(),
     }
 }
 
@@ -670,8 +687,13 @@ impl Assessment {
         };
         let unchanged = || {
             self.version.as_ref().is_none_or(|version| {
-                fingerprint(&version.command, &version.cwd, &version.rule_id)
-                    .is_ok_and(|current| current == *version)
+                fingerprint(
+                    &version.command,
+                    &version.cwd,
+                    &version.rule_id,
+                    &self.environment,
+                )
+                .is_ok_and(|current| current == *version)
             })
         };
         if !unchanged() || !dialog(scope) || !unchanged() {
@@ -700,6 +722,15 @@ mod tests {
 
     const MOVE: &str = "core.filesystem:mv-sensitive-source-root-home";
     const REMOVE: &str = "core.filesystem:rm-recursive-general";
+
+    // Every case here runs under the agent environment, as the hook does.
+    fn fingerprint(command: &str, cwd: &Path, rule_id: &str) -> io::Result<OperandFingerprint> {
+        super::fingerprint(command, cwd, rule_id, &crate::trial::agent_environment())
+    }
+
+    fn assess(command: &str, cwd: &Path, rule_id: &str) -> Assessment {
+        super::assess(command, cwd, rule_id, &crate::trial::agent_environment())
+    }
 
     fn fixture() -> (tempfile::TempDir, PathBuf, TrialStore) {
         let temporary = tempfile::tempdir().unwrap();
