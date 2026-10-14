@@ -243,11 +243,12 @@ mod macos {
             r#"{"exports":{".":"./loader.mjs"}}"#,
         )
         .unwrap();
+        // A literal cleanup target, so static analysis has a dependency finding
+        // to defer: a cleanup through a parameter yields none to begin with.
         fs::write(
             package.join("loader.mjs"),
             "import fs from 'node:fs';\n\
-             export function cleanup(path) { fs.rmSync(path, {recursive:true, force:true}); }\n\
-             cleanup('build/cache');\n",
+             fs.rmSync('build/cache', {recursive: true, force: true});\n",
         )
         .unwrap();
         fs::write(
@@ -466,9 +467,11 @@ mod macos {
             "export function cleanup(path) { require('fs').rmSync(path, {recursive:true}); }",
         )
         .unwrap();
+        // A single-file rmSync is allowed by policy wherever it appears (#455),
+        // so the direct case deletes tracked source recursively.
         for command in [
             "npm test && git reset --hard",
-            "node --eval 'require(\"fs\").rmSync(\"tracked.txt\")' --test case.test.cjs",
+            "node --eval 'require(\"fs\").rmSync(\"tracked.txt\", {recursive: true})' --test case.test.cjs",
         ] {
             let output = hook_request(
                 &fixture.project,
