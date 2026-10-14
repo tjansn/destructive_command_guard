@@ -52,22 +52,17 @@ success** — one line, revert, next lever, no retraction narrative.
 
 ---
 
-## Git Branch: ONLY Use `main`, NEVER `master`
+## Git Branch: ONLY `main` (this fork has exactly one branch)
 
-**The default branch is `main`. The `master` branch exists only for legacy URL compatibility.**
+**Tom's fork (`tjansn/destructive_command_guard`) keeps a single branch, `main`, locally and on
+`origin`.** Its `master` and feature branches were merged and deleted on 2026-10-14.
 
-- **All work happens on `main`** — commits, PRs, feature branches all merge to `main`
-- **Never reference `master` in code or docs** — if you see `master` anywhere, it's a bug that needs fixing
-- **The `master` branch must stay synchronized with `main`** — after pushing to `main`, also push to `master`:
-  ```bash
-  git push origin main:master
-  ```
-
-**Why this matters:** The `dcg update` command and install URLs historically referenced `master`. If `master` falls behind `main`, users get stale code. We had a bug where `master` was **497 commits behind**, causing users to see old installer behavior.
-
-**If you see `master` referenced anywhere:**
-1. Update it to `main`
-2. Ensure `master` is synchronized: `git push origin main:master`
+- **All work is committed on `main`** — do not create, push or recreate `master` or other branches
+  in this fork, and do not run `git push origin main:master`.
+- **Never reference `master` in code or docs** — if you see `master` anywhere, it's a bug that needs fixing.
+- `dcg update` and the install URLs point at the upstream repository
+  (`Dicklesworthstone/destructive_command_guard`), never at this fork's branches, so nothing here
+  depends on a fork `master`. Upstream itself still keeps `master` synchronized for its legacy URLs.
 
 ---
 
@@ -932,8 +927,7 @@ patch version instead of moving the tag or replacing signed assets.
 ### 4. Push and Trigger Release
 
 ```bash
-git push origin main
-git push origin main:master  # Keep master in sync
+git push origin main  # this fork has no master branch
 ```
 
 The `release-automation.yml` workflow will:
@@ -1488,7 +1482,6 @@ VERSION=vX.Y.Z
 git status --short
 git tag -a "$VERSION" -m "Release $VERSION"
 git push origin main
-git push origin main:master
 git push origin "$VERSION"
 ```
 
