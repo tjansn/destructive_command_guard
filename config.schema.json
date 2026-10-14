@@ -92,6 +92,7 @@
         "enabled": true,
         "timeout_secs": 600,
         "network": "localhost",
+        "confined_loopback": "none",
         "max_copy_bytes": 2000000000,
         "keep_artifacts": false
       }
@@ -792,9 +793,14 @@
           "default": 600
         },
         "network": {
-          "description": "Network access is restricted to localhost; other policies are unsupported.",
+          "description": "Observational trials deny outbound TCP, including localhost.",
           "$ref": "#/$defs/TrialNetwork",
           "default": "localhost"
+        },
+        "confined_loopback": {
+          "description": "Trusted continuing-confinement policy. Observational trials ignore it.",
+          "$ref": "#/$defs/ConfinedLoopback",
+          "default": "none"
         },
         "max_copy_bytes": {
           "description": "Maximum bytes copied when copy-on-write cloning is unavailable.",
@@ -811,13 +817,21 @@
       }
     },
     "TrialNetwork": {
-      "description": "Network policy for sandboxed trials. Only loopback traffic is supported.",
+      "description": "Observational network policy: local listeners and owned Unix sockets only.",
       "oneOf": [
         {
-          "description": "Permit loopback connections and Unix sockets inside the trial directory.",
+          "description": "Permit loopback listeners and owned Unix sockets; outbound TCP is denied.",
           "type": "string",
           "const": "localhost"
         }
+      ]
+    },
+    "ConfinedLoopback": {
+      "description": "Trusted opt-in for Part E only. This grants access to every host loopback\nservice, including services outside the confined process tree.",
+      "type": "string",
+      "enum": [
+        "none",
+        "all"
       ]
     },
     "ConfidenceConfig": {

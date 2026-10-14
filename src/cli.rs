@@ -2755,7 +2755,11 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }) => {
             use std::io::Write as _;
             let request = crate::confined::Request::decode(&request)?;
-            let result = crate::confined::run(&request, &std::env::temp_dir())?;
+            let result = crate::confined::run(
+                &request,
+                &std::env::temp_dir(),
+                config.trial.confined_loopback,
+            )?;
             std::io::stdout().write_all(&result.stdout)?;
             std::io::stderr().write_all(&result.stderr)?;
             std::io::stdout().flush()?;

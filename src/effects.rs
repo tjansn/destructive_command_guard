@@ -1,6 +1,8 @@
 //! Bounded filesystem evidence for literal commands. Never executes a candidate.
 //! A version grant resolves one rule, not sibling rules or an entire shell program.
 
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read};
@@ -31,6 +33,8 @@ pub struct Assessment {
     pub self_protected: bool,
     pub summary: Option<String>,
     pub version: Option<OperandFingerprint>,
+    /// The inherited environment `version` was bound under; rechecks reuse it.
+    environment: BTreeMap<OsString, OsString>,
 }
 
 #[derive(Debug)]
@@ -430,11 +434,18 @@ fn definite_filesystem_rule(rule_id: &str) -> bool {
             .any(|part| rule_id.contains(part))
 }
 
-pub fn fingerprint(command: &str, cwd: &Path, rule_id: &str) -> io::Result<OperandFingerprint> {
+/// `environment` is what the command inherits; see
+/// [`crate::trial::agent_environment`].
+pub fn fingerprint(
+    command: &str,
+    cwd: &Path,
+    rule_id: &str,
+    environment: &BTreeMap<OsString, OsString>,
+) -> io::Result<OperandFingerprint> {
     if !definite_filesystem_rule(rule_id) {
         return Err(unsupported("not a definite filesystem rule"));
     }
-    if std::env::vars_os().any(|(key, value)| {
+    if environment.iter().any(|(key, value)| {
         !value.is_empty() && {
             let key = key.to_string_lossy();
             matches!(
@@ -480,9 +491,9 @@ pub fn fingerprint(command: &str, cwd: &Path, rule_id: &str) -> io::Result<Opera
         field(&mut hash, name.as_bytes());
         field(
             &mut hash,
-            std::env::var_os(name)
-                .unwrap_or_default()
-                .as_encoded_bytes(),
+            environment
+                .get(OsStr::new(name))
+                .map_or(&[][..], |value| value.as_encoded_bytes()),
         );
     }
     let mut manifest = Manifest::default();
@@ -551,7 +562,12 @@ fn single_file_effect(parsed: &Invocation, home: &Path) -> bool {
                 .is_some_and(|parent| !sensitive_directory(parent, home)))
 }
 
-pub fn assess(command: &str, cwd: &Path, rule_id: &str) -> Assessment {
+pub fn assess(
+    command: &str,
+    cwd: &Path,
+    rule_id: &str,
+    environment: &BTreeMap<OsString, OsString>,
+) -> Assessment {
     if changes_self(command) {
         return Assessment {
             self_protected: true,
@@ -572,7 +588,7 @@ pub fn assess(command: &str, cwd: &Path, rule_id: &str) -> Assessment {
             ..Assessment::default()
         };
     }
-    let version = match fingerprint(command, cwd, rule_id) {
+    let version = match fingerprint(command, cwd, rule_id, environment) {
         Ok(version) => Some(version),
         Err(error) if error.to_string() == SELF_PROTECTION => {
             return Assessment {
@@ -606,6 +622,7 @@ pub fn assess(command: &str, cwd: &Path, rule_id: &str) -> Assessment {
         self_protected: false,
         summary,
         version,
+        environment: environment.clone(),
     }
 }
 
@@ -657,26 +674,43 @@ impl Assessment {
 
     /// The dialog is injected only in tests. Production passes the existing
     /// nonce-bound biometric review and rechecks operands before AND after it.
-    pub fn review_with(&self, store: Option<&TrialStore>, dialog: impl FnOnce() -> bool) -> bool {
+    pub fn review_with(
+        &self,
+        store: Option<&TrialStore>,
+        dialog: impl FnOnce(crate::desktop_review::ApprovalScope) -> bool,
+    ) -> bool {
+        use crate::desktop_review::ApprovalScope;
+        let scope = if !self.self_protected && self.version.is_some() && store.is_some() {
+            ApprovalScope::LearnedFilesystem
+        } else {
+            ApprovalScope::OneTime
+        };
         let unchanged = || {
             self.version.as_ref().is_none_or(|version| {
-                fingerprint(&version.command, &version.cwd, &version.rule_id)
-                    .is_ok_and(|current| current == *version)
+                fingerprint(
+                    &version.command,
+                    &version.cwd,
+                    &version.rule_id,
+                    &self.environment,
+                )
+                .is_ok_and(|current| current == *version)
             })
         };
-        if !unchanged() || !dialog() || !unchanged() {
+        if !unchanged() || !dialog(scope) || !unchanged() {
             return false;
         }
-        if !self.self_protected
+        if scope == ApprovalScope::LearnedFilesystem
             && let (Some(store), Some(version)) = (store, self.version.as_ref())
         {
-            // Persistence failure cannot expand an approval; it remains one-request.
-            let _ = store.approve_learned(
-                version,
-                self.summary
-                    .as_deref()
-                    .unwrap_or("Touch ID: exact filesystem operands"),
-            );
+            // Do not silently substitute a different scope for the user's consent.
+            return store
+                .approve_learned(
+                    version,
+                    self.summary
+                        .as_deref()
+                        .unwrap_or("Touch ID: exact filesystem operands"),
+                )
+                .is_ok();
         }
         true
     }
@@ -688,6 +722,15 @@ mod tests {
 
     const MOVE: &str = "core.filesystem:mv-sensitive-source-root-home";
     const REMOVE: &str = "core.filesystem:rm-recursive-general";
+
+    // Every case here runs under the agent environment, as the hook does.
+    fn fingerprint(command: &str, cwd: &Path, rule_id: &str) -> io::Result<OperandFingerprint> {
+        super::fingerprint(command, cwd, rule_id, &crate::trial::agent_environment())
+    }
+
+    fn assess(command: &str, cwd: &Path, rule_id: &str) -> Assessment {
+        super::assess(command, cwd, rule_id, &crate::trial::agent_environment())
+    }
 
     fn fixture() -> (tempfile::TempDir, PathBuf, TrialStore) {
         let temporary = tempfile::tempdir().unwrap();
@@ -846,15 +889,48 @@ mod tests {
         let text = command("rm -r", &[&target]);
         let first = assess(&text, &project, REMOVE);
         assert!(!first.allow && !first.learned(&store));
-        assert!(first.review_with(Some(&store), || true));
+        assert!(first.review_with(Some(&store), |scope| scope
+            == crate::desktop_review::ApprovalScope::LearnedFilesystem));
         assert!(assess(&text, &project, REMOVE).learned(&store));
         assert!(!assess(&text, &project, "core.filesystem:rm-protected-file").learned(&store));
         assert!(!assess(&format!("{text} "), &project, REMOVE).learned(&store));
         fs::write(&target, "changed").unwrap();
         let next = assess(&text, &project, REMOVE);
         assert!(!next.learned(&store));
-        assert!(!next.review_with(Some(&store), || false));
+        assert!(!next.review_with(Some(&store), |_| false));
         assert_eq!(store.list_learned().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unavailable_learning_store_uses_one_time_scope() {
+        let (_temp, project, store) = fixture();
+        let target = project.join("target");
+        fs::write(&target, "original").unwrap();
+        let check = assess(&command("rm -r", &[&target]), &project, REMOVE);
+        assert!(check.review_with(None, |scope| {
+            assert_eq!(scope, crate::desktop_review::ApprovalScope::OneTime);
+            true
+        }));
+        assert!(store.list_learned().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_learning_write_cannot_silently_change_the_consented_scope() {
+        let (_temp, project, _) = fixture();
+        let target = project.join("target");
+        fs::write(&target, "original").unwrap();
+        let store_path = project.join("not-a-directory");
+        fs::write(&store_path, "fixture obstacle").unwrap();
+        let store = TrialStore::new(store_path);
+        let check = assess(&command("rm -r", &[&target]), &project, REMOVE);
+        assert!(!check.review_with(Some(&store), |scope| {
+            assert_eq!(
+                scope,
+                crate::desktop_review::ApprovalScope::LearnedFilesystem
+            );
+            true
+        }));
+        assert_eq!(fs::read_to_string(target).unwrap(), "original");
     }
 
     #[test]
@@ -864,7 +940,7 @@ mod tests {
         fs::write(&target, "original").unwrap();
         let text = command("rm -r", &[&target]);
         let check = assess(&text, &project, REMOVE);
-        assert!(!check.review_with(Some(&store), || {
+        assert!(!check.review_with(Some(&store), |_| {
             fs::write(&target, "changed").unwrap();
             true
         }));
@@ -915,7 +991,8 @@ mod tests {
             for _ in 0..2 {
                 let mut asked = false;
                 assert!(!assessment.allow && !assessment.learned(&store));
-                assert!(assessment.review_with(Some(&store), || {
+                assert!(assessment.review_with(Some(&store), |scope| {
+                    assert_eq!(scope, crate::desktop_review::ApprovalScope::OneTime);
                     asked = true;
                     true
                 }));

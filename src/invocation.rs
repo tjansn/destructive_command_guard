@@ -2,11 +2,503 @@
 
 use crate::heredoc::ScriptLanguage;
 
+/// Split only a literal leading cd. The caller must still validate the entire
+/// remaining command; this function never grants permission for a chain.
+pub(crate) fn leading_cd(
+    source: &str,
+    cwd: &std::path::Path,
+    cdpath: Option<&std::ffi::OsStr>,
+) -> Option<(std::path::PathBuf, String)> {
+    use crate::normalize::{NormalizeTokenKind, tokenize_for_normalization};
+    let source = source.trim();
+    // The normalization tokenizer and shell_words disagree about comments.
+    // Reject even quoted '#' here instead of reviving a commented-out suffix.
+    if source.contains('#') {
+        return None;
+    }
+    let tokens = tokenize_for_normalization(source);
+    let separator = tokens
+        .iter()
+        .position(|token| token.kind == NormalizeTokenKind::Separator)?;
+    let token = &tokens[separator];
+    if &source[token.byte_range.clone()] != "&&" {
+        return None;
+    }
+    let prefix = &source[..token.byte_range.start];
+    if prefix.contains(['$', '`', '~', '\n', '\r', '*', '?', '[', '{']) {
+        return None;
+    }
+    let words = shell_words::split(prefix).ok()?;
+    let path = match words.as_slice() {
+        [cd, path] if cd == "cd" => path,
+        [cd, options, path] if cd == "cd" && options == "--" => path,
+        _ => return None,
+    };
+    if path.is_empty() || path.starts_with('-') {
+        return None;
+    }
+    let path = std::path::Path::new(path);
+    if !path.is_absolute() && cdpath.is_some_and(|value| !value.is_empty()) {
+        return None;
+    }
+    let target = cwd.join(path).canonicalize().ok()?;
+    if !target.is_dir() {
+        return None;
+    }
+    let rest = source[token.byte_range.end..].trim();
+    (!rest.is_empty()).then(|| (target, rest.to_owned()))
+}
+
+#[derive(Debug)]
+pub(crate) struct BoundEnvironment {
+    pub values: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    pub wrapper: Option<(String, std::ffi::OsString)>,
+    pub program: String,
+    /// Original program/argument text, excluding only the bound prefix.
+    pub command: String,
+    preload: bool,
+}
+
+impl BoundEnvironment {
+    pub fn ensure_reviewable(&self) -> Result<(), String> {
+        if self.preload {
+            Err("inherited preload or command-local startup state cannot be approved by literal-environment review".to_owned())
+        } else {
+            let stripped = crate::normalize::strip_wrapper_prefixes(&self.command);
+            if stripped.wrapper_limit_reached || !stripped.stripped_wrappers.is_empty() {
+                return Err("nested environment or execution wrappers cannot be bound for literal-environment review".to_owned());
+            }
+            Ok(())
+        }
+    }
+}
+
+pub(crate) fn preload_variable(name: &str) -> bool {
+    name.starts_with("DYLD_")
+        || name.starts_with("LD_")
+        || name.starts_with("BASH_FUNC_")
+        || matches!(
+            name,
+            "NODE_OPTIONS"
+                | "NODE_PATH"
+                | "BASH_ENV"
+                | "ENV"
+                | "RUBYOPT"
+                | "RUBYLIB"
+                | "PERL5OPT"
+                | "PERL5LIB"
+                | "PYTHONPATH"
+                | "PYTHONHOME"
+                | "ZDOTDIR"
+                | "PHPRC"
+                | "PHP_INI_SCAN_DIR"
+        )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnvironmentReview {
+    None,
+    Trial,
+    Bound,
+}
+
+/// Classify only the command prefix, without interpreting assignment values or
+/// consulting the hook's environment. Ordinary prefixes retain normal inspection,
+/// including dynamic values; PATH and env -i need the stricter binding below.
+pub(crate) fn environment_review(source: &str) -> EnvironmentReview {
+    use crate::normalize::{NormalizeTokenKind, is_env_assignment, tokenize_for_normalization};
+    let tokens = tokenize_for_normalization(source);
+    let mut words = tokens
+        .iter()
+        .take_while(|token| token.kind == NormalizeTokenKind::Word)
+        .map(|token| {
+            let raw = &source[token.byte_range.clone()];
+            shell_words::split(raw)
+                .ok()
+                .and_then(|words| words.into_iter().next())
+                .unwrap_or_else(|| raw.to_owned())
+        })
+        .peekable();
+    let mut review = EnvironmentReview::None;
+    // Walk assignment/env prefixes only. Classification does not authorize
+    // nested wrappers: literal binding still rejects them in ensure_reviewable.
+    loop {
+        while words.peek().is_some_and(|word| is_env_assignment(word)) {
+            let word = words.next().expect("peeked assignment");
+            let (name, _) = word.split_once('=').expect("assignment name");
+            let name = name.strip_suffix('+').unwrap_or(name);
+            let name = name.split_once('[').map_or(name, |(name, _)| name);
+            if name == "PATH" {
+                return EnvironmentReview::Bound;
+            }
+            if preload_variable(name) {
+                review = EnvironmentReview::Trial;
+            }
+        }
+        if words
+            .next()
+            .is_none_or(|word| word.rsplit('/').next() != Some("env"))
+        {
+            break;
+        }
+        if words
+            .peek()
+            .is_some_and(|word| matches!(word.as_str(), "-i" | "--ignore-environment"))
+        {
+            return EnvironmentReview::Bound;
+        }
+        if words.peek().is_some_and(|word| word == "--") {
+            words.next();
+        }
+    }
+    review
+}
+
+fn absolute_search_path(path: &std::ffi::OsStr) -> Result<(), String> {
+    // POSIX command data can also be inspected on Windows (e.g. git-bash).
+    // Keep slash-rooted POSIX PATH syntax separate from native guard paths.
+    if cfg!(windows)
+        && path
+            .to_str()
+            .is_some_and(|value| value.split(':').all(|entry| entry.starts_with('/')))
+    {
+        return Ok(());
+    }
+    if path.is_empty() || std::env::split_paths(path).any(|entry| !entry.is_absolute()) {
+        return Err(
+            "PATH must contain only non-empty absolute directories; desktop review unavailable"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Bind literal assignment operands without executing a shell or expanding
+/// variables. Unsupported env switches remain unavailable for review.
+pub(crate) fn bound_environment(
+    source: &str,
+    parent: &std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+) -> Result<Option<BoundEnvironment>, String> {
+    use crate::normalize::{NormalizeTokenKind, tokenize_for_normalization};
+    if environment_review(source) != EnvironmentReview::Bound {
+        return Ok(None);
+    }
+    let tokens = tokenize_for_normalization(source);
+    let mut values = parent.clone();
+    let mut index = 0;
+    let mut bound = false;
+    let word = |index: usize| -> Result<(String, &str), String> {
+        let token = tokens.get(index).ok_or("environment has no executable")?;
+        if token.kind != NormalizeTokenKind::Word {
+            return Err("environment executable is not a literal word".to_owned());
+        }
+        let raw = &source[token.byte_range.clone()];
+        let decoded = shell_words::split(raw).map_err(|e| e.to_string())?;
+        match decoded.as_slice() {
+            [value] => Ok((value.clone(), raw)),
+            _ => Err("environment operand is not a literal word".to_owned()),
+        }
+    };
+    let assignment = |value: &str,
+                      raw: &str|
+     -> Result<Option<(std::ffi::OsString, std::ffi::OsString)>, String> {
+        let Some((name, value)) = value.split_once('=') else {
+            return Ok(None);
+        };
+        if name.is_empty()
+            || name.starts_with(|ch: char| ch.is_ascii_digit())
+            || !name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            return Err("invalid literal environment name".to_owned());
+        }
+        if raw.contains(['$', '`', '~', '\n', '\r', '*', '?', '[', ']', '{', '}']) {
+            return Err("environment expansion or substitution cannot be reviewed".to_owned());
+        }
+        Ok(Some((name.into(), value.into())))
+    };
+    while let Ok((value, raw)) = word(index) {
+        let Some((key, value)) = assignment(&value, raw)? else {
+            break;
+        };
+        values.insert(key, value);
+        bound = true;
+        index += 1;
+    }
+    let (outer, _) = word(index)?;
+    let mut wrapper = None;
+    if outer.rsplit('/').next() == Some("env") {
+        wrapper = Some((
+            outer,
+            values
+                .get(std::ffi::OsStr::new("PATH"))
+                .cloned()
+                .unwrap_or_default(),
+        ));
+        index += 1;
+        if matches!(word(index)?.0.as_str(), "-i" | "--ignore-environment") {
+            values.clear();
+            bound = true;
+            index += 1;
+        }
+        if word(index)?.0 == "--" {
+            index += 1;
+        }
+        while let Ok((value, raw)) = word(index) {
+            let Some((key, value)) = assignment(&value, raw)? else {
+                break;
+            };
+            values.insert(key, value);
+            bound = true;
+            index += 1;
+        }
+    }
+    if !bound {
+        return Ok(None);
+    }
+    let (program, raw) = word(index)?;
+    if program.starts_with('-') || raw.contains(['$', '`', '~', '*', '?', '[', '{']) {
+        return Err("environment executable requires a literal path".to_owned());
+    }
+    if !program.contains('/') && !values.contains_key(std::ffi::OsStr::new("PATH")) {
+        return Err(
+            "cleared environment requires a literal PATH or absolute executable".to_owned(),
+        );
+    }
+    let preload = [parent, &values].iter().any(|environment| {
+        environment
+            .iter()
+            .any(|(key, value)| !value.is_empty() && preload_variable(&key.to_string_lossy()))
+    });
+    if let Some(path) = values.get(std::ffi::OsStr::new("PATH")) {
+        absolute_search_path(path)?;
+    }
+    if let Some((wrapper, path)) = &wrapper
+        && !wrapper.contains('/')
+    {
+        absolute_search_path(path)?;
+    }
+    let command = source[tokens[index].byte_range.start..].to_owned();
+    Ok(Some(BoundEnvironment {
+        values,
+        wrapper,
+        program,
+        command,
+        preload,
+    }))
+}
+
+#[cfg(test)]
+mod literal_environment_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::ffi::{OsStr, OsString};
+
+    #[test]
+    fn leading_cd_is_literal_canonical_and_independent_of_cdpath() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("with space");
+        std::fs::create_dir(&child).unwrap();
+        let result = leading_cd("cd 'with space' && node --test", temp.path(), None).unwrap();
+        assert_eq!(
+            result,
+            (child.canonicalize().unwrap(), "node --test".to_owned())
+        );
+        assert!(
+            leading_cd(
+                "cd 'with space' && node --test",
+                temp.path(),
+                Some(OsStr::new("/different"))
+            )
+            .is_none()
+        );
+        let absolute = format!(
+            "cd -- {} && node --test",
+            shell_words::quote(child.to_str().unwrap())
+        );
+        assert!(leading_cd(&absolute, temp.path(), Some(OsStr::new("/different"))).is_some());
+        for command in [
+            "cd - && node --test",
+            "cd $HOME && node --test",
+            "cd $(pwd) && node --test",
+            "cd .; node --test",
+            "cd . || node --test",
+            "cd",
+            "cd . &&",
+            "cd . # && node --test",
+            "cd . # comment\n&& node --test",
+            "cd . && node --test # comment",
+        ] {
+            assert!(
+                leading_cd(command, temp.path(), None).is_none(),
+                "{command}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_environment_binds_only_spelled_out_values() {
+        let parent = BTreeMap::from([
+            (OsString::from("PATH"), OsString::from("/parent/bin")),
+            (OsString::from("SECRET"), OsString::from("not forwarded")),
+        ]);
+        let bound = bound_environment(
+            "env -i HOME='/tmp/with space' PATH=/usr/bin:/bin EMPTY= cargo test",
+            &parent,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(bound.program, "cargo");
+        assert_eq!(bound.command, "cargo test");
+        assert_eq!(bound.values.len(), 3);
+        assert_eq!(bound.values[OsStr::new("HOME")], "/tmp/with space");
+        assert_eq!(bound.values[OsStr::new("PATH")], "/usr/bin:/bin");
+        assert_eq!(bound.values[OsStr::new("EMPTY")], "");
+        assert_eq!(bound.wrapper, Some(("env".into(), "/parent/bin".into())));
+    }
+
+    #[test]
+    fn expansions_unsupported_options_and_missing_path_remain_unbound() {
+        for command in [
+            "env -i HOME=$HOME PATH=/bin cargo test",
+            "env -i HOME=$(pwd) PATH=/bin cargo test",
+            "env -i HOME=`pwd` PATH=/bin cargo test",
+            "env -i HOME=~ PATH=/bin cargo test",
+            "env -i HOME=/tmp/* PATH=/bin cargo test",
+            "env -i HOME=/tmp cargo test",
+            "env -i -u HOME PATH=/bin cargo test",
+            "PATH=$PATH cargo test",
+        ] {
+            assert!(
+                bound_environment(command, &BTreeMap::new()).is_err(),
+                "{command}"
+            );
+        }
+        let bound = bound_environment("/usr/bin/env -i HOME=/tmp /usr/bin/true", &BTreeMap::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.program, "/usr/bin/true");
+        assert!(
+            bound_environment("cargo test", &BTreeMap::new())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn literal_path_rejects_empty_and_relative_search_entries() {
+        let parent = BTreeMap::from([(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))]);
+        for path in [
+            "",
+            ".:/usr/bin",
+            ":/usr/bin",
+            "bin:/usr/bin",
+            "/usr/bin:",
+            "/bin::/usr/bin",
+        ] {
+            for prefix in ["env -i ", ""] {
+                let command = format!("{prefix}PATH={path} node scripts/check.js");
+                assert!(
+                    bound_environment(&command, &parent)
+                        .unwrap_err()
+                        .contains("absolute directories"),
+                    "{command}"
+                );
+            }
+        }
+        assert!(
+            bound_environment("env -i PATH=/usr/bin:/bin node scripts/check.js", &parent)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn ordinary_prefixes_never_bind_values_or_the_inherited_path() {
+        for path in ["", ".:/usr/bin", ":/usr/bin", "bin:/usr/bin", "/usr/bin:"] {
+            let parent = BTreeMap::from([(OsString::from("PATH"), OsString::from(path))]);
+            for command in [
+                "GIT_PAGER=cat git log",
+                "CI=1 npm test",
+                "LC_ALL=C grep fixture input.txt",
+                "TZ=UTC date",
+                "PI_OFFLINE=1 PI_OS_AGENT=0 swift test",
+                "FOO=$BAR git log",
+                "FOO=~/fixture git log",
+                "FOO=*.txt git log",
+                "FOO={one,two} git log",
+                "env FOO=$BAR git log",
+                "env -- CI=1 npm test",
+                "CI=1 env TZ=UTC date",
+                "printf '%s' PATH=/relative",
+            ] {
+                assert_eq!(environment_review(command), EnvironmentReview::None);
+                assert!(bound_environment(command, &parent).unwrap().is_none());
+            }
+        }
+        for command in [
+            "FOO=$BAR PATH=/bin cargo test",
+            "env CI=1 PATH=/bin cargo test",
+            "CI=1 env -i /bin/true",
+            "PATH+=:/bin cargo test",
+        ] {
+            assert_eq!(environment_review(command), EnvironmentReview::Bound);
+        }
+    }
+
+    #[test]
+    fn local_preloads_use_trials_but_cannot_enter_literal_environment_review() {
+        for name in [
+            "NODE_OPTIONS",
+            "NODE_PATH",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "BASH_ENV",
+            "PYTHONPATH",
+        ] {
+            let command = format!("{name}=fixture /usr/bin/true");
+            assert_eq!(environment_review(&command), EnvironmentReview::Trial);
+            assert_eq!(
+                environment_review(&format!("CI=1 env CI=1 env {command}")),
+                EnvironmentReview::Trial
+            );
+            assert!(
+                bound_environment(&command, &BTreeMap::new())
+                    .unwrap()
+                    .is_none()
+            );
+            let command = format!("/usr/bin/env -i {command}");
+            assert!(
+                bound_environment(&command, &BTreeMap::new())
+                    .unwrap()
+                    .unwrap()
+                    .ensure_reviewable()
+                    .unwrap_err()
+                    .contains("preload")
+            );
+            let parent = BTreeMap::from([(OsString::from(name), OsString::from("fixture"))]);
+            assert!(
+                bound_environment("/usr/bin/env -i /usr/bin/true", &parent)
+                    .unwrap()
+                    .unwrap()
+                    .ensure_reviewable()
+                    .unwrap_err()
+                    .contains("preload")
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourceRole {
     Executable,
     SyntaxData,
     Startup,
+    NodeImport,
+    NodeRequire,
 }
 
 #[derive(Debug)]
@@ -184,7 +676,15 @@ pub(crate) fn classify(
             }
             result.sources.push(Source {
                 path,
-                role: SourceRole::Startup,
+                role: if node && !reporter {
+                    if arg == "--import" || arg.starts_with("--import=") {
+                        SourceRole::NodeImport
+                    } else {
+                        SourceRole::NodeRequire
+                    }
+                } else {
+                    SourceRole::Startup
+                },
                 glob: false,
             });
             continue;

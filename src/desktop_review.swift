@@ -4,6 +4,66 @@ import AppKit
 import Foundation
 import LocalAuthentication
 import LocalAuthenticationEmbeddedUI
+import QuartzCore
+
+// The window server must not infer an active-state rectangular shadow from
+// NSGlassEffectView's backing surface. Clip the material and draw one explicit
+// rounded shadow inside a transparent, padded window in both focus states.
+@MainActor
+final class ReviewPanelSurface: NSView {
+    static let padding: CGFloat = 20
+    static let radius: CGFloat = 28
+    let clip = NSView()
+    // Not `shadow`: that name would override NSView's NSShadow property.
+    private let shadowLayer = CALayer()
+    private let shadowCutout = CAShapeLayer()
+
+    init(material: NSView) {
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+        shadowLayer.shadowColor = NSColor.black.cgColor
+        shadowLayer.shadowOpacity = 0.22
+        shadowLayer.shadowRadius = 10
+        shadowLayer.shadowOffset = CGSize(width: 0, height: -3)
+        shadowCutout.fillRule = .evenOdd
+        shadowLayer.mask = shadowCutout
+        layer?.addSublayer(shadowLayer)
+        clip.wantsLayer = true
+        clip.layer?.cornerRadius = Self.radius
+        clip.layer?.masksToBounds = true
+        clip.layer?.borderWidth = 0
+        addSubview(clip)
+        clip.addSubview(material)
+        material.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            material.leadingAnchor.constraint(equalTo: clip.leadingAnchor),
+            material.trailingAnchor.constraint(equalTo: clip.trailingAnchor),
+            material.topAnchor.constraint(equalTo: clip.topAnchor),
+            material.bottomAnchor.constraint(equalTo: clip.bottomAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func layout() {
+        super.layout()
+        let panel = bounds.insetBy(dx: Self.padding, dy: Self.padding)
+        clip.frame = panel
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        shadowLayer.frame = bounds
+        let outline = CGPath(roundedRect: panel, cornerWidth: Self.radius,
+                             cornerHeight: Self.radius, transform: nil)
+        shadowLayer.shadowPath = outline
+        let cutout = CGMutablePath()
+        cutout.addRect(bounds)
+        cutout.addPath(outline)
+        shadowCutout.frame = bounds
+        shadowCutout.path = cutout
+        CATransaction.commit()
+    }
+}
 
 struct ReviewDescription: Decodable {
     let agent: String
@@ -15,16 +75,31 @@ struct ReviewDescription: Decodable {
     let effect: String
     let warning: String?
     let command: String
+    let executables: [String]
     let targets: [String]
     let text: String
+    let scope: String
+    let scope_text: String
+
+    static func inlineCommand(_ source: String) -> String {
+        source.replacingOccurrences(of: "\r\n", with: "\n")
+            .components(separatedBy: .newlines).joined(separator: " ⏎ ")
+            .replacingOccurrences(of: "\t", with: " ⇥ ")
+    }
+
+    var commandHeading: String {
+        command.contains(where: { $0.isNewline }) ? "Aufruf · mehrere Zeilen (Details)" : "Aufruf"
+    }
 
     var valid: Bool {
-        let required = [agent, project, cwd, title, effect, command, text]
-        let fields = required + targets + [host ?? "", repository ?? "", warning ?? ""]
-        return required.allSatisfy { !$0.isEmpty } && cwd.hasPrefix("/") &&
+        let required = [agent, project, cwd, title, effect, command, text, scope_text]
+        let fields = required + targets + executables + [host ?? "", repository ?? "", warning ?? ""]
+        return ["one_time", "exact_version", "learned_filesystem", "confined"].contains(scope) &&
+            required.allSatisfy { !$0.isEmpty } && cwd.hasPrefix("/") &&
             agent.utf8.count <= 128 && project.utf8.count <= 512 &&
             (host?.utf8.count ?? 0) <= 128 && title.utf8.count <= 128 &&
-            text.utf8.count <= 5_000 && targets.count <= 128 &&
+            text.utf8.count <= 5_000 && targets.count <= 128 && executables.count <= 128 &&
+            executables.allSatisfy { $0.hasPrefix("/") } &&
             fields.reduce(0) { $0 + $1.utf8.count } <= 16_000
     }
 }
@@ -173,6 +248,8 @@ final class ReviewController: NSObject, NSWindowDelegate {
     private var timer: Timer?
     private var authContainer: NSView?
     private var authInstruction: NSTextField?
+    private var authDetail: NSTextField?
+    private var panelContent: NSView?
     private var window: ReviewWindow?
     private var details: NSScrollView?
     private var detailsButton: NSButton?
@@ -184,8 +261,7 @@ final class ReviewController: NSObject, NSWindowDelegate {
         },
         makeAttempt: { [weak self] in self?.makeAttempt() },
         waiting: { [weak self] in
-            self?.authInstruction?.stringValue = "Klicke auf den Dialog, um mit Touch ID fortzufahren"
-            self?.resizeToFit()
+            self?.showPaused()
         },
         reactivate: { [weak self] in
             DispatchQueue.main.async {
@@ -337,6 +413,68 @@ final class ReviewController: NSObject, NSWindowDelegate {
         return effect
     }
 
+    private func commandSummary(_ info: ReviewDescription) -> NSView {
+        let command = label(ReviewDescription.inlineCommand(info.command), size: 12)
+        let cwd = label(info.cwd, size: 11)
+        for field in [command, cwd] {
+            field.font = .monospacedSystemFont(ofSize: field === command ? 12 : 11, weight: .regular)
+            field.maximumNumberOfLines = 1
+            field.lineBreakMode = .byTruncatingMiddle
+            field.toolTip = field.stringValue
+        }
+        command.toolTip = info.command
+        command.setAccessibilityLabel("Genauer Aufruf: \(info.command)")
+        cwd.setAccessibilityLabel("Arbeitsordner: \(info.cwd)")
+        let result = vertical([label(info.commandHeading, size: 11, weight: .semibold), command,
+                               label("Arbeitsordner", size: 11, weight: .semibold), cwd,
+                               label(info.scope_text, size: 12)], spacing: 5)
+        if !info.executables.isEmpty {
+            result.insertArrangedSubview(label("Aufgelöste ausführbare Dateien", size: 11, weight: .semibold), at: 2)
+            for (index, path) in info.executables.prefix(3).enumerated() {
+                let executable = label(path, size: 11)
+                executable.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+                executable.maximumNumberOfLines = 1
+                executable.lineBreakMode = .byTruncatingMiddle
+                executable.toolTip = path
+                result.insertArrangedSubview(executable, at: 3 + index)
+            }
+            if info.executables.count > 3 {
+                result.insertArrangedSubview(label("Weitere ausführbare Dateien in Details", size: 11), at: 6)
+            }
+        }
+        for row in result.arrangedSubviews {
+            row.widthAnchor.constraint(equalTo: result.widthAnchor).isActive = true
+        }
+        return card(result)
+    }
+
+    private func evidenceDetails(_ info: ReviewDescription) -> NSScrollView {
+        let value = info.text + "\n\n" + info.scope_text
+        let scroll = scrollText(value, height: 150, mono: false)
+        if let text = scroll.documentView as? NSTextView, let storage = text.textStorage {
+            let mono = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+            let source = value as NSString
+            for literal in [info.command, info.cwd] + info.targets + info.executables {
+                var start = 0
+                while start < source.length {
+                    let range = source.range(of: literal, options: [], range: NSRange(location: start, length: source.length - start))
+                    if range.location == NSNotFound || range.length == 0 { break }
+                    storage.addAttribute(.font, value: mono, range: range)
+                    start = NSMaxRange(range)
+                }
+            }
+            var offset = 0
+            for line in value.components(separatedBy: "\n") {
+                let length = (line as NSString).length
+                if line.hasPrefix("  | ") || line.hasPrefix("/") || line.hasPrefix("~") {
+                    storage.addAttribute(.font, value: mono, range: NSRange(location: offset, length: length))
+                }
+                offset += length + 1
+            }
+        }
+        return scroll
+    }
+
     private func detailsControl() -> NSView {
         let toggle = NSButton(title: "Details", target: self, action: #selector(toggleDetails))
         toggle.isBordered = false
@@ -356,14 +494,15 @@ final class ReviewController: NSObject, NSWindowDelegate {
         let auth = NSView()
         authContainer = auth
         auth.translatesAutoresizingMaskIntoConstraints = false
+        auth.wantsLayer = true
+        auth.layer?.masksToBounds = true
         auth.widthAnchor.constraint(equalToConstant: 48).isActive = true
         auth.heightAnchor.constraint(equalToConstant: 48).isActive = true
         let prompt = label("Finger auflegen", size: 13, weight: .semibold)
         authInstruction = prompt
-        let instruction = vertical([
-            prompt,
-            label("Diesen Vorgang freigeben", size: 11, color: .secondaryLabelColor),
-        ], spacing: 3)
+        let detail = label("Diesen Vorgang freigeben", size: 11, color: .secondaryLabelColor)
+        authDetail = detail
+        let instruction = vertical([prompt, detail], spacing: 3)
         let cancel = NSButton(title: "Ablehnen", target: self, action: #selector(decline))
         cancel.bezelStyle = .rounded
         cancel.keyEquivalent = "\u{1b}"
@@ -378,14 +517,14 @@ final class ReviewController: NSObject, NSWindowDelegate {
 
     private func buildWindow() -> ReviewWindow {
         let info = request.description
-        let window = ReviewWindow(contentRect: NSRect(x: 0, y: 0, width: Self.width, height: 440),
+        let window = ReviewWindow(contentRect: NSRect(x: 0, y: 0, width: Self.width + 2 * ReviewPanelSurface.padding, height: 480),
                                   styleMask: [.borderless], backing: .buffered, defer: false)
         self.window = window
         window.title = "DCG · \(info.agent) · \(info.project)"
         window.isReleasedWhenClosed = false
         window.isOpaque = false
         window.backgroundColor = .clear
-        window.hasShadow = true
+        window.hasShadow = false
         window.level = .floating
         window.isMovableByWindowBackground = true
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -393,12 +532,16 @@ final class ReviewController: NSObject, NSWindowDelegate {
         window.cancel = { [weak self] in self?.authentication.deny() }
 
         let content = NSView()
+        panelContent = content
+        content.wantsLayer = true
+        content.layer?.cornerRadius = 28
+        content.layer?.masksToBounds = true
         if #available(macOS 26.0, *) {
             let glass = NSGlassEffectView()
-            glass.style = .regular
+            glass.style = .clear
             glass.cornerRadius = 28
             glass.contentView = content
-            window.contentView = glass
+            window.contentView = ReviewPanelSurface(material: glass)
         } else {
             let material = NSVisualEffectView()
             material.material = .hudWindow
@@ -415,19 +558,20 @@ final class ReviewController: NSObject, NSWindowDelegate {
                 content.topAnchor.constraint(equalTo: material.topAnchor),
                 content.bottomAnchor.constraint(equalTo: material.bottomAnchor),
             ])
-            window.contentView = material
+            window.contentView = ReviewPanelSurface(material: material)
         }
 
         let identity = identityCard(info)
         let effect = actionSummary(info)
+        let command = commandSummary(info)
         let disclosure = detailsControl()
-        let details = scrollText(info.text, height: 150, mono: true)
+        let details = evidenceDetails(info)
         details.isHidden = true
         self.details = details
         let divider = NSBox()
         divider.boxType = .separator
         let authentication = authenticationRow()
-        let stack = vertical([identity, effect, disclosure, details, divider, authentication], spacing: 12)
+        let stack = vertical([identity, effect, command, disclosure, details, divider, authentication], spacing: 12)
         stack.setCustomSpacing(16, after: identity)
         stack.setCustomSpacing(0, after: disclosure)
         stack.setCustomSpacing(12, after: details)
@@ -438,7 +582,7 @@ final class ReviewController: NSObject, NSWindowDelegate {
             stack.topAnchor.constraint(equalTo: content.topAnchor, constant: Self.inset),
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -Self.inset),
         ])
-        for row in [identity, effect, disclosure, details, divider, authentication] as [NSView] {
+        for row in [identity, effect, command, disclosure, details, divider, authentication] as [NSView] {
             row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
         self.stack = stack
@@ -449,8 +593,12 @@ final class ReviewController: NSObject, NSWindowDelegate {
         guard let window, let stack else { return }
         window.contentView?.layoutSubtreeIfNeeded()
         let old = window.frame
-        let height = stack.fittingSize.height + 2 * Self.inset
-        window.setFrame(NSRect(x: old.minX, y: old.maxY - height, width: Self.width, height: height), display: true)
+        let height = stack.fittingSize.height + 2 * (Self.inset + ReviewPanelSurface.padding)
+        let width = Self.width + 2 * ReviewPanelSurface.padding
+        window.setFrame(NSRect(x: old.minX, y: old.maxY - height, width: width, height: height), display: true)
+        window.contentView?.layoutSubtreeIfNeeded()
+        window.invalidateShadow()
+        DispatchQueue.main.async { [weak window] in window?.invalidateShadow() }
     }
 
     @objc private func toggleDetails() {
@@ -464,6 +612,27 @@ final class ReviewController: NSObject, NSWindowDelegate {
     @objc private func decline() { authentication.deny() }
 
     func windowWillClose(_ notification: Notification) { authentication.deny() }
+
+    func windowDidResize(_ notification: Notification) { window?.invalidateShadow() }
+
+    private func showPaused() {
+        authInstruction?.stringValue = "Prüfung pausiert"
+        authDetail?.stringValue = "Klicke auf den Dialog, um mit Touch ID fortzufahren"
+        if let container = authContainer {
+            for child in container.subviews { child.removeFromSuperview() }
+            let paused = icon("hand.tap", size: 24, color: .labelColor)
+            container.addSubview(paused)
+            NSLayoutConstraint.activate([
+                paused.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+                paused.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+                paused.widthAnchor.constraint(equalToConstant: 24),
+                paused.heightAnchor.constraint(equalToConstant: 24),
+            ])
+        }
+        // Preserve readable contrast when inactive glass changes its tint.
+        panelContent?.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        resizeToFit()
+    }
 
     func windowDidResignKey(_ notification: Notification) {
         authentication.resignedKey()
@@ -484,11 +653,18 @@ final class ReviewController: NSObject, NSWindowDelegate {
         if let container = authContainer {
             for child in container.subviews { child.removeFromSuperview() }
             let view = LAAuthenticationView(context: fresh.context, controlSize: .large)
-            view.frame = container.bounds
-            view.autoresizingMask = [.width, .height]
+            view.translatesAutoresizingMaskIntoConstraints = false
             container.addSubview(view)
+            NSLayoutConstraint.activate([
+                view.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+                view.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+                view.topAnchor.constraint(equalTo: container.topAnchor),
+                view.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            ])
         }
+        panelContent?.layer?.backgroundColor = NSColor.clear.cgColor
         authInstruction?.stringValue = "Finger auflegen"
+        authDetail?.stringValue = "Diesen Vorgang freigeben"
         resizeToFit()
         return fresh
     }

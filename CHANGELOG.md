@@ -40,6 +40,10 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 - See [sandbox-trial usage and limits](docs/sandbox-trials.md) and the
   [approved design](docs/design/sandbox-trials.md). Platform probe results and
   measured overhead belong to the implementation report, not this release note.
+- Inspect inline code passed with the long flags `node`/`bun` `--eval` and
+  `--print` (also `--eval=…`) and `php --run`. Only the short flags reached
+  embedded-code analysis, so `node --eval '<recursive rmSync>'` ran past rules
+  that deny the `-e` spelling.
 
 ## [v0.15.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.3) -- 2026-10-08 [Release]
 

@@ -836,7 +836,7 @@ fn segment_is_dcg_inspection_call(segment: &str) -> bool {
 
 /// Returns `true` if `arg0` (after stripping any leading path) is the dcg
 /// binary name.
-fn is_dcg_binary_name(arg0: &str) -> bool {
+pub(crate) fn is_dcg_binary_name(arg0: &str) -> bool {
     let base = arg0.rsplit(['/', '\\']).next().unwrap_or(arg0);
     let stem = base
         .get(..base.len().saturating_sub(4))
@@ -859,7 +859,7 @@ fn is_dcg_binary_name(arg0: &str) -> bool {
 /// occurrences of those characters are treated as ordinary data, exactly as
 /// bash would, so a candidate command containing them inside quotes is still
 /// recognized as inert argument text.
-fn parse_simple_command_argv(segment: &str) -> Option<Vec<String>> {
+pub(crate) fn parse_simple_command_argv(segment: &str) -> Option<Vec<String>> {
     let mut words: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut started = false;

@@ -14,8 +14,10 @@ use crate::heredoc::ScriptLanguage;
 pub enum Outcome {
     Dangerous,
     Dynamic,
+    BoundInputs,
     Limit,
     ReviewUnavailable,
+    InternalCommand,
 }
 
 impl Outcome {
@@ -41,8 +43,10 @@ impl Outcome {
         match self {
             Self::Dangerous => "definite-dangerous-operation",
             Self::Dynamic => "unsupported-dynamic",
+            Self::BoundInputs => "bound-input-review",
             Self::Limit => "analysis-limit",
             Self::ReviewUnavailable => "review-unavailable-or-cancelled",
+            Self::InternalCommand => "internal-hook-command",
         }
     }
 
@@ -50,8 +54,10 @@ impl Outcome {
         match self {
             Self::Dangerous => "Destructive Command Detected",
             Self::Dynamic => "Inspection Incomplete",
+            Self::BoundInputs => "Literal Inputs Need Review",
             Self::Limit => "Analysis Limit Reached",
             Self::ReviewUnavailable => "Review Not Approved",
+            Self::InternalCommand => "Internal Hook Command",
         }
     }
 
@@ -63,11 +69,17 @@ impl Outcome {
             Self::Dynamic => {
                 "Executable inputs remain unresolved. Use bounded literal inputs, sandbox verification, or exact-version desktop review; command-only codes cannot resolve this boundary."
             }
+            Self::BoundInputs => {
+                "Literal environment values can be bound for one-request desktop review. Use a hook with desktop review enabled; no reusable trial approval or command-only exception applies."
+            }
             Self::Limit => {
                 "Static analysis reached a resource limit. A bounded parse-only retry cannot authorize execution; reduce the input or request desktop review."
             }
             Self::ReviewUnavailable => {
                 "The desktop review was unavailable, cancelled, declined or expired. Restore the review route and retry for an explicit decision; no approval was recorded."
+            }
+            Self::InternalCommand => {
+                "Submit the original finite command to the hook. Only the hook may construct its confined replacement; direct runner requests cannot be approved or learned."
             }
         }
     }
@@ -75,8 +87,14 @@ impl Outcome {
 
 /// Classification changes presentation only, never the authorization decision.
 pub fn outcome(pack: Option<&str>, pattern: Option<&str>, reason: &str) -> Outcome {
+    if pack == Some("dcg.internal") && pattern == Some("confined-runner") {
+        return Outcome::InternalCommand;
+    }
     if reason.contains("[dcg:review-unavailable-or-cancelled]") {
         return Outcome::ReviewUnavailable;
+    }
+    if reason.contains("[dcg:bound-input-review]") {
+        return Outcome::BoundInputs;
     }
     if reason.contains("[dcg:analysis-limit]")
         || reason.contains("AST matching error")
@@ -223,6 +241,7 @@ mod tests {
         for (reason, expected) in [
             ("destructive", Outcome::Dangerous),
             ("[dcg:unsupported-dynamic]", Outcome::Dynamic),
+            ("[dcg:bound-input-review]", Outcome::BoundInputs),
             ("[dcg:analysis-limit]", Outcome::Limit),
             (
                 "[dcg:review-unavailable-or-cancelled]",
@@ -233,5 +252,14 @@ mod tests {
             assert!(!expected.code().is_empty());
             assert!(!expected.remediation().is_empty());
         }
+        assert!(
+            !Outcome::BoundInputs
+                .supports_command_review(Some("heredoc.script_files"), Some("unverified"))
+        );
+        assert_eq!(
+            outcome(Some("dcg.internal"), Some("confined-runner"), ""),
+            Outcome::InternalCommand
+        );
+        assert!(!Outcome::InternalCommand.supports_command_review(None, None));
     }
 }

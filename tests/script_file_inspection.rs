@@ -62,8 +62,13 @@ impl Fixture {
     }
 
     fn run(&self, candidate: &str) -> (Output, Value) {
+        self.run_with_path(candidate, &std::env::var_os("PATH").unwrap_or_default())
+    }
+
+    fn run_with_path(&self, candidate: &str, path: &std::ffi::OsStr) -> (Output, Value) {
         let mut child = self
             .command()
+            .env("PATH", path)
             .args([
                 "--robot",
                 "test",
@@ -791,16 +796,213 @@ fn finite_hook_rewrites_only_capable_hosts_and_never_executes_during_the_hook() 
 
 #[cfg(target_os = "macos")]
 #[test]
-fn definite_findings_cannot_be_hidden_by_a_finite_rewrite() {
+fn leading_literal_cd_rewrites_from_the_resolved_directory_without_executing() {
+    use destructive_command_guard::confined::Request;
     let fixture = Fixture::new();
     fixture.write(
-        "danger.test.js",
-        "require('child_process').execSync('git reset --hard');\n",
+        "nested dir/once.test.js",
+        "require('node:fs').writeFileSync('executed-marker', 'ran');\n",
     );
-    let input = json!({"tool_name":"Bash","tool_input":{"command":"node --test danger.test.js"},"cwd":fixture.root});
+    for candidate in [
+        "cd 'nested dir' && node --test once.test.js".to_owned(),
+        format!(
+            "cd -- {} && node --test once.test.js",
+            shell_words::quote(fixture.root.join("nested dir").to_str().unwrap())
+        ),
+    ] {
+        let input = json!({"tool_name":"Bash", "tool_input":{"command":candidate, "timeout":600_000}, "cwd":fixture.root});
+        let mut child = fixture
+            .command()
+            .args(["--agent", "claude-code"])
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output["dcg_verdict"], "confined", "{candidate}: {output}");
+        let words = shell_words::split(
+            output["hookSpecificOutput"]["updatedInput"]["command"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let request = Request::decode(words.last().unwrap()).unwrap();
+        assert_eq!(request.command, candidate);
+        assert_eq!(request.cwd, fixture.root);
+        assert!(!fixture.root.join("nested dir/executed-marker").exists());
+    }
+}
+
+#[test]
+fn literal_env_diagnostics_offer_bound_review_without_a_command_only_code() {
+    let fixture = Fixture::new();
+    let result = fixture.denied("env -i HOME=/tmp/fixture PATH=/usr/bin:/bin cargo test");
+    let text = result.to_string();
+    assert!(text.contains("bound-input-review"), "{text}");
+    assert!(text.contains("no reusable trial approval"), "{text}");
+    assert!(
+        !text.contains("command-local PATH requires desktop review"),
+        "{text}"
+    );
+    assert!(!text.contains("dcg trial run"), "{text}");
+    for candidate in [
+        "env -i HOME=$HOME PATH=/bin cargo test",
+        "env -i HOME=$(pwd) PATH=/bin cargo test",
+    ] {
+        let text = fixture.denied(candidate).to_string();
+        assert!(!text.contains("bound-input-review"), "{text}");
+    }
+}
+
+#[test]
+fn ordinary_assignment_prefixes_preserve_static_decisions_with_script_scanning() {
+    let fixture = Fixture::new();
+    fixture.write("package.json", r#"{"scripts":{"test":"echo safe"}}"#);
+    fixture.write("input.txt", "fixture\n");
+    // These are tom.10's static allow cases. Exercise the full evaluator with
+    // scan_script_files=true, including an unusable PATH in the hook process.
+    // The candidates remain data; no npm, Swift, Git or grep command is run.
+    for path in [
+        "/usr/bin:/bin",
+        "",
+        ".:/usr/bin",
+        ":/usr/bin",
+        "bin:/usr/bin",
+    ] {
+        for (candidate, plain) in [
+            ("CI=1 npm test", "npm test"),
+            ("GIT_PAGER=cat git log", "git log"),
+            ("LC_ALL=C grep fixture input.txt", "grep fixture input.txt"),
+            ("TZ=UTC date", "date"),
+            ("PI_OFFLINE=1 PI_OS_AGENT=0 swift test", "swift test"),
+            ("FOO=$BAR git log", "git log"),
+            ("FOO=~/fixture git log", "git log"),
+            ("FOO=*.txt git log", "git log"),
+            ("FOO={one,two} git log", "git log"),
+            ("env FOO=$BAR git log", "git log"),
+            ("env -- CI=1 npm test", "npm test"),
+            ("CI=1 env TZ=UTC date", "date"),
+        ] {
+            let (baseline_output, baseline) = fixture.run_with_path(plain, path.as_ref());
+            assert_eq!(baseline["decision"], "allow", "{plain}: {baseline}");
+            let (output, result) = fixture.run_with_path(candidate, path.as_ref());
+            assert_eq!(
+                result["decision"], baseline["decision"],
+                "{candidate}: {result}"
+            );
+            assert_eq!(
+                result["rule_id"], baseline["rule_id"],
+                "{candidate}: {result}"
+            );
+            assert_eq!(output.status.code(), baseline_output.status.code());
+        }
+    }
+}
+
+#[test]
+fn local_preload_prefixes_keep_trial_diagnostics_with_script_scanning() {
+    let fixture = Fixture::new();
+    fixture.write("package.json", r#"{"scripts":{"build":"echo safe"}}"#);
+    for path in ["/usr/bin:/bin", "", ".:/usr/bin"] {
+        for candidate in [
+            "PYTHONPATH=src pytest",
+            "NODE_OPTIONS=--max-old-space-size=4096 npm run build",
+            "env PYTHONPATH=src pytest",
+            "env NODE_OPTIONS=--max-old-space-size=4096 npm run build",
+            "PYTHONPATH=$SOURCE pytest",
+            "CI=1 PYTHONPATH=src pytest",
+            "CI=1 env CI=1 env PYTHONPATH=src pytest",
+        ] {
+            let (_, result) = fixture.run_with_path(candidate, path.as_ref());
+            assert_eq!(
+                result["rule_id"], "heredoc.script_files:unverified",
+                "{result}"
+            );
+            let text = result.to_string();
+            assert!(text.contains("dcg trial run"), "{candidate}: {text}");
+            assert!(!text.contains("bound-input-review"), "{candidate}: {text}");
+            assert!(!text.contains("cannot be approved"), "{candidate}: {text}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn literal_environment_does_not_hide_a_definite_script_denial() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "scripts/check.js",
+        "require('fs').rmSync('/home/fixture/valuable', {recursive: true, force: true});\n",
+    );
+    for candidate in [
+        "node scripts/check.js",
+        "env -i HOME=/tmp/h PATH=/usr/bin:/bin node scripts/check.js",
+        "PATH=/usr/bin:/bin node scripts/check.js",
+        "env -i HOME=/tmp/h PATH=/usr/bin:/bin node < scripts/check.js",
+        "CI=1 node scripts/check.js",
+        "FOO=$BAR node scripts/check.js",
+        "PYTHONPATH=src node scripts/check.js",
+        "NODE_OPTIONS=--max-old-space-size=4096 node scripts/check.js",
+        "env NODE_OPTIONS=--max-old-space-size=4096 node scripts/check.js",
+        "env NODE_OPTIONS=--max-old-space-size=4096 node < scripts/check.js",
+    ] {
+        fixture.destructive(candidate, "scripts/check.js");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn relative_and_empty_literal_path_entries_cannot_reach_bound_review() {
+    let fixture = Fixture::new();
+    fixture.write("scripts/check.js", "console.log('safe');\n");
+    for path in ["", ".:/usr/bin", ":/usr/bin", "bin:/usr/bin", "/usr/bin:"] {
+        let result = fixture.denied(&format!(
+            "env -i HOME=/tmp/h PATH={path} node scripts/check.js"
+        ));
+        let text = result.to_string();
+        assert!(text.contains("non-empty absolute directories"), "{text}");
+        assert!(!text.contains("bound-input-review"), "{text}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn disabled_trials_use_one_time_review_without_opening_the_approval_store() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let policy = std::fs::read_to_string(&fixture.config).unwrap();
+    std::fs::write(
+        &fixture.config,
+        format!("{policy}\n[trial]\nenabled = false\n"),
+    )
+    .unwrap();
+    // Unreadable approval data must not affect the disabled-trial path. The
+    // oversized review text guarantees no native dialog opens in this test.
+    fixture.write(
+        "home/.config/dcg/verified_trials.json",
+        "invalid fixture store",
+    );
+    // Use a real fixture executable: /bin/true does not exist on macOS.
+    // The hook only inspects it; disabled trials must not execute it.
+    fixture.write("review-fixture.sh", "#!/bin/sh\nprintf safe\n");
+    std::fs::set_permissions(
+        fixture.root.join("review-fixture.sh"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let candidate = format!(
+        "PATH=/usr/bin:/bin ./review-fixture.sh {}",
+        "x".repeat(6_000)
+    );
+    let input = json!({"tool_name":"Bash", "tool_input":{"command":candidate}, "cwd":fixture.root});
     let mut child = fixture
         .command()
-        .args(["--agent", "claude-code"])
+        .args(["--agent", "claude-code", "--desktop-review"])
         .spawn()
         .unwrap();
     child
@@ -810,12 +1012,124 @@ fn definite_findings_cannot_be_hidden_by_a_finite_rewrite() {
         .write_all(input.to_string().as_bytes())
         .unwrap();
     let output = child.wait_with_output().unwrap();
-    let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let verdict: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
-        output["hookSpecificOutput"]["permissionDecision"], "deny",
-        "{output}"
+        verdict["hookSpecificOutput"]["permissionDecision"], "deny",
+        "{verdict}"
     );
-    assert!(output["hookSpecificOutput"].get("updatedInput").is_none());
+    let text = verdict.to_string();
+    assert!(text.contains("Sandbox trials are disabled"), "{text}");
+    assert!(text.contains("one-time desktop review"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("home/.config/dcg/verified_trials.json"))
+            .unwrap(),
+        "invalid fixture store"
+    );
+    assert!(
+        !fixture
+            .root
+            .join("home/.config/dcg/verified_trials.lock")
+            .exists()
+    );
+}
+
+#[test]
+fn agents_cannot_forge_confined_receipts_or_redirect_their_trusted_config() {
+    use destructive_command_guard::config::ConfinedLoopback;
+    use destructive_command_guard::confined::Request;
+    let fixture = Fixture::new();
+    fixture.write("forged-config.toml", "[trial]\nconfined_loopback = 'all'\n");
+    let policy = std::fs::read_to_string(&fixture.config).unwrap();
+    std::fs::write(
+        &fixture.config,
+        format!(
+            "{policy}\n[trial]\nconfined_loopback = 'none'\n\
+             [overrides]\nallow = ['.*dcg.* run .*']\n\
+             [policy.rules]\n'dcg.internal:confined-runner' = 'warn'\n"
+        ),
+    )
+    .unwrap();
+    let request = Request::new("node --test", &fixture.root, "/bin/sh".as_ref(), 5)
+        .with_loopback(ConfinedLoopback::All);
+    let runner = request
+        .invocation(env!("CARGO_BIN_EXE_dcg").as_ref())
+        .unwrap();
+    for prefix in [
+        String::new(),
+        format!(
+            "DCG_CONFIG={} ",
+            shell_words::quote(fixture.root.join("forged-config.toml").to_str().unwrap())
+        ),
+        format!(
+            "HOME={} ",
+            shell_words::quote(fixture.root.to_str().unwrap())
+        ),
+    ] {
+        let candidate = format!("{prefix}{runner}");
+        let result = fixture.denied(&candidate);
+        assert_eq!(result["rule_id"], "dcg.internal:confined-runner");
+        let input =
+            json!({"tool_name":"Bash", "tool_input":{"command":candidate}, "cwd":fixture.root});
+        let mut child = fixture
+            .command()
+            .args(["--agent", "claude-code", "--desktop-review"])
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let verdict: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let decision = &verdict["hookSpecificOutput"];
+        assert_eq!(decision["permissionDecision"], "deny", "{verdict}");
+        assert_eq!(
+            decision["ruleId"], "dcg.internal:confined-runner",
+            "{verdict}"
+        );
+        assert!(decision.get("allowOnceCode").is_none(), "{verdict}");
+        assert!(decision.get("updatedInput").is_none(), "{verdict}");
+        assert!(verdict.to_string().contains("internal-hook-command"));
+    }
+    fixture.allowed("dcg test 'dcg run --confined --request fixture'");
+    fixture.allowed("printf '%s' 'dcg run --confined --request fixture'");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn definite_findings_cannot_be_hidden_by_a_finite_rewrite() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "danger.test.js",
+        "require('child_process').execSync('git reset --hard');\n",
+    );
+    for candidate in [
+        "node --test danger.test.js",
+        "cd . && node --test danger.test.js",
+    ] {
+        let input =
+            json!({"tool_name":"Bash","tool_input":{"command":candidate},"cwd":fixture.root});
+        let mut child = fixture
+            .command()
+            .args(["--agent", "claude-code"])
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            output["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{output}"
+        );
+        assert!(output["hookSpecificOutput"].get("updatedInput").is_none());
+    }
 }
 
 #[test]
@@ -837,6 +1151,96 @@ fn finite_node_imports_resolve_relative_to_the_importing_file() {
             "require('child_process').execSync('git reset --hard');\n",
         );
         fixture.destructive("node --test tests/entry.test.js", "helper.js");
+    }
+}
+
+#[test]
+fn bare_node_preloads_inspect_the_export_for_each_cli_spelling() {
+    let fixture = Fixture::new();
+    fixture.write("package.json", r#"{"name":"fixture"}"#);
+    fixture.write("case.test.js", "console.log('fixture');\n");
+    fixture.write(
+        "node_modules/loader/package.json",
+        r#"{"exports":{".":"./entry.cjs"}}"#,
+    );
+    for option in [
+        "--import loader",
+        "--import=loader",
+        "--require loader",
+        "--require=loader",
+        "-r loader",
+        "-rloader",
+    ] {
+        let command = format!("node {option} --test case.test.js");
+        fixture.write("node_modules/loader/entry.cjs", "console.log('preload');\n");
+        fixture.allowed(&command);
+        fixture.write(
+            "node_modules/loader/entry.cjs",
+            "require('child_process').execSync('git reset --hard');\n",
+        );
+        fixture.denied(&command);
+    }
+    // Missing packages and private, unexported subpaths remain inconclusive.
+    for command in [
+        "node --import missing --test case.test.js",
+        "node -r loader/private --test case.test.js",
+    ] {
+        let result = fixture.denied(command);
+        assert_eq!(
+            result["rule_id"], "heredoc.script_files:unverified",
+            "{result}"
+        );
+    }
+    fixture.write(
+        "node_modules/loader/package.json",
+        r#"{"exports":{"custom":"./danger.cjs","default":"./entry.cjs"}}"#,
+    );
+    fixture.write(
+        "node_modules/loader/entry.cjs",
+        "console.log('safe default');",
+    );
+    fixture.write(
+        "node_modules/loader/danger.cjs",
+        "require('child_process').execSync('git reset --hard');",
+    );
+    // The candidate remains data. NODE_OPTIONS must not let the static reader
+    // bind the default export while the actual runtime selects custom code.
+    let mut child = fixture
+        .command()
+        .env("NODE_OPTIONS", "--conditions=custom")
+        .args(["--robot", "test", "--dialect", "posix", "--stdin"])
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"node --import loader ./case.test.js")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["rule_id"], "heredoc.script_files:unverified");
+}
+
+#[test]
+fn bare_node_preloads_with_node_addons_stay_unverified() {
+    let fixture = Fixture::new();
+    fixture.write("package.json", r#"{"name":"fixture"}"#);
+    fixture.write("case.test.js", "console.log('fixture');");
+    fixture.write(
+        "node_modules/loader/package.json",
+        r#"{"exports":{"node-addons":"./payload.js","default":"./clean.js"}}"#,
+    );
+    fixture.write("node_modules/loader/clean.js", "console.log('safe');");
+    fixture.write(
+        "node_modules/loader/payload.js",
+        "require('child_process').execSync('git reset --hard');",
+    );
+    // Candidates are stdin data only. No execution or rewriting protocol may
+    // turn the clean fallback into an ordinary static allow.
+    for option in ["--import loader", "--require loader", "-rloader"] {
+        fixture.unverified(&format!("node {option} --test case.test.js"));
+        fixture.unverified(&format!("node --no-addons {option} --test case.test.js"));
     }
 }
 

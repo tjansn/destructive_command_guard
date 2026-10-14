@@ -28,7 +28,19 @@ mod macos {
             let project = fs::canonicalize(project_path).unwrap();
             fs::write(project.join("run.sh"), script).unwrap();
             fs::write(project.join("source.txt"), "original source").unwrap();
-            let store = TrialStore::new(temp.path().join("state"));
+            let agent_home = temp.path().join("agent-home");
+            fs::create_dir(&agent_home).unwrap();
+            // The agent session the trial reproduces, not cargo's test process:
+            // its CARGO_*/DYLD_* additions would make every run inconclusive.
+            let store = TrialStore::new(temp.path().join("state")).with_environment(
+                [
+                    ("PATH", std::env::var_os("PATH").unwrap_or_default()),
+                    ("HOME", agent_home.into_os_string()),
+                ]
+                .into_iter()
+                .map(|(key, value)| (key.into(), value))
+                .collect(),
+            );
             Self {
                 temp,
                 project,
@@ -37,6 +49,17 @@ mod macos {
         }
 
         fn run(&self, timeout_secs: u64) -> TrialReport {
+            self.run_with_loopback(
+                timeout_secs,
+                destructive_command_guard::config::ConfinedLoopback::None,
+            )
+        }
+
+        fn run_with_loopback(
+            &self,
+            timeout_secs: u64,
+            confined_loopback: destructive_command_guard::config::ConfinedLoopback,
+        ) -> TrialReport {
             let fingerprint = self
                 .store
                 .fingerprint("/bin/sh ./run.sh", &self.project, Path::new("/bin/sh"), &[])
@@ -47,6 +70,7 @@ mod macos {
                 Path::new("/bin/sh"),
                 &TrialConfig {
                     timeout_secs,
+                    confined_loopback,
                     ..TrialConfig::default()
                 },
                 self.temp.path(),
@@ -437,14 +461,15 @@ mod macos {
     }
 
     #[test]
-    fn loopback_exchange_requires_review_without_endpoint_ownership_proof() {
+    fn trial_loopback_stays_closed_even_when_confined_loopback_is_all() {
         // Use curl for the connect syscall: Python can report a preflight
         // permission error without producing a tagged kernel network event.
         // Its parent owns the listener; the same sandbox still denies TCP out.
         let fixture = Fixture::new(
             "python3 -S -c 'import socket,subprocess,sys; s=socket.socket(); s.bind((\"127.0.0.1\",0)); s.listen(1); sys.exit(subprocess.run([\"/usr/bin/curl\",\"--noproxy\",\"*\",\"--max-time\",\"2\",\"-sS\",\"http://127.0.0.1:%d/\"%s.getsockname()[1]]).returncode)'",
         );
-        let report = fixture.run(10);
+        let report =
+            fixture.run_with_loopback(10, destructive_command_guard::config::ConfinedLoopback::All);
         assert_eq!(
             report.observations.verdict(),
             Verdict::Inconclusive,
@@ -761,6 +786,40 @@ mod macos {
     }
 
     #[test]
+    fn hook_local_preloads_run_trials_and_reuse_only_the_exact_version() {
+        let fixture = Fixture::new("mkdir -p build; printf safe > build/out");
+        for command in [
+            "PYTHONPATH=src /bin/sh ./run.sh",
+            "NODE_OPTIONS=--max-old-space-size=4096 /bin/sh ./run.sh",
+            "/usr/bin/env PYTHONPATH=src /bin/sh ./run.sh",
+        ] {
+            let output = hook(&fixture, command);
+            assert!(output.status.success());
+            assert!(
+                output.stdout.is_empty(),
+                "{command}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("verifying `"), "{command}: {stderr}");
+            assert!(
+                stderr.contains("observed safe in one sandboxed run"),
+                "{command}: {stderr}"
+            );
+            assert!(!fixture.project.join("build").exists());
+            let cached = hook(&fixture, command);
+            assert!(cached.status.success() && cached.stdout.is_empty());
+            let stderr = String::from_utf8_lossy(&cached.stderr);
+            assert!(!stderr.contains("verifying `"), "{command}: {stderr}");
+            assert!(
+                stderr.contains("observed safe in one sandboxed run"),
+                "{command}: {stderr}"
+            );
+        }
+    }
+
+    #[test]
     fn hook_unverified_node_allows_observed_version_and_denies_malicious() {
         let fixture = Fixture::new("mkdir -p build; cat source.txt > build/out");
         fs::write(
@@ -875,7 +934,10 @@ mod macos {
     #[test]
     fn preview_service_requests_review_without_starting_or_minting_a_code() {
         let fixture = Fixture::new("printf safe");
-        let log = fixture.temp.path().join("preview.log");
+        // Under the hook's HOME: a truncating redirect into the macOS temp root
+        // (/var/folders) is denied by its own rule before the service shape is
+        // considered, and that is not what this test is about.
+        let log = fixture.temp.path().join("home/preview.log");
         let command = format!(
             "nohup python3 -m http.server 18476 --bind 127.0.0.1 --directory {} > {} 2>&1 < /dev/null &",
             shell_words::quote(&fixture.project.display().to_string()),

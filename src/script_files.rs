@@ -30,6 +30,241 @@ struct InspectionBudget {
 
 thread_local! {
     static BUDGET: RefCell<Option<InspectionBudget>> = const { RefCell::new(None) };
+    static CONFINED: RefCell<Option<ConfinedPaths>> = const { RefCell::new(None) };
+}
+
+struct ConfinedPaths {
+    project: PathBuf,
+    cwd: PathBuf,
+    writable: Vec<PathBuf>,
+    protected: Vec<PathBuf>,
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+pub(crate) fn with_confined_dependencies<T>(
+    project: PathBuf,
+    cwd: PathBuf,
+    writable: Vec<PathBuf>,
+    protected: Vec<PathBuf>,
+    inspect: impl FnOnce() -> T,
+) -> T {
+    struct Scope(Option<ConfinedPaths>);
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            CONFINED.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let paths = ConfinedPaths {
+        project,
+        cwd,
+        writable,
+        protected,
+    };
+    let _scope = Scope(CONFINED.with(|slot| slot.replace(Some(paths))));
+    inspect()
+}
+
+impl ConfinedPaths {
+    fn deferrable_target(&self, literal: &str) -> bool {
+        use std::path::Component;
+        // Resolve existing ancestors, including symlinks, before appending a
+        // new leaf. A lexical in-bounds spelling must not conceal an escape.
+        let mut target = PathBuf::new();
+        // Source discovery can retain the hook/package cwd. Filesystem calls
+        // run in the runner's canonical effective cwd, including leading cd.
+        for component in self.cwd.join(literal).components() {
+            match component {
+                Component::ParentDir => {
+                    target.pop();
+                }
+                Component::CurDir => {}
+                other => target.push(other.as_os_str()),
+            }
+            match fs::canonicalize(&target) {
+                Ok(real) => target = real,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return false,
+            }
+        }
+        self.build_output(&target)
+            && self.writable.iter().any(|root| target.starts_with(root))
+            && !self
+                .protected
+                .iter()
+                .any(|root| target.starts_with(root) || root.starts_with(&target))
+    }
+
+    fn build_output(&self, target: &Path) -> bool {
+        let Ok(relative) = target.strip_prefix(&self.project) else {
+            return false;
+        };
+        let mut path = self.project.clone();
+        for part in relative.components() {
+            path.push(part);
+            if matches!(
+                part.as_os_str().to_str(),
+                Some("build" | "dist" | "target" | ".cache" | "coverage" | "node_modules")
+            ) {
+                // The output name denotes a directory, not an ignored file
+                // with that basename. Absent ignored output roots are valid.
+                return match fs::symlink_metadata(&path) {
+                    Ok(meta) => meta.is_dir(),
+                    Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                };
+            }
+        }
+        false
+    }
+}
+
+/// Only findings in resolved Node dependency files can defer to the kernel.
+/// This is scoped to the hook's second reading; it cannot produce a host allow.
+fn dependency_result(
+    path: &Path,
+    source: &str,
+    language: ScriptLanguage,
+    original: EvaluationResult,
+) -> EvaluationResult {
+    if !path
+        .components()
+        .any(|part| part.as_os_str() == "node_modules")
+        || original.pattern_info.as_ref().is_some_and(|info| {
+            info.source == crate::evaluator::MatchSource::ConfigOverride
+                || info.pack_id.as_deref() == Some("dcg.internal")
+                || info.pack_id.as_deref() == Some("core.git")
+                || info.pattern_name.as_deref() == Some("credential-file-write")
+        })
+    {
+        return original;
+    }
+    CONFINED.with(|slot| {
+        let paths = slot.borrow();
+        let Some(paths) = paths.as_ref() else {
+            return original;
+        };
+        match language {
+            ScriptLanguage::JavaScript | ScriptLanguage::TypeScript => {
+                match dependency_target(source, language, paths) {
+                    Ok(Some(target)) => EvaluationResult::denied_by_embedded_sink(
+                        "heredoc.script_files.confined-target",
+                        &format!("Dependency operation targets a path outside approved confined build/cache outputs: {target}"),
+                    ),
+                    Ok(None) => EvaluationResult::allowed(),
+                    Err(()) => original,
+                }
+            }
+            ScriptLanguage::Bash => {
+                // Explicit child command strings still run through the normal
+                // evaluator. Only a literal filesystem command whose targets
+                // are all approved writable outputs can lose its finding.
+                if dependency_shell_targets(source).is_some_and(|targets| {
+                    targets.iter().all(|target| paths.deferrable_target(target))
+                }) {
+                    EvaluationResult::allowed()
+                } else {
+                    original
+                }
+            }
+            _ => original,
+        }
+    })
+}
+
+fn dependency_shell_targets(command: &str) -> Option<Vec<String>> {
+    let ast = AstGrep::new(command, SupportLang::Bash);
+    let root = ast.root();
+    let mut commands = root.children().filter(ast_grep_core::Node::is_named);
+    if ast.root().get_inner_node().has_error()
+        || commands.next()?.kind().as_ref() != "command"
+        || commands.next().is_some()
+    {
+        return None;
+    }
+    let words = shell_words::split(command).ok()?;
+    let tool = words.first()?.rsplit('/').next()?;
+    if !matches!(tool, "rm" | "rmdir" | "unlink") {
+        return None;
+    }
+    let mut targets = Vec::new();
+    for word in words.iter().skip(1) {
+        if word == "--" {
+            continue;
+        }
+        if let Some(flags) = word.strip_prefix('-') {
+            if flags.is_empty() || !flags.chars().all(|flag| "rRfivd".contains(flag)) {
+                return None;
+            }
+            continue;
+        }
+        if word.contains(['$', '`', '*', '?', '[', '{', '~']) {
+            return None;
+        }
+        targets.push(word.clone());
+    }
+    (!targets.is_empty()).then_some(targets)
+}
+
+fn dependency_target(
+    source: &str,
+    language: ScriptLanguage,
+    paths: &ConfinedPaths,
+) -> Result<Option<String>, ()> {
+    let ast = AstGrep::new(
+        source,
+        if language == ScriptLanguage::TypeScript {
+            SupportLang::TypeScript
+        } else {
+            SupportLang::JavaScript
+        },
+    );
+    if ast.root().get_inner_node().has_error() {
+        return Err(());
+    }
+    for (index, node) in ast.root().dfs().enumerate() {
+        if index >= 100_000 {
+            return Err(());
+        }
+        if node.kind().as_ref() != "call_expression" {
+            continue;
+        }
+        let (Some(function), Some(arguments)) = (node.field("function"), node.field("arguments"))
+        else {
+            continue;
+        };
+        let function = function.text();
+        let name = function.rsplit('.').next().unwrap_or(&function);
+        let args: Vec<_> = arguments
+            .children()
+            .filter(|child| child.is_named() && child.kind().as_ref() != "comment")
+            .collect();
+        let operands: &[usize] = match name {
+            "rm" | "rmSync" | "rmdir" | "rmdirSync" | "unlink" | "unlinkSync" | "writeFile"
+            | "writeFileSync" | "appendFile" | "appendFileSync" | "truncate" | "truncateSync"
+            | "chmod" | "chmodSync" | "chown" | "chownSync" => &[0],
+            "rename" | "renameSync" => &[0, 1],
+            "copyFile" | "copyFileSync" | "cp" | "cpSync" => &[1],
+            _ => &[],
+        };
+        for &operand in operands {
+            if let Some(argument) = args.get(operand)
+                && let Ok(target) = js_literal(&argument.text())
+                && !paths.deferrable_target(&target)
+            {
+                return Ok(Some(target));
+            }
+        }
+        if matches!(name, "exec" | "execSync")
+            && let Some(argument) = args.first()
+            && let Ok(command) = js_literal(&argument.text())
+            && let Some(targets) = dependency_shell_targets(&command)
+            && let Some(target) = targets
+                .into_iter()
+                .find(|target| !paths.deferrable_target(target))
+        {
+            return Ok(Some(target));
+        }
+    }
+    Ok(None)
 }
 
 struct InspectionScope(bool);
@@ -103,6 +338,7 @@ struct Reference {
 #[derive(Debug)]
 enum FileFormat {
     Script,
+    NodePreload(crate::node_sources::Mode),
     SyntaxOnly(String),
     TestGlob(String),
     FiniteScript(String),
@@ -117,6 +353,14 @@ fn unverified(reason: &str) -> EvaluationResult {
         &format!("Script-file inspection incomplete: {reason}"),
     );
     if let Some(info) = result.pattern_info.as_mut() {
+        if reason.contains("[dcg:bound-input-review]") {
+            info.explanation = Some(
+                crate::inspection::Outcome::BoundInputs
+                    .remediation()
+                    .to_owned(),
+            );
+            return result;
+        }
         info.explanation = Some(
             "Static inspection could not establish the executable sources. A sandbox trial \
              or desktop review must verify this exact project, command and source version. \
@@ -152,7 +396,7 @@ pub(crate) fn evaluate(
             "file inspection currently requires a POSIX shell",
         ));
     }
-    let references = match references(command, deadline) {
+    let (references, review_reason) = match references(command, deadline) {
         Ok(references) => references,
         Err(reason) => return (!resolve_unverified).then(|| unverified(&reason)),
     };
@@ -218,7 +462,14 @@ pub(crate) fn evaluate(
     if deadline.is_exceeded() {
         Some(EvaluationResult::indeterminate_due_to_budget())
     } else {
-        first_denial.or(incomplete).or(first_warning)
+        first_denial
+            .or(incomplete)
+            .or_else(|| {
+                review_reason
+                    .filter(|_| !resolve_unverified)
+                    .map(|reason| unverified(&reason))
+            })
+            .or(first_warning)
     }
 }
 
@@ -279,7 +530,10 @@ fn guarded_absolute_cwd(command: &str) -> Option<PathBuf> {
     crate::rebase_recovery::resolve_effective_cwd(Path::new("/"), prefix, ShellDialect::Posix)
 }
 
-fn references(command: &str, deadline: &Deadline) -> Result<Vec<Reference>, String> {
+fn references(
+    command: &str,
+    deadline: &Deadline,
+) -> Result<(Vec<Reference>, Option<String>), String> {
     if command.len() as u64 > MAX_TOTAL_BYTES {
         return Err("command exceeds script inspection's input bound".to_string());
     }
@@ -288,6 +542,8 @@ fn references(command: &str, deadline: &Deadline) -> Result<Vec<Reference>, Stri
         return Err("shell source could not be parsed completely".to_string());
     }
     let mut references = Vec::new();
+    let mut review_reason = None;
+    let environment = crate::trial::agent_environment();
     let mut pending = vec![ast.root()];
     while let Some(node) = pending.pop() {
         if deadline.is_exceeded() {
@@ -310,7 +566,42 @@ fn references(command: &str, deadline: &Deadline) -> Result<Vec<Reference>, Stri
                 pending.extend(node.children());
                 continue;
             }
-            references.extend(command_references(node.text().as_ref())?);
+            if let Some(bound) = crate::invocation::bound_environment(&text, &environment)? {
+                // Inspection must precede the review marker, including in the
+                // relaxed pass. Binding a prefix cannot erase a definite sink.
+                references.extend(command_references(&bound.command)?);
+                for name in ["BASH_ENV", "ENV"] {
+                    if let Some(path) = bound
+                        .values
+                        .get(std::ffi::OsStr::new(name))
+                        .filter(|v| !v.is_empty())
+                    {
+                        references.push(Reference {
+                            path: static_word(&shell_words::quote(&path.to_string_lossy()))?,
+                            language: Some(ScriptLanguage::Bash),
+                            sourced: true,
+                            format: FileFormat::Script,
+                        });
+                    }
+                }
+                if let Err(reason) = bound.ensure_reviewable() {
+                    review_reason = Some(reason);
+                } else {
+                    review_reason.get_or_insert_with(|| BOUND_REVIEW_REASON.to_owned());
+                }
+            } else {
+                references.extend(command_references(&text)?);
+                if crate::invocation::environment_review(&text)
+                    == crate::invocation::EnvironmentReview::Trial
+                {
+                    // Local preload/startup values are executed by the trial's
+                    // shell. They must not become a literal-environment approval
+                    // or hide a definite finding in the program's source.
+                    review_reason.get_or_insert_with(|| {
+                        "execution-affecting environment assignment requires review".to_owned()
+                    });
+                }
+            }
             if references.len() > MAX_FILES {
                 return Err("too many executable file references".to_string());
             }
@@ -323,7 +614,15 @@ fn references(command: &str, deadline: &Deadline) -> Result<Vec<Reference>, Stri
                     "PATH" | "NODE_OPTIONS" | "NODE_PATH" | "LD_PRELOAD" | "LD_LIBRARY_PATH"
                 ) || name.starts_with("DYLD_")
             }) {
-                return Err("execution-affecting environment assignment requires review".to_owned());
+                if node
+                    .parent()
+                    .is_none_or(|parent| parent.kind().as_ref() != "command")
+                {
+                    return Err(
+                        "standalone execution environment changes cannot be bound for review"
+                            .to_owned(),
+                    );
+                }
             }
             if let Some((name, value)) = assignment.split_once('=')
                 && matches!(name, "BASH_ENV" | "ENV")
@@ -351,6 +650,10 @@ fn references(command: &str, deadline: &Deadline) -> Result<Vec<Reference>, Stri
                 }
                 let mut synthetic = owner.text().to_string();
                 synthetic.push_str(" ./DCG_STDIN_SOURCE");
+                if let Some(bound) = crate::invocation::bound_environment(&synthetic, &environment)?
+                {
+                    synthetic = bound.command;
+                }
                 for mut reference in command_references(&synthetic)? {
                     if reference.path == "./DCG_STDIN_SOURCE" {
                         reference.path = static_word(raw_path.trim())?;
@@ -361,7 +664,7 @@ fn references(command: &str, deadline: &Deadline) -> Result<Vec<Reference>, Stri
         }
         pending.extend(node.children());
     }
-    Ok(references)
+    Ok((references, review_reason))
 }
 
 fn static_word(raw: &str) -> Result<String, String> {
@@ -391,6 +694,8 @@ fn assignment(raw: &str) -> bool {
     })
 }
 
+const BOUND_REVIEW_REASON: &str = "[dcg:bound-input-review] Literal environment assignments require review of this exact invocation; no reusable trial approval will be recorded.";
+
 fn command_references(source: &str) -> Result<Vec<Reference>, String> {
     // env's assignment operands are removed by the shared wrapper normalizer.
     // Preserve shell startup sources before normalizing those operands away.
@@ -410,14 +715,17 @@ fn command_references(source: &str) -> Result<Vec<Reference>, String> {
     if is_env
         && words.iter().any(|word| {
             word.split_once('=').is_some_and(|(name, _)| {
-                matches!(
-                    name,
-                    "PATH" | "NODE_OPTIONS" | "NODE_PATH" | "LD_PRELOAD" | "LD_LIBRARY_PATH"
-                ) || name.starts_with("DYLD_")
+                name == "PATH"
+                    || (crate::invocation::preload_variable(name)
+                        && crate::invocation::environment_review(source)
+                            != crate::invocation::EnvironmentReview::Trial)
             })
         })
     {
-        return Err("execution-affecting environment assignment requires review".to_owned());
+        return Err(
+            "execution environment inside an unsupported wrapper cannot be bound for review"
+                .to_owned(),
+        );
     }
     let startup: Vec<_> = words
         .iter()
@@ -618,7 +926,11 @@ fn interpreter_references(
             path: source.path,
             language: Some(language),
             sourced: source.role == crate::invocation::SourceRole::Startup,
-            format: if source.role == crate::invocation::SourceRole::SyntaxData {
+            format: if source.role == crate::invocation::SourceRole::NodeImport {
+                FileFormat::NodePreload(crate::node_sources::Mode::Import)
+            } else if source.role == crate::invocation::SourceRole::NodeRequire {
+                FileFormat::NodePreload(crate::node_sources::Mode::Require)
+            } else if source.role == crate::invocation::SourceRole::SyntaxData {
                 FileFormat::SyntaxOnly(program.to_owned())
             } else if source.glob {
                 FileFormat::TestGlob(program.to_owned())
@@ -714,6 +1026,25 @@ fn inspect_reference(
     cwd: &Path,
     evaluate_source: &mut impl FnMut(&str, &Path, ScriptLanguage) -> EvaluationResult,
 ) -> Result<Option<EvaluationResult>, String> {
+    if let FileFormat::NodePreload(mode) = reference.format {
+        if builtin_module(&reference.path) {
+            return Ok(None);
+        }
+        let path = crate::node_sources::resolve(&reference.path, cwd, mode)?;
+        return inspect_reference(
+            &Reference {
+                path: path
+                    .to_str()
+                    .ok_or("non-UTF-8 Node preload path")?
+                    .to_owned(),
+                language: Some(ScriptLanguage::JavaScript),
+                sourced: false,
+                format: FileFormat::Script,
+            },
+            cwd,
+            evaluate_source,
+        );
+    }
     if let FileFormat::TestGlob(program) = &reference.format {
         verify_syntax_interpreter(program, cwd)?;
         let mut result = None;
@@ -827,7 +1158,7 @@ fn inspect_reference(
     crate::desktop_review::record_script(&path, &content, cwd, language);
     let sources = match &reference.format {
         FileFormat::Script | FileFormat::FiniteScript(_) => vec![content],
-        FileFormat::SyntaxOnly(_) | FileFormat::TestGlob(_) => {
+        FileFormat::SyntaxOnly(_) | FileFormat::TestGlob(_) | FileFormat::NodePreload(_) => {
             unreachable!("syntax operands were handled before source inspection")
         }
         FileFormat::PackageScript(task) => package_source(&content, task)?,
@@ -853,7 +1184,12 @@ fn inspect_reference(
         }) {
             return Err("script source could not be parsed completely".to_string());
         }
-        let candidate = evaluate_source(&source, cwd, language);
+        let candidate = dependency_result(
+            &path,
+            &source,
+            language,
+            evaluate_source(&source, cwd, language),
+        );
         if candidate.decision != EvaluationDecision::Allow {
             if result.decision == EvaluationDecision::Allow
                 || (!definite(&result) && definite(&candidate))
@@ -966,6 +1302,9 @@ fn js_literal(source: &str) -> Result<String, String> {
 fn builtin_module(name: &str) -> bool {
     // Explicit names only: an arbitrary `node:` URL is not evidence of a
     // supported builtin. Unknown/bare package imports remain unresolved.
+    if matches!(name, "test" | "test/reporters") {
+        return false; // These builtins require node:, unlike packages of that name.
+    }
     matches!(
         name.strip_prefix("node:").unwrap_or(name),
         "assert"
@@ -1137,7 +1476,12 @@ fn inspect_js_inputs(
     for child in children {
         match child {
             Ok(command) => {
-                let found = evaluate_source(&command, cwd, ScriptLanguage::Bash);
+                let found = dependency_result(
+                    source_dir,
+                    &command,
+                    ScriptLanguage::Bash,
+                    evaluate_source(&command, cwd, ScriptLanguage::Bash),
+                );
                 if definite(&found) {
                     result.get_or_insert(found);
                 } else if found.decision != EvaluationDecision::Allow {
@@ -1153,16 +1497,24 @@ fn inspect_js_inputs(
 }
 
 fn verify_syntax_interpreter(program: &str, cwd: &Path) -> Result<(), String> {
-    if std::env::vars_os().any(|(key, value)| {
-        !value.is_empty() && {
-            let key = key.to_string_lossy();
-            matches!(
-                key.as_ref(),
-                "NODE_OPTIONS" | "BASH_ENV" | "ENV" | "ZDOTDIR" | "LD_PRELOAD" | "LD_LIBRARY_PATH"
-            ) || key.starts_with("DYLD_")
-                || key.starts_with("BASH_FUNC_")
-        }
-    }) {
+    if crate::trial::agent_environment()
+        .iter()
+        .any(|(key, value)| {
+            !value.is_empty() && {
+                let key = key.to_string_lossy();
+                matches!(
+                    key.as_ref(),
+                    "NODE_OPTIONS"
+                        | "BASH_ENV"
+                        | "ENV"
+                        | "ZDOTDIR"
+                        | "LD_PRELOAD"
+                        | "LD_LIBRARY_PATH"
+                ) || key.starts_with("DYLD_")
+                    || key.starts_with("BASH_FUNC_")
+            }
+        })
+    {
         return Err("syntax-only invocation has unverified startup/preload context".to_owned());
     }
     let path = if program.contains('/') {
@@ -1207,7 +1559,7 @@ fn verify_syntax_interpreter(program: &str, cwd: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn verify_unchanged(path: &Path, before: &fs::Metadata) -> Result<(), String> {
+pub(crate) fn verify_unchanged(path: &Path, before: &fs::Metadata) -> Result<(), String> {
     let after = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     if !after.is_file()
         || after.file_type().is_symlink()
@@ -1311,4 +1663,303 @@ fn native_binary(magic: &[u8; 4]) -> bool {
             | [0xca, 0xfe, 0xba, 0xbe]
             | [b'M', b'Z', _, _]
     )
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)] // JavaScript `{recursive:true}`, not a format
+    fn dependency_deferral_is_scoped_and_keeps_resolved_targets_outside_outputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let dependency = cwd.join("node_modules/loader/entry.js");
+        let original = || {
+            EvaluationResult::denied_by_embedded_sink(
+                "heredoc.shell.incomplete-analysis",
+                "bounded fallback found rm",
+            )
+        };
+        let dynamic = "export function cleanup(path) { fs.rmSync(path, {recursive:true}); }";
+        let inspect = |path: &Path, source: &str| {
+            dependency_result(path, source, ScriptLanguage::JavaScript, original())
+        };
+        assert_eq!(
+            inspect(&dependency, dynamic).decision,
+            EvaluationDecision::Deny
+        );
+        with_confined_dependencies(
+            cwd.clone(),
+            cwd.clone(),
+            vec![cwd.join("build")],
+            vec![cwd.join(".git")],
+            || {
+                assert_eq!(
+                    inspect(&dependency, dynamic).decision,
+                    EvaluationDecision::Allow
+                );
+                assert_eq!(
+                    inspect(&cwd.join("own.test.js"), dynamic).decision,
+                    EvaluationDecision::Deny
+                );
+                assert_eq!(
+                    inspect(&dependency, "fs.rmSync('build/cache', {recursive:true});").decision,
+                    EvaluationDecision::Allow
+                );
+                for target in ["tracked.txt", ".git", "../outside", "build/../../outside"] {
+                    let source = format!("fs.rmSync('{target}', {{recursive:true}});");
+                    let found = inspect(&dependency, &source);
+                    assert_eq!(found.decision, EvaluationDecision::Deny, "{source}");
+                    assert_eq!(
+                        found.pattern_info.unwrap().pattern_name.as_deref(),
+                        Some("confined-target")
+                    );
+                }
+                fs::create_dir(cwd.join("build")).unwrap();
+                std::os::unix::fs::symlink(&cwd, cwd.join("build/escape")).unwrap();
+                assert_eq!(
+                    inspect(&dependency, "fs.rmSync('build/escape/tracked.txt');").decision,
+                    EvaluationDecision::Deny
+                );
+            },
+        );
+        assert_eq!(
+            inspect(&dependency, dynamic).decision,
+            EvaluationDecision::Deny
+        );
+    }
+
+    #[test]
+    fn dependency_deferral_rejects_ignored_data_and_requires_approved_output_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let dependency = cwd.join("node_modules/loader/entry.js");
+        let outputs = [
+            "build",
+            "dist",
+            "target",
+            ".cache",
+            "coverage",
+            "node_modules",
+        ];
+        let other = [
+            ".env",
+            "data.sqlite",
+            ".build",
+            ".next",
+            ".turbo",
+            "out",
+            "dist-old",
+        ];
+        let writable = outputs
+            .iter()
+            .chain(&other)
+            .map(|name| cwd.join(name))
+            .collect();
+        let inspect = |source: &str, language| {
+            dependency_result(
+                &dependency,
+                source,
+                language,
+                EvaluationResult::denied_by_embedded_sink(
+                    "heredoc.javascript.fs-rm",
+                    "filesystem deletion",
+                ),
+            )
+            .decision
+        };
+        let protected = vec![cwd.join(".git")];
+        with_confined_dependencies(cwd.clone(), cwd.clone(), writable, protected, || {
+            for name in outputs {
+                let source = format!("fs.rmSync('{name}/x', {{recursive:true}});");
+                assert_eq!(
+                    inspect(&source, ScriptLanguage::JavaScript),
+                    EvaluationDecision::Allow,
+                    "{source}"
+                );
+            }
+            for name in other {
+                for source in [
+                    format!("fs.rmSync('{name}', {{recursive:true}});"),
+                    format!("fs.rmSync('dist/x'); fs.rmSync('{name}');"),
+                    format!("execSync('rm -rf {name}');"),
+                ] {
+                    assert_eq!(
+                        inspect(&source, ScriptLanguage::JavaScript),
+                        EvaluationDecision::Deny,
+                        "{source}"
+                    );
+                }
+                assert_eq!(
+                    inspect(&format!("rm -rf dist/x {name}"), ScriptLanguage::Bash),
+                    EvaluationDecision::Deny,
+                    "{name}"
+                );
+            }
+            // A literal host temp/home path is not the runner's fresh private
+            // temp/home, which is allocated only after the hook rewrites.
+            let outside = temp.path().parent().unwrap().join("dist/x");
+            let source = format!("fs.rmSync('{}');", outside.display());
+            assert_eq!(
+                inspect(&source, ScriptLanguage::JavaScript),
+                EvaluationDecision::Deny
+            );
+            fs::write(cwd.join("dist"), "an ignored file, not a directory").unwrap();
+            assert_eq!(
+                inspect("fs.rmSync('dist');", ScriptLanguage::JavaScript),
+                EvaluationDecision::Deny
+            );
+        });
+    }
+
+    #[test]
+    fn dependency_deferral_resolves_literals_and_child_targets_from_execution_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().canonicalize().unwrap();
+        let cwd = project.join("sub");
+        fs::create_dir(&cwd).unwrap();
+        let dependency = project.join("node_modules/loader/entry.js");
+        let writable = vec![project.join("dist")];
+        with_confined_dependencies(project, cwd, writable, Vec::new(), || {
+            for (target, expected) in [
+                ("../dist/x", EvaluationDecision::Allow),
+                ("dist/x", EvaluationDecision::Deny),
+            ] {
+                for (source, language) in [
+                    (
+                        format!("fs.rmSync('{target}');"),
+                        ScriptLanguage::JavaScript,
+                    ),
+                    (
+                        format!("execSync('rm -rf {target}');"),
+                        ScriptLanguage::JavaScript,
+                    ),
+                    (format!("rm -rf {target}"), ScriptLanguage::Bash),
+                ] {
+                    let result = dependency_result(
+                        &dependency,
+                        &source,
+                        language,
+                        EvaluationResult::denied_by_embedded_sink(
+                            "heredoc.shell.incomplete-analysis",
+                            "filesystem deletion",
+                        ),
+                    );
+                    assert_eq!(result.decision, expected, "{source}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn local_preload_marker_is_resolved_only_by_the_trial_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        fs::write(cwd.join("check.sh"), "echo safe\n").unwrap();
+        fs::write(cwd.join("startup.sh"), "echo startup\n").unwrap();
+        for command in [
+            "PYTHONPATH=src bash check.sh",
+            "PYTHONPATH=$SOURCE bash check.sh",
+            "NODE_OPTIONS=--max-old-space-size=4096 bash check.sh",
+            "env NODE_OPTIONS=--max-old-space-size=4096 bash check.sh",
+            "CI=1 env CI=1 env NODE_OPTIONS=--max-old-space-size=4096 bash check.sh",
+            "env NODE_OPTIONS=--max-old-space-size=4096 bash < check.sh",
+            "BASH_ENV=./startup.sh bash check.sh",
+            "env BASH_ENV=./startup.sh bash check.sh",
+        ] {
+            for relaxed in [false, true] {
+                let capture = crate::desktop_review::ReviewCapture::start();
+                let mut inspected = false;
+                let result = evaluate(
+                    command,
+                    Some(&cwd),
+                    ShellDialect::Posix,
+                    false,
+                    None,
+                    relaxed,
+                    |source, source_cwd, language| {
+                        assert_eq!(source_cwd, cwd);
+                        assert_eq!(language, ScriptLanguage::Bash);
+                        inspected |= source == "echo safe\n";
+                        EvaluationResult::allowed()
+                    },
+                );
+                assert!(inspected, "{command}, relaxed={relaxed}");
+                assert!(
+                    capture
+                        .snapshot()
+                        .resolved_paths()
+                        .contains(&cwd.join("check.sh"))
+                );
+                if relaxed {
+                    assert!(result.is_none(), "{command}: {result:?}");
+                } else {
+                    let info = result.unwrap().pattern_info.unwrap();
+                    assert_eq!(info.pattern_name.as_deref(), Some("unverified"));
+                    assert_eq!(
+                        crate::inspection::outcome(
+                            info.pack_id.as_deref(),
+                            info.pattern_name.as_deref(),
+                            &info.reason,
+                        ),
+                        crate::inspection::Outcome::Dynamic
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn env_prefix_keeps_definite_findings_and_sources_in_the_relaxed_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let source = "git reset --hard\n";
+        fs::write(cwd.join("check.sh"), source).unwrap();
+        for relaxed in [false, true] {
+            for command in [
+                "bash check.sh",
+                "env -i HOME=/tmp/h PATH=/usr/bin:/bin bash check.sh",
+                "env -i PATH=/usr/bin:/bin bash < check.sh",
+                "CI=1 bash check.sh",
+                "FOO=$BAR bash check.sh",
+                "PYTHONPATH=src bash check.sh",
+                "NODE_OPTIONS=--max-old-space-size=4096 bash check.sh",
+                "env NODE_OPTIONS=--max-old-space-size=4096 bash check.sh",
+                "env NODE_OPTIONS=--max-old-space-size=4096 bash < check.sh",
+            ] {
+                let capture = crate::desktop_review::ReviewCapture::start();
+                let mut inspected = false;
+                let result = evaluate(
+                    command,
+                    Some(&cwd),
+                    ShellDialect::Posix,
+                    false,
+                    None,
+                    relaxed,
+                    |text, _, _| {
+                        assert_eq!(text, source);
+                        inspected = true;
+                        EvaluationResult::denied_by_embedded_sink(
+                            "heredoc.posix.git-reset-hard",
+                            "destructive fixture source",
+                        )
+                    },
+                )
+                .unwrap();
+                assert!(inspected, "{command}, relaxed={relaxed}");
+                assert_eq!(result.decision, EvaluationDecision::Deny);
+                let info = result.pattern_info.unwrap();
+                assert_eq!(info.pattern_name.as_deref(), Some("git-reset-hard"));
+                let snapshot = capture.snapshot();
+                assert!(snapshot.resolved_paths().contains(&cwd.join("check.sh")));
+                assert!(
+                    snapshot
+                        .description(command, &cwd, &info, "codex")
+                        .is_some(),
+                    "definite evidence must remain reviewable: {command}"
+                );
+            }
+        }
+    }
 }

@@ -139,6 +139,70 @@ requested task itself under continuing confinement instead of trial-then-host). 
 
 ## Part E: enforcement instead of trial-then-host for finite commands (Tom approved 2026-10-12)
 
+### F3 clarification: Node preloads and dependency findings (2026-10-13)
+
+Node `--import`, `--require` and `-r` operands are module specifiers, distinct
+from shell `source` filenames. Static resolution uses the selected package
+script's directory, the nearest package self-reference and a bounded ancestor
+`node_modules` walk. It binds the manifest and selected JavaScript file, honors
+explicit exports and conditional insertion order for import/require, and uses
+legacy main/index lookup when exports are absent. No interpreter or loader is
+executed to resolve a name. See Node's [ESM resolution algorithm](https://nodejs.org/api/esm.html#resolution-algorithm-specification)
+and [CommonJS file resolution](https://nodejs.org/api/modules.html#file-modules).
+
+The bounded implementation leaves export wildcards/arrays, runtime-dependent
+`module-sync` and `node-addons` conditions, custom loaders, package imports/maps, native addons,
+JSON preloads and symlinks inconclusive. Unresolved package names never become
+static proof of safety. Manifest reads are capped at 256 KiB each and 1 MiB per
+resolution; each ancestor walk has 64 steps, export maps have 256 entries and
+conditional selection has 16 levels. Captured manifests and resolved sources
+participate in the existing exact-version input evidence.
+
+An encountered `node-addons` map stays inconclusive even with `--no-addons`:
+Node enables this condition by default and the current resolver does not bind
+that flag. It must not inspect a clean default while Node selects another file.
+See Node's [conditional exports](https://nodejs.org/api/packages.html#conditional-exports).
+
+For a finite command on a host capable of continuing-confinement rewriting,
+the hook may re-evaluate dependency findings in a dedicated scope. That scope
+uses the runner's Git-derived writable and protected paths. JavaScript and
+TypeScript dependency files beneath `node_modules` may defer dynamic cleanup
+or bounded fallback findings to kernel enforcement. Every recognized literal
+filesystem target must also lie within a project build/cache output directory:
+`build`, `dist`, `target`, `.cache`, `coverage` or `node_modules`. Git-ignored
+data such as `.env` or `data.sqlite` does not qualify. Neither do `.build`,
+`.next`, `.turbo` or `out`. Output names alone do not grant write access;
+Git-derived source/protected paths and symlink escapes still deny. Explicit
+child commands are evaluated normally; only bounded deletion commands whose
+literal operands meet both restrictions can defer. Config blocks, dcg's
+internal-command protection, credential writes, Git findings, and findings in
+the command or project-owned test sources remain in force. Static analysis is
+bounded and does not claim to resolve arbitrary dynamic targets; the unchanged
+kernel profile enforces every actual access throughout execution.
+
+The run's private temp/home remain writable. They are allocated after rewriting,
+so the hook does not equate any inherited home/temp literal with those private
+directories. Dynamic runtime accesses to the actual run temp/home remain under
+kernel enforcement; no host temp/home prefix is added to the literal exception.
+
+Literal targets (including explicit deletion child commands) are resolved from
+the runner's canonical effective cwd after any accepted leading `cd ... &&`.
+The hook's original cwd and a dependency's source directory cannot substitute
+for that runtime directory. Tests use opposite parent/subdirectory ignore
+layouts to catch both false denials and mistaken deferrals.
+
+This scope can only produce a confined replacement. It creates no ordinary
+allow, observed-safe trial result, learned approval or exception. Failed scope
+setup or re-evaluation preserves the original denial. Non-capable protocols,
+disabled trials and observational trial evaluation never enter it. Workspace
+boundaries are checked again by the actual runner before execution.
+
+The pi-os acceptance must first submit the unmodified `npm test` command to the
+real Claude Code hook, require `updatedInput` and a confined receipt, then run
+that decoded request in the disposable CoW workspace. Direct runner acceptance
+alone cannot detect a hook that rejects preloads before confinement. Require
+real exit 0, CDP test success and completion within the existing 595-second limit.
+
 Decision (Tom): for finite commands (test runs, `--check`/syntax checks, linters, builds whose outputs go to ignored
 paths) dcg does not run a trial and then allow an unconfined host run. It runs the requested command ONCE, in the real
 workspace, under continuing confinement, and the agent gets that real result.

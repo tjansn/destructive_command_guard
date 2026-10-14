@@ -98,12 +98,15 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 30] = [
     r#"\birb[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
     // Perl inline execution (matches perl, perl5, perl5.36, perl.exe, etc.)
     r#"\bperl[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*[eE][A-Za-z]*(?:\s|['"]|$)"#,
-    // Node.js inline execution (matches node, node18, nodejs, node.exe, etc.)
-    r#"\bnode(?:js)?[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*[ep][A-Za-z]*(?:\s|['"]|$)"#,
+    // Node.js inline execution (matches node, node18, nodejs, node.exe, etc.).
+    // The long spellings `--eval`/`--print` (also `--eval=…`) run the same
+    // payload as `-e`/`-p`; without them a one-word swap skipped every
+    // embedded-JavaScript rule (the #425 shape, reaching extraction).
+    r#"\bnode(?:js)?[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?(?:-[A-Za-z]*[ep][A-Za-z]*|--(?:eval|print))(?:\s|['"=]|$)"#,
     // Bun and Deno inline execution (issue #397). Bun runs `-e`/`-p` exactly as
     // Node does, so the identical payload must reach the identical rules; before
     // this, swapping `node` for `bun` was a one-word bypass of a live deny.
-    r#"\b(?:bun|deno)[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*[ep][A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\b(?:bun|deno)[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?(?:-[A-Za-z]*[ep][A-Za-z]*|--(?:eval|print))(?:\s|['"=]|$)"#,
     // Bun's `exec` subcommand hands its argument to a shell, so it is an inline
     // shell payload under a subcommand rather than a flag (issue #397).
     // The optional quote matches `subcommand_inline_payload`, which dequotes the
@@ -133,8 +136,8 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 30] = [
     r"(?i)\bdo\s+shell\s+script\b",
     r"\$\.system\s*\(",
     r"\.doShellScript\s*\(",
-    // PHP inline execution
-    r#"\bphp[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*r[A-Za-z]*(?:\s|['"]|$)"#,
+    // PHP inline execution (`-r` or its long spelling `--run`)
+    r#"\bphp[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?(?:-[A-Za-z]*r[A-Za-z]*|--run)(?:\s|['"=]|$)"#,
     // Lua inline execution
     r#"\blua[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
     // Shell inline execution (sh -c, bash -c, zsh -c, fish -c, bash -lc, etc.).
@@ -1416,26 +1419,28 @@ static HERESTRING_UNQUOTED: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Regex for inline script flag extraction with single quotes.
 static INLINE_SCRIPT_SINGLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
-    // Matches: command -c/-e/-p/-E/-r followed by single-quoted content
+    // Matches: command -c/-e/-p/-E/-r (or --eval/--print/--run, also `=`-joined)
+    // followed by single-quoted content
     // Groups: (1) interpreter, (2) optional "js" suffix for node, (3) flag, (4) content
     // Supports versioned interpreters: python3.11, ruby3.0, perl5.36, node18, nodejs20, etc.
     // Supports Windows .exe extensions: python.exe, python3.11.exe, etc.
     // `(?i:powershell|pwsh)` matches the Windows PowerShell host case-insensitively;
     // `["']?` after the interpreter swallows the closing quote of a quoted full
     // path (e.g. `"...\powershell.exe" -Command '...'`) before flags (#125).
-    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|dash(?:\.exe)?|ksh[0-9]*(?:\.exe)?|mksh(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b["']?(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*\s+['\x22]?(-[A-Za-z]*[ceECpr][A-Za-z]*)['\x22]?\s*'([^']*)'"#)
+    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|dash(?:\.exe)?|ksh[0-9]*(?:\.exe)?|mksh(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b["']?(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*\s+['\x22]?(-[A-Za-z]*[ceECpr][A-Za-z]*|--(?:eval|print|run))['\x22]?=?\s*'([^']*)'"#)
         .expect("inline script single-quote regex compiles")
 });
 
 /// Regex for inline script flag extraction with double quotes.
 static INLINE_SCRIPT_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
-    // Matches: command -c/-e/-p/-E/-r followed by double-quoted content
+    // Matches: command -c/-e/-p/-E/-r (or --eval/--print/--run, also `=`-joined)
+    // followed by double-quoted content
     // Groups: (1) interpreter, (2) optional "js" suffix for node, (3) flag, (4) content
     // Supports versioned interpreters: python3.11, ruby3.0, perl5.36, node18, nodejs20, etc.
     // Supports Windows .exe extensions: python.exe, python3.11.exe, etc.
     // PowerShell host + quoted-path closing quote handled as in the single-quote
     // variant above (#125).
-    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|dash(?:\.exe)?|ksh[0-9]*(?:\.exe)?|mksh(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b['"]?(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*\s+['\x22]?(-[A-Za-z]*[ceECpr][A-Za-z]*)['\x22]?\s*"([^"]*)""#)
+    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|dash(?:\.exe)?|ksh[0-9]*(?:\.exe)?|mksh(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b['"]?(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*\s+['\x22]?(-[A-Za-z]*[ceECpr][A-Za-z]*|--(?:eval|print|run))['\x22]?=?\s*"([^"]*)""#)
         .expect("inline script double-quote regex compiles")
 });
 
@@ -2051,7 +2056,16 @@ fn extract_inline_scripts(
             let cmd_lower = cmd_name.to_ascii_lowercase();
             let is_powershell =
                 cmd_lower.starts_with("powershell") || cmd_lower.starts_with("pwsh");
-            let is_inline_flag = if cmd_name.starts_with("python") {
+            let is_inline_flag = if let Some(long) = flag.strip_prefix("--") {
+                // Long spellings are matched by name, per interpreter: Node and
+                // Bun honour `--eval`/`--print`, PHP `--run`; no other
+                // interpreter here takes code through a long option.
+                if cmd_name.starts_with("node") || cmd_name.starts_with("bun") {
+                    matches!(long, "eval" | "print")
+                } else {
+                    cmd_name.starts_with("php") && long == "run"
+                }
+            } else if cmd_name.starts_with("python") {
                 flag.contains('c') || flag.contains('e')
             } else if cmd_name.starts_with("ruby") || cmd_name.starts_with("irb") {
                 flag.contains('e')
@@ -10101,16 +10115,30 @@ fn literal_file_data_consumers(command: &str, outside: &str) -> Vec<ProvenFileDa
     }
     // Match the existing AST timeout's only-raise convention. Keep the cheap
     // trigger and byte cap outside the worker, and include input ownership and
-    // thread startup in the same deadline. One process-wide slot applies in
-    // tests too; a busy or expired optional proof simply supplies no waiver.
-    static BUSY: AtomicBool = AtomicBool::new(false);
+    // thread startup in the same deadline. One slot per hook process; a busy or
+    // expired optional proof simply supplies no waiver. Each test thread stands
+    // in for its own hook process: `cargo test` runs every test in one process,
+    // where a sibling's proof made this one's waiver depend on scheduling.
+    #[cfg(not(test))]
+    let busy = {
+        static BUSY: AtomicBool = AtomicBool::new(false);
+        &BUSY
+    };
+    #[cfg(test)]
+    let busy = TEST_FILE_DATA_PROOF_SLOT.with(|slot| *slot);
     let budget = crate::ast_matcher::protected_scan_budget();
     let started = Instant::now();
     let command = command.to_owned();
     let outside = outside.to_owned();
-    run_file_data_proof(&BUSY, started, budget, move || {
+    run_file_data_proof(busy, started, budget, move || {
         literal_file_data_consumers_inner(&command, &outside, started, budget)
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FILE_DATA_PROOF_SLOT: &'static AtomicBool =
+        Box::leak(Box::new(AtomicBool::new(false)));
 }
 
 fn literal_file_data_consumers_inner(
@@ -13964,8 +13992,8 @@ mod tests {
 
     #[test]
     fn expired_and_busy_transfer_proofs_supply_no_exemption_543() {
-        // Exercise the same runner with an isolated slot; public helpers
-        // always use the process-wide slot, including in test builds.
+        // Exercise the same runner with an isolated slot; public helpers use
+        // the per-process slot (per test thread in test builds).
         static BUSY: AtomicBool = AtomicBool::new(false);
         assert!(
             run_file_data_proof(&BUSY, Instant::now(), Duration::ZERO, || {
@@ -15664,6 +15692,75 @@ mod tests {
                 assert!(contents[0].quoted);
             } else {
                 panic!("Expected Extracted result");
+            }
+        }
+
+        /// Node/Bun `--eval`/`--print` and PHP `--run` carry the same payload as
+        /// their short flags. Only the short spellings used to reach extraction,
+        /// so `node --eval '<recursive rmSync>'` skipped every embedded rule.
+        #[test]
+        fn long_inline_code_flags_reach_extraction() {
+            for (command, payload, language) in [
+                (
+                    "node --eval 'fs.rmSync(p)'",
+                    "fs.rmSync(p)",
+                    ScriptLanguage::JavaScript,
+                ),
+                (
+                    r#"node --print "fs.rmSync(p)""#,
+                    "fs.rmSync(p)",
+                    ScriptLanguage::JavaScript,
+                ),
+                (
+                    "node --eval='fs.rmSync(p)'",
+                    "fs.rmSync(p)",
+                    ScriptLanguage::JavaScript,
+                ),
+                (
+                    "node --test --eval 'fs.rmSync(p)' entry.test.js",
+                    "fs.rmSync(p)",
+                    ScriptLanguage::JavaScript,
+                ),
+                (
+                    r#"bun --eval "fs.rmSync(p)""#,
+                    "fs.rmSync(p)",
+                    ScriptLanguage::TypeScript,
+                ),
+                (
+                    r#"php --run "unlink($p);""#,
+                    "unlink($p);",
+                    ScriptLanguage::Php,
+                ),
+            ] {
+                assert_eq!(
+                    check_triggers(command),
+                    TriggerResult::Triggered,
+                    "{command}"
+                );
+                let ExtractionResult::Extracted(contents) =
+                    extract_content(command, &ExtractionLimits::default())
+                else {
+                    panic!("expected extraction: {command}");
+                };
+                assert_eq!(contents.len(), 1, "{command}");
+                assert_eq!(contents[0].content, payload, "{command}");
+                assert_eq!(contents[0].language, language, "{command}");
+            }
+            // An ordinary long option is not code, and no other interpreter
+            // here takes code through a long option.
+            for command in [
+                "node --max-old-space-size=4096 app.js",
+                "node --inspect app.js --print",
+                "python3 --eval 'import os'",
+                "ruby --print 'puts 1'",
+            ] {
+                assert!(
+                    !matches!(
+                        extract_content(command, &ExtractionLimits::default()),
+                        ExtractionResult::Extracted(_)
+                    ),
+                    "{command}"
+                );
             }
         }
 

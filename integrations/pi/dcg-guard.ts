@@ -58,6 +58,9 @@ function checkCommand(input: Record<string, unknown>, cwd: string): Promise<Verd
       try {
         const result = JSON.parse(stdout);
         if (code === 0 && result.dcg_verdict === "confined"
+            && result.dcg_approval_scope === "confined"
+            && ["none", "all"].includes(result.dcg_confined_loopback)
+            && result.hookSpecificOutput?.hookEventName === "PreToolUse"
             && result.hookSpecificOutput?.permissionDecision === "allow"
             && typeof result.hookSpecificOutput.updatedInput?.command === "string"
             && result.hookSpecificOutput.updatedInput.command.trim().length > 0) {

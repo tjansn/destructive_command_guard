@@ -4,6 +4,7 @@
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use destructive_command_guard::config::ConfinedLoopback;
     use destructive_command_guard::confined::{self, Request, RunResult};
     use std::fs;
     use std::io::{Read, Write};
@@ -85,14 +86,24 @@ mod macos {
         }
 
         fn run(&self, timeout_secs: u64) -> Result<RunResult, String> {
+            self.run_with_loopback(timeout_secs, ConfinedLoopback::None)
+        }
+
+        fn run_with_loopback(
+            &self,
+            timeout_secs: u64,
+            loopback: ConfinedLoopback,
+        ) -> Result<RunResult, String> {
             confined::run(
                 &Request::new(
                     "node --test ./case.test.cjs",
                     &self.project,
                     Path::new("/bin/sh"),
                     timeout_secs,
-                ),
+                )
+                .with_loopback(loopback),
                 &self.runtime,
+                loopback,
             )
         }
 
@@ -149,6 +160,340 @@ mod macos {
             "missing {operation} operation report for {target}: {}",
             details(result)
         );
+    }
+
+    fn hook_request(
+        cwd: &Path,
+        runtime: &Path,
+        command: &str,
+        agent: &str,
+        capable: bool,
+    ) -> serde_json::Value {
+        let home = runtime.join("hook-home");
+        fs::create_dir_all(&home).unwrap();
+        let config = runtime.join("hook-policy.toml");
+        fs::write(
+            &config,
+            "[general]\nself_heal_hook = false\nfail_closed = true\nunverified_decision = 'deny'\n\
+             [policy]\ndefault_mode = 'deny'\n\
+             [heredoc]\nenabled = true\nscan_script_files = true\n\
+             [trial]\nenabled = true\ntimeout_secs = 600\nconfined_loopback = 'all'\n",
+        )
+        .unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_dcg"))
+            .args(["--agent", agent])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("TMPDIR", runtime)
+            .env("TEMP", runtime)
+            .env("TMP", runtime)
+            .env("DCG_CONFIG", &config)
+            .env("DCG_SELF_HEAL_HOOK", "0")
+            .env("DCG_HISTORY_DISABLED", "1")
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", runtime.join("no-system.toml"))
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let input = serde_json::json!({
+            "tool_name": "Bash", "cwd": cwd,
+            "tool_input": {"command": command, "timeout": if capable { 600 } else { 600_000 }},
+            "dcg_input_rewrite": capable, "dcg_explicit_verdict": true,
+        });
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "hook output: {error}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+    }
+
+    fn rewritten_request(output: &serde_json::Value) -> Request {
+        assert_eq!(output["dcg_verdict"], "confined", "{output}");
+        let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        let words = shell_words::split(command).unwrap();
+        assert_eq!(words[0], env!("CARGO_BIN_EXE_dcg"));
+        assert_eq!(&words[1..4], ["run", "--confined", "--request"]);
+        Request::decode(&words[4]).unwrap()
+    }
+
+    #[test]
+    fn dependency_cleanup_runs_only_after_a_capable_hook_confines_it() {
+        let fixture = Fixture::new(
+            "fs.mkdirSync('build', {recursive: true}); fs.writeFileSync('build/once', 'once');",
+        );
+        let package = fixture.project.join("node_modules/fixture-loader");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"exports":{".":"./loader.mjs"}}"#,
+        )
+        .unwrap();
+        // A literal cleanup target, so static analysis has a dependency finding
+        // to defer: a cleanup through a parameter yields none to begin with.
+        fs::write(
+            package.join("loader.mjs"),
+            "import fs from 'node:fs';\n\
+             fs.rmSync('build/cache', {recursive: true, force: true});\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.project.join("package.json"),
+            r#"{"scripts":{"test":"node --import fixture-loader --test case.test.cjs"}}"#,
+        )
+        .unwrap();
+        for command in [
+            "npm test",
+            "node --import ./node_modules/fixture-loader/loader.mjs --test case.test.cjs",
+        ] {
+            for (agent, capable) in [("claude-code", false), ("pi", true)] {
+                let output =
+                    hook_request(&fixture.project, &fixture.runtime, command, agent, capable);
+                let request = rewritten_request(&output);
+                assert_eq!(request.command, command);
+                assert!(
+                    !fixture.project.join("build/once").exists(),
+                    "hook must not execute the candidate"
+                );
+            }
+        }
+        // These protocols cannot rewrite, so their static dependency decision
+        // remains in force and no observational trial may erase the finding.
+        for agent in ["pi", "opencode"] {
+            let output = hook_request(&fixture.project, &fixture.runtime, "npm test", agent, false);
+            assert!(
+                output["hookSpecificOutput"].get("updatedInput").is_none(),
+                "{output}"
+            );
+            assert_eq!(
+                output["hookSpecificOutput"]["permissionDecision"], "deny",
+                "{output}"
+            );
+        }
+        let output = hook_request(
+            &fixture.project,
+            &fixture.runtime,
+            "npm test",
+            "claude-code",
+            false,
+        );
+        let result = confined::run(
+            &rewritten_request(&output),
+            &fixture.runtime,
+            ConfinedLoopback::All,
+        )
+        .unwrap();
+        assert_eq!(result.exit_code, 0, "{}", details(&result));
+        assert_eq!(
+            fs::read_to_string(fixture.project.join("build/once")).unwrap(),
+            "once"
+        );
+    }
+
+    #[test]
+    fn dependency_ignored_data_is_not_an_approved_cleanup_output() {
+        let fixture = Fixture::new("console.log('must not execute');");
+        fs::write(
+            fixture.project.join(".gitignore"),
+            "build/\ndist/\n.env\ndata.sqlite\n.next/\n",
+        )
+        .unwrap();
+        for name in [".env", "data.sqlite"] {
+            fs::write(fixture.project.join(name), "preserve ignored fixture data").unwrap();
+        }
+        let package = fixture.project.join("node_modules/fixture-loader");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"exports":"./loader.mjs"}"#,
+        )
+        .unwrap();
+        fs::write(
+            fixture.project.join("package.json"),
+            r#"{"scripts":{"test":"node --import fixture-loader --test case.test.cjs"}}"#,
+        )
+        .unwrap();
+        for (target, deferred) in [
+            ("dist/x", true),
+            (".env", false),
+            ("data.sqlite", false),
+            (".next/x", false),
+        ] {
+            fs::write(
+                package.join("loader.mjs"),
+                format!("import fs from 'node:fs'; fs.rmSync('{target}', {{recursive:true, force:true}});"),
+            )
+            .unwrap();
+            let output = hook_request(
+                &fixture.project,
+                &fixture.runtime,
+                "npm test",
+                "claude-code",
+                false,
+            );
+            if deferred {
+                assert_eq!(rewritten_request(&output).command, "npm test");
+            } else {
+                assert_eq!(
+                    output["hookSpecificOutput"]["permissionDecision"], "deny",
+                    "{target}: {output}"
+                );
+                assert!(output["hookSpecificOutput"].get("updatedInput").is_none());
+            }
+        }
+        for name in [".env", "data.sqlite"] {
+            assert_eq!(
+                fs::read_to_string(fixture.project.join(name)).unwrap(),
+                "preserve ignored fixture data"
+            );
+        }
+    }
+
+    #[test]
+    fn dependency_relative_targets_follow_the_leading_cd_directory() {
+        let fixture = Fixture::new("console.log('must not execute');");
+        let sub = fixture.project.join("node-harness");
+        let package = sub.join("node_modules/fixture-loader");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"exports":"./loader.mjs"}"#,
+        )
+        .unwrap();
+        fs::write(
+            sub.join("package.json"),
+            r#"{"scripts":{"test":"node --import fixture-loader --test case.test.cjs"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            sub.join("case.test.cjs"),
+            "console.log('must not execute');",
+        )
+        .unwrap();
+        for cwd in [&fixture.project, &sub] {
+            fs::create_dir(cwd.join("dist")).unwrap();
+            fs::write(cwd.join("dist/x"), "preserve fixture contents").unwrap();
+        }
+        // Opposite layouts catch both mistakes: rejecting a valid subdirectory
+        // output and accepting a subdirectory source because the parent's
+        // identically spelled target is writable.
+        for (ignore, deferred) in [("/node-harness/dist/\n", true), ("/dist/\n", false)] {
+            fs::write(fixture.project.join(".gitignore"), ignore).unwrap();
+            for source in [
+                "import fs from 'node:fs'; fs.rmSync('dist/x', {recursive:true, force:true});",
+                "import {execSync} from 'node:child_process'; execSync('rm -rf dist/x');",
+            ] {
+                fs::write(package.join("loader.mjs"), source).unwrap();
+                let command = "cd ./node-harness/../node-harness && npm test";
+                let output = hook_request(
+                    &fixture.project,
+                    &fixture.runtime,
+                    command,
+                    "claude-code",
+                    false,
+                );
+                if deferred {
+                    let request = rewritten_request(&output);
+                    assert_eq!(request.command, command);
+                    assert_eq!(request.cwd, fixture.project);
+                } else {
+                    assert_eq!(
+                        output["hookSpecificOutput"]["permissionDecision"], "deny",
+                        "{source}: {output}"
+                    );
+                    assert!(output["hookSpecificOutput"].get("updatedInput").is_none());
+                }
+            }
+        }
+        for cwd in [&fixture.project, &sub] {
+            assert_eq!(
+                fs::read_to_string(cwd.join("dist/x")).unwrap(),
+                "preserve fixture contents"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)] // JavaScript `{recursive:true}`, not a format
+    fn dependency_literal_targets_outside_outputs_and_direct_commands_stay_denied() {
+        let fixture = Fixture::new("console.log('must not execute');");
+        let package = fixture.project.join("node_modules/fixture-loader");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"exports":"./loader.mjs"}"#,
+        )
+        .unwrap();
+        fs::write(
+            fixture.project.join("package.json"),
+            r#"{"scripts":{"test":"node --import fixture-loader --test case.test.cjs"}}"#,
+        )
+        .unwrap();
+        for source in [
+            "import fs from 'node:fs'; fs.rmSync('tracked.txt', {recursive:true, force:true});",
+            "import fs from 'node:fs'; fs.rmSync('.git', {recursive:true, force:true});",
+            "import fs from 'node:fs'; fs.rmSync('../outside', {recursive:true, force:true});",
+        ] {
+            fs::write(package.join("loader.mjs"), source).unwrap();
+            let output = hook_request(
+                &fixture.project,
+                &fixture.runtime,
+                "npm test",
+                "claude-code",
+                false,
+            );
+            assert_eq!(
+                output["hookSpecificOutput"]["permissionDecision"], "deny",
+                "{source}: {output}"
+            );
+            assert!(output["hookSpecificOutput"].get("updatedInput").is_none());
+        }
+        fs::write(
+            package.join("loader.mjs"),
+            "export function cleanup(path) { require('fs').rmSync(path, {recursive:true}); }",
+        )
+        .unwrap();
+        // A single-file rmSync is allowed by policy wherever it appears (#455),
+        // so the direct case deletes tracked source recursively.
+        for command in [
+            "npm test && git reset --hard",
+            "node --eval 'require(\"fs\").rmSync(\"tracked.txt\", {recursive: true})' --test case.test.cjs",
+        ] {
+            let output = hook_request(
+                &fixture.project,
+                &fixture.runtime,
+                command,
+                "claude-code",
+                false,
+            );
+            assert!(
+                output["hookSpecificOutput"].get("updatedInput").is_none(),
+                "{output}"
+            );
+            assert_eq!(
+                output["hookSpecificOutput"]["permissionDecision"], "deny",
+                "{output}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(fixture.project.join("tracked.txt")).unwrap(),
+            "original tracked source"
+        );
+        assert!(!fixture.root.join("outside").exists());
     }
 
     #[test]
@@ -272,50 +617,133 @@ mod macos {
     }
 
     #[test]
-    fn a_preexisting_loopback_http_deputy_cannot_mutate_its_fixture_victim() {
-        let fixture = Fixture::new("");
-        let victim = fixture.root.join("deputy-victim.txt");
-        fs::write(&victim, "unchanged").unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture loopback listener");
-        listener.set_nonblocking(true).unwrap();
-        let address = listener.local_addr().unwrap();
-        let stopped = Arc::new(AtomicBool::new(false));
-        let stop = Arc::clone(&stopped);
-        let target = victim.clone();
-        let server = std::thread::spawn(move || {
-            let started = Instant::now();
-            while !stop.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(25) {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    stream
-                        .set_read_timeout(Some(Duration::from_millis(500)))
-                        .unwrap();
-                    let mut request = [0; 1024];
-                    if stream.read(&mut request).unwrap_or(0) > 0 {
-                        fs::write(&target, "delegated mutation").unwrap();
-                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    fn trusted_all_explicitly_accepts_preexisting_loopback_deputies() {
+        for loopback in [ConfinedLoopback::None, ConfinedLoopback::All] {
+            let fixture = Fixture::new("");
+            let victim = fixture.root.join("deputy-victim.txt");
+            fs::write(&victim, "unchanged").unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").expect("fixture loopback listener");
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let stopped = Arc::new(AtomicBool::new(false));
+            let stop = Arc::clone(&stopped);
+            let target = victim.clone();
+            let server = std::thread::spawn(move || {
+                let started = Instant::now();
+                while !stop.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(25) {
+                    if let Ok((mut stream, _)) = listener.accept() {
+                        stream
+                            .set_read_timeout(Some(Duration::from_millis(500)))
+                            .unwrap();
+                        let mut request = [0; 1024];
+                        if stream.read(&mut request).unwrap_or(0) > 0 {
+                            fs::write(&target, "delegated mutation").unwrap();
+                            let _ =
+                                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                        }
                     }
+                    std::thread::sleep(Duration::from_millis(5));
                 }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        });
-        fixture.replace_body(&format!(
+            });
+            fixture.replace_body(&format!(
             "await new Promise((resolve, reject) => {{\n\
              const request = require('node:http').get('http://{address}/mutate', response => {{ response.resume(); response.on('end', resolve); }});\n\
              request.on('error', reject);\n\
              request.setTimeout(2000, () => request.destroy(new Error('fixture network timeout')));\n\
              }});"
         ));
-        let result = fixture.run(15);
-        stopped.store(true, Ordering::SeqCst);
-        server.join().expect("join fixture deputy");
-        let result = result.expect("loopback deputy fixture result");
-        assert_violation(&result, "network", &format!(":{}", address.port()));
-        assert!(
-            String::from_utf8_lossy(&result.stdout).contains("127.0.0.1"),
-            "{}",
-            details(&result)
+            let result = fixture.run_with_loopback(15, loopback);
+            stopped.store(true, Ordering::SeqCst);
+            server.join().expect("join fixture deputy");
+            let result = result.expect("loopback deputy fixture result");
+            if loopback == ConfinedLoopback::None {
+                assert_violation(&result, "network", &format!(":{}", address.port()));
+                assert!(
+                    String::from_utf8_lossy(&result.stdout).contains("127.0.0.1"),
+                    "{}",
+                    details(&result)
+                );
+                assert_eq!(fs::read_to_string(victim).unwrap(), "unchanged");
+            } else {
+                assert_eq!(result.exit_code, 0, "{}", details(&result));
+                assert_eq!(fs::read_to_string(victim).unwrap(), "delegated mutation");
+            }
+        }
+    }
+
+    #[test]
+    fn owned_tcp_listeners_require_the_trusted_all_opt_in() {
+        for loopback in [ConfinedLoopback::None, ConfinedLoopback::All] {
+            for (listen, connect) in [
+                ("127.0.0.1", "127.0.0.1"),
+                ("::1", "::1"),
+                ("127.0.0.1", "::ffff:127.0.0.1"),
+            ] {
+                let body = format!(
+                    "const net = require('node:net');\n\
+                     const server = net.createServer(socket => socket.end('fixture response'));\n\
+                     await new Promise((resolve, reject) => {{ server.once('error', reject); server.listen(0, '{listen}', resolve); }});\n\
+                     try {{\n\
+                       const result = await new Promise(resolve => {{\n\
+                         const socket = net.connect(server.address().port, '{connect}');\n\
+                         socket.setTimeout(2000, () => {{ socket.destroy(); resolve('TIMEOUT'); }});\n\
+                         socket.once('data', data => {{ socket.destroy(); resolve(data.toString()); }});\n\
+                         socket.once('error', error => resolve(error.code));\n\
+                       }});\n\
+                       assert.equal(result, '{}');\n\
+                     }} finally {{ await new Promise(resolve => server.close(resolve)); }}",
+                    if loopback == ConfinedLoopback::All {
+                        "fixture response"
+                    } else {
+                        "EPERM"
+                    }
+                );
+                let fixture = Fixture::new(&body);
+                let result = fixture.run_with_loopback(15, loopback).unwrap();
+                assert_eq!(
+                    result.exit_code,
+                    0,
+                    "{loopback:?} {connect}: {}",
+                    details(&result)
+                );
+                assert!(!result.timed_out, "{}", details(&result));
+                assert!(String::from_utf8_lossy(&result.stderr).contains(loopback.receipt()));
+            }
+        }
+    }
+
+    #[test]
+    fn localhost_opt_in_does_not_open_non_loopback_tcp() {
+        let fixture = Fixture::new(
+            "const result = await new Promise(resolve => {\n\
+               const socket = require('node:net').connect(9, '192.0.2.1');\n\
+               socket.setTimeout(2000, () => { socket.destroy(); resolve('TIMEOUT'); });\n\
+               socket.once('connect', () => { socket.destroy(); resolve('CONNECTED'); });\n\
+               socket.once('error', error => resolve(error.code));\n\
+             });\n\
+             assert.equal(result, 'EPERM');",
         );
-        assert_eq!(fs::read_to_string(victim).unwrap(), "unchanged");
+        let result = fixture
+            .run_with_loopback(15, ConfinedLoopback::All)
+            .unwrap();
+        assert_eq!(result.exit_code, 0, "{}", details(&result));
+        assert!(!result.timed_out);
+    }
+
+    #[test]
+    fn receipt_cannot_enable_localhost_without_matching_trusted_config() {
+        let fixture =
+            Fixture::new("fs.mkdirSync('build'); fs.writeFileSync('build/marker', 'executed');");
+        let request = Request::new(
+            "node --test ./case.test.cjs",
+            &fixture.project,
+            Path::new("/bin/sh"),
+            15,
+        )
+        .with_loopback(ConfinedLoopback::All);
+        let error = confined::run(&request, &fixture.runtime, ConfinedLoopback::None).unwrap_err();
+        assert!(error.contains("differs from the confined receipt"));
+        assert!(!fixture.project.join("build/marker").exists());
     }
 
     #[test]
@@ -429,11 +857,14 @@ mod macos {
         assert!(output_parent.starts_with(&temporary) && output_parent != temporary);
         let temp_root = std::env::temp_dir().canonicalize().unwrap();
         assert!(temp_root.starts_with(&temporary) && temp_root != temporary);
-        let result = confined::run(
-            &Request::new("npm test", &cwd, Path::new("/bin/sh"), 180),
-            &temp_root,
-        )
-        .expect("run the prepared temporary pi-os copy under continuing confinement");
+        // Exercise the real Claude Code hook first, with the package script
+        // unchanged. Calling Request::new directly missed both F3 regressions.
+        let receipt = hook_request(&cwd, &temp_root, "npm test", "claude-code", false);
+        let request = rewritten_request(&receipt);
+        assert_eq!(request.command, "npm test");
+        assert_eq!(request.timeout_secs, 595);
+        let result = confined::run(&request, &temp_root, ConfinedLoopback::All)
+            .expect("run the prepared temporary pi-os copy under continuing confinement");
         let stdout = String::from_utf8_lossy(&result.stdout);
         let stderr = String::from_utf8_lossy(&result.stderr);
         let report = format!(
@@ -455,6 +886,14 @@ mod macos {
                 || stdout.contains("# tests")
                 || stdout.contains("ℹ tests"),
             "the fixture did not reach npm/Node: {report}"
+        );
+        assert!(
+            !result.timed_out,
+            "pi-os exceeded the 595-second deadline: {report}"
+        );
+        assert_eq!(
+            result.exit_code, 0,
+            "the real pi-os suite did not pass: {report}"
         );
     }
 }

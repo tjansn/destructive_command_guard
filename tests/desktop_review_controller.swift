@@ -42,6 +42,19 @@ struct ControllerTests {
     @MainActor
     static func main() {
         let tests: [(String, () -> Void)] = [
+            ("multi-line command summary exposes every line break and keeps details", {
+                let command = "echo first\n\nrm -rf fixture\r\necho\tlast"
+                let text = "Full command:\n" + command
+                let info = ReviewDescription(
+                    agent: "Codex", host: nil, project: "fixture", repository: nil,
+                    cwd: "/tmp/fixture", title: "Fixture", effect: "No execution",
+                    warning: nil, command: command, executables: [], targets: [], text: text,
+                    scope: "one_time", scope_text: "Only this fixture")
+                precondition(ReviewDescription.inlineCommand(info.command) == "echo first ⏎  ⏎ rm -rf fixture ⏎ echo ⇥ last")
+                precondition(info.commandHeading.contains("mehrere Zeilen"))
+                precondition(info.command == command && info.text == text)
+                precondition(ReviewDescription.inlineCommand("cargo test") == "cargo test")
+            }),
             ("early steal cancels without finishing and restarts fresh", {
                 let h = Harness(); h.start(); h.now += 0.03; h.steal()
                 precondition(h.results.isEmpty && h.attempts[0].cancelled)

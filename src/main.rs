@@ -2441,7 +2441,8 @@ fn main() {
     {
         // The host executes this replacement once. Do not trial, learn or
         // emit an ordinary allow receipt for the original command.
-        let delivered = hook::output_confined_rewrite(&hook_input, &invocation);
+        let delivered =
+            hook::output_confined_rewrite(&hook_input, &invocation, config.trial.confined_loopback);
         drop(history_writer);
         finish_hook_mode(if delivered.is_ok() {
             EXIT_SUCCESS
@@ -2456,7 +2457,7 @@ fn main() {
         "hook request resolved"
     );
     let exit_code = if let Some(mut outcome) = decisive {
-        let trial_handled = trial_eligible
+        let trial_handled = (trial_eligible || desktop_review_eligible)
             && attempt_sandbox_trial(
                 &eval_context,
                 &mut outcome,
@@ -2509,7 +2510,11 @@ fn main() {
             emit_stderr!("[dcg] Warte auf deine Freigabe im macOS-Dialog (maximal 120 Sekunden).");
             let accepted = filesystem_effect.as_ref().map_or_else(
                 || snapshot.request(&description, cwd),
-                |assessment| assessment.review_with(store.as_ref(), || snapshot.request(&description, cwd)),
+                |assessment| assessment.review_with(store.as_ref(), |scope| {
+                    let mut scoped = description.clone();
+                    scoped.set_scope(scope);
+                    snapshot.request(&scoped, cwd)
+                }),
             );
             if !accepted {
                 review_unavailable = Some("Nicht per Fingerabdruck freigegeben: abgelehnt, abgelaufen, Dialog nicht verfügbar oder geprüfte Dateien geändert.");
@@ -2589,34 +2594,27 @@ fn confined_invocation(
         return None;
     }
     if let Some(outcome) = outcome {
-        let ResolvedCommandOutcome::DenyFamily(resolved) = outcome else {
+        let ResolvedCommandOutcome::DenyFamily(_) = outcome else {
             return None;
         };
-        if !resolved.result.pattern_info.as_ref().is_some_and(|info| {
-            trial::eligible(info)
-                && destructive_command_guard::inspection::outcome(
-                    info.pack_id.as_deref(),
-                    info.pattern_name.as_deref(),
-                    &info.reason,
-                ) == destructive_command_guard::inspection::Outcome::Dynamic
-        }) {
-            return None;
-        }
         let relaxed = ctx.allowlists.with_rule_grants(
             trial::TRIAL_RULES,
             "resolve only unverified scripts under confinement",
             "confined-run",
         );
-        let deadline = Deadline::new(Duration::from_millis(
-            ctx.config.effective_hook_timeout_ms(),
-        ));
-        let residual = HookEvalContext {
-            allowlists: &relaxed,
-            deadline: &deadline,
-            ..*ctx
-        };
         if !matches!(
-            resolve_hook_command(&residual, command, dialect, None),
+            confined::inspect_for_rewrite(command, cwd, || {
+                let deadline = Deadline::new(Duration::from_millis(
+                    ctx.config.effective_hook_timeout_ms(),
+                ));
+                let residual = HookEvalContext {
+                    allowlists: &relaxed,
+                    deadline: &deadline,
+                    ..*ctx
+                };
+                resolve_hook_command(&residual, command, dialect, None)
+            })
+            .ok()?,
             ResolvedCommandOutcome::Allow(_)
         ) {
             return None;
@@ -2645,6 +2643,7 @@ fn confined_invocation(
         input.dcg_input_rewrite.as_ref() == Some(&serde_json::Value::Bool(true)),
     )?;
     confined::Request::new(command, cwd, &shell, timeout)
+        .with_loopback(ctx.config.trial.confined_loopback)
         .invocation(&std::env::current_exe().ok()?)
         .ok()
 }
@@ -2665,6 +2664,7 @@ fn assess_filesystem_outcome(
         &resolved.command,
         ctx.scope_base?,
         &rule,
+        &destructive_command_guard::trial::agent_environment(),
     ))
 }
 
@@ -2706,6 +2706,7 @@ fn allow_filesystem_effect(
             &version.command,
             &version.cwd,
             &version.rule_id,
+            &destructive_command_guard::trial::agent_environment(),
         )
         .is_ok_and(|current| current == *version)
     {
@@ -2791,24 +2792,52 @@ fn attempt_sandbox_trial(
         .and_then(|t| t.tty.as_ref())
         .or_else(|| input.tool_args.as_ref().and_then(|t| t.get("tty")))
         .is_some_and(|v| v != &serde_json::Value::Bool(false));
-    let sources = capture
-        .map(|c| c.snapshot().resolved_paths())
+    let evidence = capture.map(destructive_command_guard::desktop_review::ReviewCapture::snapshot);
+    let sources = evidence
+        .as_ref()
+        .map(destructive_command_guard::desktop_review::ReviewSnapshot::resolved_paths)
         .unwrap_or_default();
     let resolve = || -> Result<bool, String> {
         let store = TrialStore::user().map_err(|e| format!("Trial store unavailable: {e}"))?;
-        let before = store
-            .fingerprint(&command, cwd, &shell, &sources)
+        let fingerprint = || {
+            if ctx.config.trial.enabled {
+                store.fingerprint(&command, cwd, &shell, &sources)
+            } else {
+                store.fingerprint_for_review(&command, cwd, &shell, &sources)
+            }
+        };
+        let before = fingerprint()
             .map_err(|e| format!("Die Prüfung ist unvollständig. Cannot bind an exact trial version; desktop approval unavailable: {e}"))?;
-        if !before.reproducible {
-            let explanation = "Runtime inputs or environment are not reproduced by the sandbox. This request requires one-time desktop review; no reusable approval will be recorded.";
-            if !desktop || !desktop_review::request_trial(&command, cwd, explanation, agent) {
+        let scope =
+            desktop_review::ApprovalScope::trial(ctx.config.trial.enabled, before.reproducible);
+        if scope == desktop_review::ApprovalScope::OneTime {
+            let (explanation, german) = if ctx.config.trial.enabled {
+                (
+                    "Runtime inputs or environment are not reproduced by the sandbox. This request requires one-time desktop review; no reusable approval will be recorded.",
+                    "Laufzeiteingaben oder Umgebung können in der Sandbox nicht vollständig nachgebildet werden. Bitte prüfe den genauen Aufruf und seine Folgen.",
+                )
+            } else {
+                (
+                    "Sandbox trials are disabled. Existing exact-version approvals are ignored; this request requires one-time desktop review and stores no approval.",
+                    "Sandbox-Tests sind deaktiviert. Gespeicherte Freigaben werden nicht verwendet. Bitte prüfe den genauen Aufruf und seine Folgen für diese einmalige Freigabe.",
+                )
+            };
+            if !desktop
+                || !desktop_review::request_trial(
+                    &command,
+                    cwd,
+                    german,
+                    agent,
+                    scope,
+                    &before,
+                    evidence.as_ref(),
+                )
+            {
                 return Err(format!(
                     "{explanation}\n[dcg:review-unavailable-or-cancelled] Desktop review unavailable, declined or expired."
                 ));
             }
-            let after = store
-                .fingerprint(&command, cwd, &shell, &sources)
-                .map_err(|e| e.to_string())?;
+            let after = fingerprint().map_err(|e| e.to_string())?;
             if before != after {
                 return Err("Runtime inputs changed during review; approval rejected.".to_owned());
             }
@@ -2863,7 +2892,17 @@ fn attempt_sandbox_trial(
             trial::Verdict::Safe => "trial",
             trial::Verdict::Unsafe => return Err(summary),
             trial::Verdict::Inconclusive => {
-                if !desktop || !desktop_review::request_trial(&command, cwd, &summary, agent) {
+                if !desktop
+                    || !desktop_review::request_trial(
+                        &command,
+                        cwd,
+                        &report.review_details(),
+                        agent,
+                        scope,
+                        &before,
+                        evidence.as_ref(),
+                    )
+                {
                     return Err(format!(
                         "{summary}\n[dcg:review-unavailable-or-cancelled] Desktop review unavailable, declined or expired."
                     ));

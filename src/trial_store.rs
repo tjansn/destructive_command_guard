@@ -42,6 +42,7 @@ pub struct Fingerprint {
     pub command: String,
     pub shell: PathBuf,
     pub resolved_sources: Vec<PathBuf>,
+    pub resolved_executables: Vec<PathBuf>,
     /// False means isolation changed or could not bind a runtime input. Such
     /// requests may be reviewed once, but cannot reuse or create a grant.
     pub reproducible: bool,
@@ -127,12 +128,25 @@ impl Default for StoreData {
 #[derive(Debug, Clone)]
 pub struct TrialStore {
     directory: PathBuf,
+    /// What fingerprinted commands inherit; see [`crate::trial::agent_environment`].
+    environment: BTreeMap<OsString, OsString>,
 }
 
 impl TrialStore {
     #[must_use]
-    pub const fn new(directory: PathBuf) -> Self {
-        Self { directory }
+    pub fn new(directory: PathBuf) -> Self {
+        Self {
+            directory,
+            environment: crate::trial::agent_environment(),
+        }
+    }
+
+    /// Bind versions against an explicit inherited environment instead of
+    /// dcg's own, e.g. the hermetic environment of a spawned dcg process.
+    #[must_use]
+    pub fn with_environment(mut self, environment: BTreeMap<OsString, OsString>) -> Self {
+        self.environment = environment;
+        self
     }
 
     /// Use the same trusted user directory as ordinary allowlist entries.
@@ -156,6 +170,17 @@ impl TrialStore {
         self.fingerprint_inner(command, cwd, shell, resolved_sources, true)
     }
 
+    /// Bind a one-time review without reading or writing the approval store.
+    pub fn fingerprint_for_review(
+        &self,
+        command: &str,
+        cwd: &Path,
+        shell: &Path,
+        resolved_sources: &[PathBuf],
+    ) -> io::Result<Fingerprint> {
+        self.fingerprint_inner(command, cwd, shell, resolved_sources, false)
+    }
+
     fn fingerprint_inner(
         &self,
         command: &str,
@@ -172,23 +197,33 @@ impl TrialStore {
             .map(|source| cwd.join(source).canonicalize())
             .collect::<io::Result<Vec<_>>>()?;
         let manifest = source_manifest(&project_root)?;
-        let mut executables = resolved_executables(command, &cwd)?;
+        let parent_environment = &self.environment;
+        let search_path = parent_environment
+            .get(OsStr::new("PATH"))
+            .cloned()
+            .unwrap_or_default();
+        let (resolved, local_environment) =
+            resolved_executables(command, &cwd, parent_environment)?;
+        let reviewed_executables = resolved.iter().cloned().collect();
+        let mut executables = BTreeSet::new();
         executables.insert(shell.clone());
         executables.extend(sources.iter().cloned());
-        resolve_interpreters(&mut executables, &cwd)?;
-        let parent_environment: BTreeMap<_, _> = std::env::vars_os().collect();
-        let (environment_digest, environment_reproduced) = runtime_environment(&parent_environment);
+        resolve_interpreters(&mut executables, &cwd, &search_path)?;
+        executables.extend(resolved);
+        let (environment_digest, environment_reproduced) = runtime_environment(parent_environment);
         let mut runtime = ignored_runtime_inputs(&project_root);
-        let startup = shell_startup_inputs(&shell, &parent_environment);
+        let startup = shell_startup_inputs(&shell, parent_environment);
         let public_config = existing_runtime_inputs(PUBLIC_RUNTIME_CONFIGS.map(PathBuf::from));
-        let mut reproducible = environment_reproduced
+        // Overrides are bound, but are not the sanitized trial environment.
+        let mut reproducible = !local_environment
+            && environment_reproduced
             && runtime.complete
             && startup.files.is_empty()
             && startup.complete
             && public_config.complete;
         runtime.files.extend(startup.files);
         runtime.files.extend(public_config.files);
-        self.with_data(|data| {
+        let calculate = |data: &mut StoreData| {
             let mut hasher = Sha256::new();
             hash_field(&mut hasher, b"dcg-verified-trial-v2");
             hash_field(&mut hasher, path_text(&project_root)?.as_bytes());
@@ -204,12 +239,7 @@ impl TrialStore {
             // elsewhere. Exact approvals must retain their original semantics.
             hash_field(&mut hasher, command.as_bytes());
             hash_field(&mut hasher, environment_digest.as_bytes());
-            hash_field(
-                &mut hasher,
-                std::env::var_os("PATH")
-                    .unwrap_or_default()
-                    .as_encoded_bytes(),
-            );
+            hash_field(&mut hasher, search_path.as_encoded_bytes());
             let mut dirty = false;
             let mut runtime_bytes = 0_u64;
             for (index, path) in runtime.files.iter().enumerate() {
@@ -269,11 +299,17 @@ impl TrialStore {
                     command: command.to_owned(),
                     shell,
                     resolved_sources: sources,
+                    resolved_executables: reviewed_executables,
                     reproducible,
                 },
                 dirty && persist_cache,
             ))
-        })
+        };
+        if persist_cache {
+            self.with_data(calculate)
+        } else {
+            calculate(&mut StoreData::default()).map(|(fingerprint, _)| fingerprint)
+        }
     }
 
     pub fn lookup(&self, current_version: &Fingerprint) -> io::Result<Option<VerifiedTrial>> {
@@ -383,6 +419,7 @@ impl TrialStore {
             &fingerprint.command,
             &fingerprint.cwd,
             &fingerprint.rule_id,
+            &self.environment,
         )?;
         if current != *fingerprint {
             return Err(io::Error::other(
@@ -475,7 +512,12 @@ impl TrialStore {
             if project.is_some_and(|project| !entry.cwd.starts_with(project)) {
                 continue;
             }
-            let current = crate::effects::fingerprint(&entry.command, &entry.cwd, &entry.rule_id);
+            let current = crate::effects::fingerprint(
+                &entry.command,
+                &entry.cwd,
+                &entry.rule_id,
+                &self.environment,
+            );
             if !current.is_ok_and(|value| value.digest == entry.fingerprint) {
                 stale_learned.insert(entry.fingerprint);
             }
@@ -1249,20 +1291,44 @@ fn file_state(metadata: &fs::Metadata) -> io::Result<CachedHash> {
     })
 }
 
-fn resolved_executables(command: &str, cwd: &Path) -> io::Result<BTreeSet<PathBuf>> {
+fn resolved_executables(
+    command: &str,
+    cwd: &Path,
+    parent: &BTreeMap<OsString, OsString>,
+) -> io::Result<(BTreeSet<PathBuf>, bool)> {
     let ast = AstGrep::new(command, SupportLang::Bash);
     let mut pending = vec![ast.root()];
     let mut result = BTreeSet::new();
+    let parent_path = parent.get(OsStr::new("PATH")).cloned().unwrap_or_default();
+    let mut local_environment = false;
     while let Some(node) = pending.pop() {
         pending.extend(node.children());
+        if node.kind().as_ref() == "variable_assignment"
+            && node
+                .parent()
+                .is_none_or(|parent| parent.kind().as_ref() != "command")
+            && node.text().split_once('=').is_some_and(|(name, _)| {
+                name == "PATH" || crate::invocation::preload_variable(name)
+            })
+        {
+            return Err(io::Error::other(
+                "standalone execution environment changes cannot be bound for review",
+            ));
+        }
         if node.kind().as_ref() == "command" {
             let text = node.text();
             let words = shell_words::split(&text).map_err(io::Error::other)?;
-            if words.iter().any(|word| word.starts_with("PATH=")) {
+            let bound =
+                crate::invocation::bound_environment(&text, parent).map_err(io::Error::other)?;
+            if let Some(bound) = &bound {
+                bound.ensure_reviewable().map_err(io::Error::other)?;
+            }
+            if bound.is_none() && words.iter().any(|word| word.starts_with("PATH=")) {
                 return Err(io::Error::other(
-                    "command-local PATH requires desktop review",
+                    "PATH assignment inside an unsupported wrapper cannot be bound; use a direct literal environment invocation",
                 ));
             }
+            local_environment |= bound.is_some();
             let Some(first) = words.iter().find(|word| !word.contains('=')) else {
                 continue;
             };
@@ -1300,25 +1366,45 @@ fn resolved_executables(command: &str, cwd: &Path) -> io::Result<BTreeSet<PathBu
                 crate::normalize::ShellDialect::Posix,
             )
             .ok_or_else(|| io::Error::other("dynamic working directory cannot be fingerprinted"))?;
-            let path = resolve_executable(first, &effective)?;
-            result.insert(path);
+            if let Some(bound) = bound {
+                if let Some((wrapper, path)) = bound.wrapper {
+                    let mut files =
+                        BTreeSet::from([resolve_executable(&wrapper, &effective, &path)?]);
+                    resolve_interpreters(&mut files, &effective, &path)?;
+                    result.extend(files);
+                }
+                let path = bound
+                    .values
+                    .get(OsStr::new("PATH"))
+                    .cloned()
+                    .unwrap_or_default();
+                let mut files =
+                    BTreeSet::from([resolve_executable(&bound.program, &effective, &path)?]);
+                resolve_interpreters(&mut files, &effective, &path)?;
+                result.extend(files);
+                continue;
+            }
+            let path = resolve_executable(first, &effective, &parent_path)?;
+            let mut files = BTreeSet::from([path]);
             let stripped = crate::normalize::strip_wrapper_prefixes(&text);
             let inner = shell_words::split(&stripped.normalized).map_err(io::Error::other)?;
             if let Some(executable) = inner.first()
                 && executable != first
             {
-                result.insert(resolve_executable(executable, &effective)?);
+                files.insert(resolve_executable(executable, &effective, &parent_path)?);
             }
+            resolve_interpreters(&mut files, &effective, &parent_path)?;
+            result.extend(files);
         }
     }
-    Ok(result)
+    Ok((result, local_environment))
 }
 
-fn resolve_executable(name: &str, cwd: &Path) -> io::Result<PathBuf> {
+pub(crate) fn resolve_executable(name: &str, cwd: &Path, path: &OsStr) -> io::Result<PathBuf> {
     if name.contains('/') || name.contains('\\') {
         return cwd.join(name).canonicalize();
     }
-    for directory in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+    for directory in std::env::split_paths(path) {
         let candidate = cwd.join(directory).join(name);
         if candidate.is_file() {
             #[cfg(unix)]
@@ -1336,7 +1422,11 @@ fn resolve_executable(name: &str, cwd: &Path) -> io::Result<PathBuf> {
     )))
 }
 
-fn resolve_interpreters(paths: &mut BTreeSet<PathBuf>, cwd: &Path) -> io::Result<()> {
+fn resolve_interpreters(
+    paths: &mut BTreeSet<PathBuf>,
+    cwd: &Path,
+    search_path: &OsStr,
+) -> io::Result<()> {
     let mut pending: Vec<_> = paths.iter().cloned().collect();
     let mut inspected = BTreeSet::new();
     while let Some(path) = pending.pop() {
@@ -1363,7 +1453,7 @@ fn resolve_interpreters(paths: &mut BTreeSet<PathBuf>, cwd: &Path) -> io::Result
         let Some(interpreter) = words.first() else {
             return Err(io::Error::other("empty script interpreter"));
         };
-        let interpreter = resolve_executable(interpreter, cwd)?;
+        let interpreter = resolve_executable(interpreter, cwd, search_path)?;
         if interpreter.file_name().is_some_and(|name| name == "env") {
             let command = words
                 .iter()
@@ -1380,7 +1470,7 @@ fn resolve_interpreters(paths: &mut BTreeSet<PathBuf>, cwd: &Path) -> io::Result
                     "dynamic env shebang cannot be fingerprinted",
                 ));
             }
-            let executable = resolve_executable(command, cwd)?;
+            let executable = resolve_executable(command, cwd, search_path)?;
             if paths.insert(executable.clone()) {
                 pending.push(executable);
             }
@@ -1410,6 +1500,163 @@ mod tests {
         store
             .fingerprint("echo safe", project, &project.with_file_name("shell"), &[])
             .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn literal_environment_review_binds_values_and_local_path_executable_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (temp, project, store) = fixture();
+        let bin = temp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let executable = bin.join("cargo");
+        fs::write(&executable, "fixture executable one").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let command = format!(
+            "/usr/bin/env -i HOME=/tmp/fixture PATH={} cargo test",
+            shell_words::quote(bin.to_str().unwrap())
+        );
+        let capture = |text: &str| {
+            store
+                .fingerprint(text, &project, &temp.path().join("shell"), &[])
+                .unwrap()
+        };
+        let first = capture(&command);
+        assert!(!first.reproducible);
+        assert_eq!(
+            crate::desktop_review::ApprovalScope::trial(true, first.reproducible),
+            crate::desktop_review::ApprovalScope::OneTime
+        );
+        assert!(
+            store
+                .approve(&first, "user-review", "one-time review")
+                .is_err()
+        );
+        assert!(store.list().unwrap().is_empty());
+        assert_ne!(
+            first.digest,
+            capture(&command.replace("HOME=/tmp/fixture", "HOME=/tmp/changed")).digest
+        );
+        fs::write(&executable, "fixture executable two").unwrap();
+        assert_ne!(first.digest, capture(&command).digest);
+        let (files, bound) = resolved_executables(&command, &project, &BTreeMap::new()).unwrap();
+        assert!(bound && files.contains(&executable.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn literal_environment_cannot_review_inherited_preloads_or_expansions() {
+        let (_temp, project, _) = fixture();
+        for name in [
+            "DYLD_INSERT_LIBRARIES",
+            "LD_PRELOAD",
+            "BASH_ENV",
+            "NODE_OPTIONS",
+            "PYTHONPATH",
+        ] {
+            let parent = BTreeMap::from([(name.into(), "fixture-only-value".into())]);
+            let error =
+                resolved_executables("/usr/bin/env -i HOME=/tmp /bin/true", &project, &parent)
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("inherited preload"),
+                "{name}: {error}"
+            );
+        }
+        for command in [
+            "PATH=$PATH cargo test",
+            "env -i PATH=$(pwd) cargo test",
+            "timeout 10 env PATH=/unresolved cargo test",
+            "PATH=/bin; cargo test",
+            "NODE_OPTIONS=--require=./startup.js; node check.js",
+            "/usr/bin/env -i /usr/bin/env NODE_OPTIONS=--require=./startup.js node check.js",
+        ] {
+            assert!(resolved_executables(command, &project, &BTreeMap::new()).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_preloads_keep_trial_resolution_and_bind_their_raw_values() {
+        use std::os::unix::fs::PermissionsExt;
+        let (temp, project, store) = fixture();
+        let executable = project.join("fixture-program");
+        fs::write(&executable, "fixture executable").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let program = shell_words::quote(executable.to_str().unwrap());
+        for path in ["/usr/bin:/bin", "", ".:/usr/bin", ":/usr/bin"] {
+            let parent = BTreeMap::from([(OsString::from("PATH"), OsString::from(path))]);
+            for prefix in [
+                "CI=1",
+                "FOO=$BAR",
+                "PYTHONPATH=src",
+                "PYTHONPATH=$SOURCE",
+                "NODE_OPTIONS=--max-old-space-size=4096",
+                "LD_PRELOAD=./preload.so",
+                "BASH_ENV=./startup.sh",
+                "/usr/bin/env PYTHONPATH=src",
+            ] {
+                let command = format!("{prefix} {program}");
+                let (files, bound) = resolved_executables(&command, &project, &parent).unwrap();
+                assert!(!bound, "{command} must remain eligible for a trial");
+                assert!(files.contains(&executable.canonicalize().unwrap()));
+            }
+        }
+        let capture = |prefix: &str| {
+            store
+                .fingerprint(
+                    &format!("{prefix} {program}"),
+                    &project,
+                    &temp.path().join("shell"),
+                    &[],
+                )
+                .unwrap()
+        };
+        let first = capture("PYTHONPATH=src");
+        let changed = capture("PYTHONPATH=other");
+        assert_ne!(first.digest, changed.digest);
+        assert_eq!(first.reproducible, capture("CI=1").reproducible);
+    }
+
+    #[test]
+    fn one_time_fingerprint_ignores_existing_grants_and_never_touches_the_store() {
+        let (temp, project, store) = fixture();
+        let mut version = fingerprint(&store, &project);
+        // The fixture grant models an existing approval even when this test
+        // process has extra environment inputs that cannot be reproduced.
+        version.reproducible = true;
+        store
+            .approve(&version, "user-review", "existing exact approval")
+            .unwrap();
+        assert!(store.lookup(&version).unwrap().is_some());
+        let path = temp.path().join("trusted/verified_trials.json");
+        let saved = fs::read(&path).unwrap();
+        let shell = temp.path().join("shell");
+        let reviewed = store
+            .fingerprint_for_review("echo safe", &project, &shell, &[])
+            .unwrap();
+        assert_eq!(reviewed.digest, version.digest);
+        assert_eq!(
+            crate::desktop_review::ApprovalScope::trial(false, reviewed.reproducible),
+            crate::desktop_review::ApprovalScope::OneTime
+        );
+        assert_eq!(fs::read(&path).unwrap(), saved);
+        // Even unavailable/corrupt state must not prevent a one-time review.
+        fs::write(&path, "invalid fixture store").unwrap();
+        assert_eq!(
+            store
+                .fingerprint_for_review("echo safe", &project, &shell, &[])
+                .unwrap(),
+            reviewed
+        );
+        let absent = temp.path().join("absent-store");
+        let transient = TrialStore::new(absent.clone());
+        assert_eq!(
+            transient
+                .fingerprint_for_review("echo safe", &project, &shell, &[])
+                .unwrap(),
+            reviewed
+        );
+        assert!(!absent.exists());
     }
 
     #[test]
@@ -1516,6 +1763,7 @@ mod tests {
             ),
             &project.canonicalize().unwrap(),
             "core.filesystem:rm-recursive-general",
+            &crate::trial::agent_environment(),
         )
         .unwrap()
     }

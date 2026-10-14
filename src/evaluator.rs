@@ -14149,6 +14149,26 @@ fn evaluate_command_in_single_dialect_view(
         return EvaluationResult::allowed();
     }
 
+    // Only the hook may emit this runner after evaluating the original input.
+    // It must precede overrides and all exception consumption: an agent can
+    // otherwise forge a receipt and redirect the runner's trusted config.
+    if crate::confined::agent_runner_command(command) {
+        crate::desktop_review::record_incomplete();
+        let mut result = EvaluationResult::denied_by_legacy(
+            "[dcg:internal-hook-command] Direct dcg run requests are reserved for hook-generated replacements. Submit the original finite command for evaluation; do not construct a runner request or override its configuration.",
+        );
+        if let Some(info) = result.pattern_info.as_mut() {
+            info.pack_id = Some("dcg.internal".to_owned());
+            info.pattern_name = Some("confined-runner".to_owned());
+            info.explanation = Some(
+                crate::inspection::Outcome::InternalCommand
+                    .remediation()
+                    .to_owned(),
+            );
+        }
+        return result;
+    }
+
     // Grants bind to the original bytes, before diagnostic or modeled-command
     // masking. Nested payloads must never borrow or consume an outer request's
     // exact-command grant (GH#537).

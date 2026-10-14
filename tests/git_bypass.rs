@@ -12,7 +12,19 @@ fn run_hook(command: &str) -> String {
         }
     });
 
+    // The developer's own config and allowlists must not decide these git
+    // parsing cases: a user policy with script-file inspection denies
+    // `/usr/libexec/git-core/git-clean` wherever that path does not exist.
+    let home = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("git_bypass-home");
+    std::fs::create_dir_all(&home).expect("isolated home");
     let mut child = Command::new(dcg_binary())
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_HISTORY_DISABLED", "1")
         // Hook-mode self-heal writes the invoked binary's own path into the
         // caller's real agent settings, so without this a test run registers
         // `target/release/dcg` as a global Claude Code PreToolUse hook on the

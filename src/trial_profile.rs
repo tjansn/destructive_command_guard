@@ -42,8 +42,15 @@ pub fn confined_profile(
     tag: &str,
     writable: &[std::path::PathBuf],
     protected: &[std::path::PathBuf],
+    loopback: crate::config::ConfinedLoopback,
 ) -> String {
-    render(project, home, temp, tag, writable, protected, false)
+    let mut profile = render(project, home, temp, tag, writable, protected, false);
+    if loopback == crate::config::ConfinedLoopback::All {
+        // Deliberately includes pre-existing host services. This opt-in must
+        // never be applied to observational profiles or reused as a grant.
+        profile.push_str("(allow network-outbound (remote tcp \"localhost:*\"))\n");
+    }
+    profile
 }
 
 fn render(
@@ -174,6 +181,39 @@ fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_confined_opt_in_opens_outbound_localhost() {
+        use crate::config::ConfinedLoopback;
+        let project = Path::new("/tmp/project");
+        let home = Path::new("/tmp/home");
+        let temp = Path::new("/tmp/runtime");
+        let none = confined_profile(
+            project,
+            home,
+            temp,
+            "fixture",
+            &[],
+            &[],
+            ConfinedLoopback::None,
+        );
+        let all = confined_profile(
+            project,
+            home,
+            temp,
+            "fixture",
+            &[],
+            &[],
+            ConfinedLoopback::All,
+        );
+        let opt_in = "(allow network-outbound (remote tcp \"localhost:*\"))\n";
+        assert_eq!(all, format!("{none}{opt_in}"));
+        assert!(!none.contains("remote tcp"));
+        assert!(!profile(project, home, temp, "fixture").contains("remote tcp"));
+        assert!(all.contains("(deny network*"));
+        assert!(all.contains("(deny mach-lookup"));
+        assert!(all.contains("(deny file-read-data"));
+    }
 
     #[test]
     fn sbpl_escapes_paths_and_requires_read_and_endpoint_boundaries() {
