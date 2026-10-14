@@ -87,6 +87,17 @@ description = "python rmtree rejects parent traversal back to the temp root"
 command = "python3 -c \"import shutil; shutil.rmtree('/tmp/build/..')\""
 expected = "deny"
 
+# Resolving module constants in an argv (fork issue #1) must not hide a helper.
+[[case]]
+description = "python tar argv whose constant is a helper option"
+command = "python3 -c \"import subprocess; opt = '--to-command=sh'; subprocess.run(['tar', '-xf', 'a.tar', opt])\""
+expected = "deny"
+
+[[case]]
+description = "python tar argv constant that is later rebound stays unknown"
+command = "python3 -c \"import subprocess, sys; name = 'x'; name = sys.argv[1]; subprocess.run(['tar', '-xf', 'a.tar', name])\""
+expected = "deny"
+
 [[case]]
 description = "python rmtree rejects traversal from tmp into etc"
 command = "python3 -c \"import shutil; shutil.rmtree('/tmp/../etc')\""

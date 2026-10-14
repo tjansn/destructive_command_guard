@@ -223,3 +223,15 @@ expected = "allow"
 description = "soft-delete into a resolved-home Trash path is safe"
 command = "mv \"/Users/merlin/Documents/Personal/Admin\" /Users/merlin/.Trash/"
 expected = "allow"
+
+# Fork issue #1 / upstream #562: module constants in a Python argv are the
+# values the call passes, so an archive-only tar is not an unknown option.
+[[case]]
+description = "archive-only tar whose member is a module string constant"
+command = "python3 -c \"import subprocess; name = 'checkout'; subprocess.Popen(['tar', '-cf', '-', '-C', '/tmp/dcg-synthetic', name])\""
+expected = "allow"
+
+[[case]]
+description = "archive-only tar built from a fixed pathlib.Path"
+command = "python3 -c \"from pathlib import Path; import subprocess; source = Path('/tmp/dcg-synthetic/checkout'); subprocess.Popen(['tar', '-cf', '-', '-C', str(source.parent), source.name])\""
+expected = "allow"

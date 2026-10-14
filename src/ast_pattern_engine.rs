@@ -751,6 +751,7 @@ pub fn exec_sink_reconstructed_commands(
     let haystack = masked.as_ref();
 
     let mut out = Vec::new();
+    let mut python_constants: Option<PythonConstants> = None;
     for caps in sink_regex.captures_iter(haystack) {
         let Some(m) = caps.get(0) else { continue };
         let region = exec_sink_arg_region(haystack, m.start());
@@ -767,7 +768,15 @@ pub fn exec_sink_reconstructed_commands(
         if argv.unverified {
             continue;
         }
-        let operands = argv.values;
+        let operands = if language == ScriptLanguage::Python
+            && argv.values.iter().any(|value| value == RUNTIME_VALUE)
+        {
+            python_constants
+                .get_or_insert_with(|| PythonConstants::scan(code))
+                .resolve_operands(argv)
+        } else {
+            argv.values
+        };
         let command = match operands.as_slice() {
             [] => continue,
             // One string handed to a shell (#512): see below.
@@ -3966,6 +3975,8 @@ fn detect_destructive_in_args(
 /// a spread, computed argument list, or parsing bound prevents that claim.
 struct ExecArgv<'a> {
     values: Vec<Cow<'a, str>>,
+    /// The source expression of each value, for later constant resolution.
+    expressions: Vec<&'a str>,
     unverified: bool,
 }
 
@@ -3991,6 +4002,7 @@ fn exec_argv_operands(call_text: &str, language: ScriptLanguage) -> ExecArgv<'_>
     let skip_context = language == ScriptLanguage::Go && sink == "CommandContext";
     let mut argv = ExecArgv {
         values: Vec::new(),
+        expressions: Vec::new(),
         unverified: false,
     };
 
@@ -4107,6 +4119,7 @@ fn unverified_exec_argv(region: &str, language: ScriptLanguage) -> ExecArgv<'_> 
         .unwrap_or(Cow::Borrowed(RUNTIME_VALUE));
     ExecArgv {
         values: vec![value],
+        expressions: vec![""],
         unverified: true,
     }
 }
@@ -4129,6 +4142,7 @@ fn push_exec_operand<'a>(argv: &mut ExecArgv<'a>, expression: &'a str, language:
     }
     argv.values
         .push(concatenated_operand(expression, language, 0));
+    argv.expressions.push(expression);
 }
 
 fn skip_exec_trivia(mut expression: &str, language: ScriptLanguage) -> &str {
@@ -4261,6 +4275,337 @@ fn concatenated_operand(expression: &str, language: ScriptLanguage, depth: usize
         return concatenated_operand(inner, language, depth + 1);
     }
     Cow::Borrowed(RUNTIME_VALUE)
+}
+
+/// Module-level Python constants an exec argv may name (fork issue #1,
+/// upstream #562). `tar -cf - -C dir NAME` built from `NAME = 'checkout'` or
+/// from `source = Path('/x/checkout')` was judged as if each value could be any
+/// tar option. Only a name bound exactly once, at module scope, to a string
+/// literal or `pathlib.Path('<literal>')` qualifies, and only while every other
+/// occurrence of it is a plain read. Anything else stays an unknown value.
+#[derive(Default)]
+struct PythonConstants {
+    values: HashMap<String, PythonConstant>,
+    /// `str(...)` is resolved only while the builtin is never rebound.
+    builtin_str: bool,
+}
+
+#[derive(Clone)]
+enum PythonConstant {
+    Text(String),
+    /// A POSIX `pathlib` path in normalized string form.
+    Path(String),
+}
+
+const MAX_PYTHON_CONSTANT_NODES: usize = 100_000;
+const PATHLIB_CONSTRUCTORS: [&str; 4] = ["Path", "PurePath", "PosixPath", "PurePosixPath"];
+
+impl PythonConstants {
+    fn scan(code: &str) -> Self {
+        let mut constants = Self::default();
+        // Dynamic namespace access can rebind any name without naming it.
+        if [
+            "globals",
+            "locals",
+            "vars(",
+            "exec(",
+            "eval(",
+            "setattr(",
+            "__dict__",
+            "__builtins__",
+            "builtins",
+            "sys.modules",
+            "importlib",
+        ]
+        .iter()
+        .any(|marker| code.contains(marker))
+        {
+            return constants;
+        }
+        let ast = AstGrep::new(code, SupportLang::Python);
+        let root = ast.root();
+        if root.get_inner_node().has_error() {
+            return constants;
+        }
+        // Binding sites that are allowed: one per tracked name.
+        let mut definitions: HashMap<String, std::ops::Range<usize>> = HashMap::new();
+        let mut invalid: HashSet<String> = HashSet::new();
+        let mut define =
+            |name: &str, range: std::ops::Range<usize>, invalid: &mut HashSet<String>| {
+                if definitions.insert(name.to_owned(), range).is_some() {
+                    invalid.insert(name.to_owned());
+                }
+            };
+        // `pathlib` constructors usable here, keyed by their spelling in a call,
+        // with the identifier whose binding they rely on.
+        let mut constructors: HashMap<String, String> = HashMap::new();
+        let mut candidates: Vec<(String, PythonConstant, Option<String>)> = Vec::new();
+        for statement in root.children().filter(ast_grep_core::Node::is_named) {
+            match statement.kind().as_ref() {
+                "import_from_statement"
+                    if statement
+                        .field("module_name")
+                        .is_some_and(|module| module.text() == "pathlib") =>
+                {
+                    for name in statement.children() {
+                        let is_name = statement
+                            .field("module_name")
+                            .is_none_or(|module| module.range() != name.range());
+                        if is_name
+                            && name.kind().as_ref() == "dotted_name"
+                            && PATHLIB_CONSTRUCTORS.contains(&name.text().as_ref())
+                        {
+                            let text = name.text().into_owned();
+                            define(&text, name.range(), &mut invalid);
+                            constructors.insert(text.clone(), text);
+                        }
+                    }
+                }
+                "import_statement" => {
+                    // `import pathlib[, ...]`; an aliased import is not tracked.
+                    for name in statement.children() {
+                        if name.kind().as_ref() == "dotted_name" && name.text() == "pathlib" {
+                            define("pathlib", name.range(), &mut invalid);
+                            for constructor in PATHLIB_CONSTRUCTORS {
+                                constructors
+                                    .insert(format!("pathlib.{constructor}"), "pathlib".to_owned());
+                            }
+                        }
+                    }
+                }
+                "expression_statement" => {
+                    let mut named = statement.children().filter(ast_grep_core::Node::is_named);
+                    let (Some(assignment), None) = (named.next(), named.next()) else {
+                        continue;
+                    };
+                    if assignment.kind().as_ref() != "assignment" {
+                        continue;
+                    }
+                    let (Some(left), Some(right)) =
+                        (assignment.field("left"), assignment.field("right"))
+                    else {
+                        continue;
+                    };
+                    let name = left.text();
+                    if left.kind().as_ref() != "identifier" || !name.is_ascii() {
+                        continue;
+                    }
+                    let value = if let Some(text) =
+                        exec_literal_operand(&right.text(), ScriptLanguage::Python)
+                    {
+                        Some((PythonConstant::Text(text.into_owned()), None))
+                    } else {
+                        python_path_literal(&right, &constructors)
+                    };
+                    if let Some((value, constructor)) = value {
+                        define(&name, left.range(), &mut invalid);
+                        candidates.push((name.into_owned(), value, constructor));
+                    }
+                }
+                _ => {}
+            }
+        }
+        constants.builtin_str = true;
+        for (index, node) in root.dfs().enumerate() {
+            if index >= MAX_PYTHON_CONSTANT_NODES {
+                return Self::default();
+            }
+            if node.kind().as_ref() != "identifier" {
+                continue;
+            }
+            let text = node.text();
+            let tracked = definitions.contains_key(text.as_ref());
+            if !tracked && text != "str" {
+                continue;
+            }
+            if definitions.get(text.as_ref()) == Some(&node.range())
+                || python_identifier_is_read(&node)
+                || python_identifier_is_not_a_reference(&node)
+            {
+                continue;
+            }
+            if tracked {
+                invalid.insert(text.into_owned());
+            } else {
+                constants.builtin_str = false;
+            }
+        }
+        for (name, value, constructor) in candidates {
+            if !invalid.contains(&name)
+                && constructor.is_none_or(|constructor| !invalid.contains(&constructor))
+            {
+                constants.values.insert(name, value);
+            }
+        }
+        constants
+    }
+
+    /// The string a whole argv operand evaluates to: `NAME`, `str(NAME)`, and a
+    /// path's `.name` / `.parent` chain. `None` keeps the operand unknown.
+    fn resolve(&self, expression: &str) -> Option<String> {
+        let expression = expression.trim();
+        if let Some(inner) = expression
+            .strip_prefix("str(")
+            .and_then(|inner| inner.strip_suffix(')'))
+        {
+            return self.builtin_str.then(|| self.resolve(inner)).flatten();
+        }
+        let mut parts = expression.split('.').map(str::trim);
+        let mut value = self.values.get(parts.next()?)?.clone();
+        for attribute in parts {
+            let PythonConstant::Path(path) = &value else {
+                return None;
+            };
+            value = match attribute {
+                "name" => PythonConstant::Text(posix_path_name(path)),
+                "parent" => PythonConstant::Path(posix_path_parent(path)),
+                _ => return None,
+            };
+        }
+        Some(match value {
+            PythonConstant::Text(text) | PythonConstant::Path(text) => text,
+        })
+    }
+
+    /// Replace whole unknown operands that name a resolvable constant.
+    fn resolve_operands<'a>(&self, argv: ExecArgv<'a>) -> Vec<Cow<'a, str>> {
+        argv.values
+            .into_iter()
+            .zip(argv.expressions)
+            .map(|(value, expression)| {
+                if value == RUNTIME_VALUE
+                    && let Some(resolved) = self.resolve(expression)
+                {
+                    Cow::Owned(resolved)
+                } else {
+                    value
+                }
+            })
+            .collect()
+    }
+}
+
+/// `Path('<literal>')` through an imported `pathlib` constructor. POSIX hosts
+/// only: a Windows path stringifies differently.
+fn python_path_literal<D: ast_grep_core::Doc>(
+    call: &ast_grep_core::Node<'_, D>,
+    constructors: &HashMap<String, String>,
+) -> Option<(PythonConstant, Option<String>)> {
+    if !cfg!(unix) || call.kind().as_ref() != "call" {
+        return None;
+    }
+    let constructor = constructors.get(call.field("function")?.text().as_ref())?;
+    let arguments = call.field("arguments")?;
+    let mut named = arguments.children().filter(ast_grep_core::Node::is_named);
+    let (Some(argument), None) = (named.next(), named.next()) else {
+        return None;
+    };
+    let text = argument.text();
+    let literal = exec_literal_operand(&text, ScriptLanguage::Python)?;
+    Some((
+        PythonConstant::Path(posix_path_normalize(&literal)?),
+        Some(constructor.clone()),
+    ))
+}
+
+/// A value read, as opposed to a binding: assignment and loop targets,
+/// parameters, imports, `global`, `del` and unknown contexts are not reads.
+fn python_identifier_is_read<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    let is_field = |field: &str| {
+        parent
+            .field(field)
+            .is_some_and(|value| value.range() == node.range())
+    };
+    match parent.kind().as_ref() {
+        "attribute" => is_field("object"),
+        "keyword_argument" => is_field("value"),
+        "assignment" | "augmented_assignment" => is_field("right"),
+        "call" => is_field("function"),
+        "subscript" => is_field("value") || is_field("subscript"),
+        "argument_list"
+        | "list"
+        | "tuple"
+        | "set"
+        | "expression_list"
+        | "binary_operator"
+        | "comparison_operator"
+        | "boolean_operator"
+        | "not_operator"
+        | "unary_operator"
+        | "parenthesized_expression"
+        | "return_statement"
+        | "expression_statement"
+        | "conditional_expression"
+        | "interpolation"
+        | "pair"
+        | "list_splat"
+        | "dictionary_splat"
+        | "await" => true,
+        _ => false,
+    }
+}
+
+/// `obj.NAME` and `f(NAME=...)` spell an attribute or keyword, not the name.
+fn python_identifier_is_not_a_reference<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    let field = match parent.kind().as_ref() {
+        "attribute" => "attribute",
+        "keyword_argument" => "name",
+        _ => return false,
+    };
+    parent
+        .field(field)
+        .is_some_and(|value| value.range() == node.range())
+}
+
+/// `PurePosixPath` string form. `None` for spellings whose meaning differs
+/// (exactly two leading slashes are implementation-defined) or contain NUL.
+fn posix_path_normalize(literal: &str) -> Option<String> {
+    if literal.contains('\0') || (literal.starts_with("//") && !literal.starts_with("///")) {
+        return None;
+    }
+    let parts: Vec<&str> = literal
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    Some(posix_path_join(literal.starts_with('/'), &parts))
+}
+
+fn posix_path_join(absolute: bool, parts: &[&str]) -> String {
+    if absolute {
+        format!("/{}", parts.join("/"))
+    } else if parts.is_empty() {
+        ".".to_owned()
+    } else {
+        parts.join("/")
+    }
+}
+
+fn posix_path_parts(path: &str) -> Vec<&str> {
+    path.split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect()
+}
+
+fn posix_path_name(path: &str) -> String {
+    posix_path_parts(path)
+        .last()
+        .map_or_else(String::new, |name| (*name).to_owned())
+}
+
+fn posix_path_parent(path: &str) -> String {
+    let parts = posix_path_parts(path);
+    match parts.split_last() {
+        Some((_, parent)) => posix_path_join(path.starts_with('/'), parent),
+        None => path.to_owned(),
+    }
 }
 
 /// End of one complete quoted literal, including escaped delimiters.
@@ -9042,6 +9387,97 @@ mod tests {
                 "a partial argv must not become permission evidence"
             );
         }
+    }
+
+    fn reconstructed_python(source: &str) -> Vec<String> {
+        exec_sink_reconstructed_commands(source, ScriptLanguage::Python)
+            .into_iter()
+            .map(|command| command.command)
+            .collect()
+    }
+
+    /// Fork issue #1 / upstream #562: module constants named in an argv are
+    /// what the call runs, so a fixed archive member is not an unknown option.
+    #[cfg(unix)]
+    #[test]
+    fn module_constants_resolve_in_python_argv() {
+        let tar = "tar -cf - -C /tmp/dcg-synthetic checkout";
+        for source in [
+            "import subprocess\nname = 'checkout'\nsubprocess.Popen(['tar', '-cf', '-', '-C', '/tmp/dcg-synthetic', name])",
+            "from pathlib import Path\nimport subprocess\nsource = Path('/tmp/dcg-synthetic/checkout')\nsubprocess.Popen(['tar', '-cf', '-', '-C', str(source.parent), source.name])",
+            "import pathlib, subprocess\nsource = pathlib.Path('/tmp//dcg-synthetic/./checkout/')\nsubprocess.run(['tar', '-cf', '-', '-C', source.parent, str(source.name)])",
+            "import subprocess\nsubprocess.Popen(['tar', '-cf', '-', '-C', '/tmp/dcg-synthetic', name])\nname = 'checkout'\nprint(name, len(name))",
+        ] {
+            assert_eq!(reconstructed_python(source), [tar], "{source}");
+        }
+        // A resolved value is judged as what it is, including a dangerous one.
+        assert_eq!(
+            reconstructed_python(
+                "import subprocess\nopt = '--to-command=sh'\nsubprocess.run(['tar', '-xf', 'a.tar', opt])"
+            ),
+            ["tar -xf a.tar '--to-command=sh'"]
+        );
+    }
+
+    /// Anything that can make the value differ at the call keeps it unknown.
+    #[test]
+    fn rebindable_python_names_stay_unknown_in_argv() {
+        let preamble = "import subprocess, sys\nfrom pathlib import Path\nname = 'checkout'\nsource = Path('/tmp/x/checkout')\n";
+        for tail in [
+            "name = sys.argv[1]\nsubprocess.run(['tar', '-cf', '-', name])",
+            "name += '-x'\nsubprocess.run(['tar', '-cf', '-', name])",
+            "def f(name):\n    subprocess.run(['tar', '-cf', '-', name])",
+            "for name in sys.argv:\n    subprocess.run(['tar', '-cf', '-', name])",
+            "globals()['name'] = sys.argv[1]\nsubprocess.run(['tar', '-cf', '-', name])",
+            "exec(sys.argv[1])\nsubprocess.run(['tar', '-cf', '-', name])",
+            "str = lambda value: sys.argv[1]\nsubprocess.run(['tar', '-cf', '-', str(source)])",
+            "Path = lambda value: value\nsubprocess.run(['tar', '-cf', '-', source.name])",
+            "global name\nsubprocess.run(['tar', '-cf', '-', name])",
+            "del name\nsubprocess.run(['tar', '-cf', '-', name])",
+            "subprocess.run(['tar', '-cf', '-', source.stem])",
+            "subprocess.run(['tar', '-cf', '-', name.upper()])",
+        ] {
+            let source = format!("{preamble}{tail}");
+            let commands = reconstructed_python(&source);
+            assert!(
+                commands
+                    .iter()
+                    .all(|command| command.contains(RUNTIME_VALUE)),
+                "{source}: {commands:?}"
+            );
+        }
+        // Only module scope counts: a function-local or class constant does not.
+        for source in [
+            "import subprocess\ndef f():\n    name = 'checkout'\n    subprocess.run(['tar', '-cf', '-', name])",
+            "import subprocess\nif True:\n    name = 'checkout'\nsubprocess.run(['tar', '-cf', '-', name])",
+        ] {
+            assert!(
+                reconstructed_python(source)
+                    .iter()
+                    .all(|command| command.contains(RUNTIME_VALUE)),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_paths_follow_pure_posix_path() {
+        assert_eq!(
+            posix_path_normalize("/tmp//a/./b/").as_deref(),
+            Some("/tmp/a/b")
+        );
+        assert_eq!(posix_path_normalize("").as_deref(), Some("."));
+        assert_eq!(posix_path_normalize("a/../b").as_deref(), Some("a/../b"));
+        assert_eq!(posix_path_normalize("///x").as_deref(), Some("/x"));
+        assert_eq!(posix_path_normalize("//x"), None);
+        assert_eq!(posix_path_parent("/tmp/a"), "/tmp");
+        assert_eq!(posix_path_parent("/tmp"), "/");
+        assert_eq!(posix_path_parent("/"), "/");
+        assert_eq!(posix_path_parent("a"), ".");
+        assert_eq!(posix_path_parent("."), ".");
+        assert_eq!(posix_path_name("/tmp/a"), "a");
+        assert_eq!(posix_path_name("/"), "");
+        assert_eq!(posix_path_name("."), "");
     }
 
     #[test]
