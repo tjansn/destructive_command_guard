@@ -44,7 +44,9 @@ impl<'de> Deserialize<'de> for Conditions {
                 let mut entries = Vec::new();
                 while let Some((key, value)) = map.next_entry::<String, Target>()? {
                     if entries.len() >= 256 || entries.iter().any(|(name, _)| name == &key) {
-                        return Err(serde::de::Error::custom("duplicate or oversized export map"));
+                        return Err(serde::de::Error::custom(
+                            "duplicate or oversized export map",
+                        ));
                     }
                     entries.push((key, value));
                 }
@@ -209,7 +211,7 @@ fn export_target(target: &Target, mode: Mode, depth: usize) -> Result<Option<&st
                 // guess whether it takes precedence over import/require.
                 if name == "module-sync" {
                     return Err(
-                        "runtime-dependent Node export condition requires review".to_owned(),
+                        "runtime-dependent Node export condition requires review".to_owned()
                     );
                 }
                 if (matches!(name.as_str(), "node" | "default")
@@ -406,7 +408,11 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().canonicalize().unwrap();
         write(&root, "package.json", "{}");
-        write(&root, "node_modules/loader/clean.js", "console.log('safe');");
+        write(
+            &root,
+            "node_modules/loader/clean.js",
+            "console.log('safe');",
+        );
         write(
             &root,
             "node_modules/loader/payload.js",
@@ -445,7 +451,11 @@ mod tests {
             "node_modules/@scope/loader/dist/entry.js",
             "module.exports = 1;",
         );
-        write(&root, "node_modules/fallback/index.js", "module.exports = 1;");
+        write(
+            &root,
+            "node_modules/fallback/index.js",
+            "module.exports = 1;",
+        );
         let nested = root.join("nested/tests");
         fs::create_dir_all(&nested).unwrap();
         assert_eq!(
@@ -487,7 +497,10 @@ mod tests {
             "https://invalid/loader",
             "#alias",
         ] {
-            assert!(resolve(specifier, &root, Mode::Import).is_err(), "{specifier}");
+            assert!(
+                resolve(specifier, &root, Mode::Import).is_err(),
+                "{specifier}"
+            );
         }
         write(
             &root,
@@ -504,7 +517,10 @@ mod tests {
             "not json",
         ] {
             write(&root, "node_modules/loader/package.json", manifest);
-            assert!(resolve("loader", &root, Mode::Import).is_err(), "{manifest}");
+            assert!(
+                resolve("loader", &root, Mode::Import).is_err(),
+                "{manifest}"
+            );
         }
         write(
             &root,

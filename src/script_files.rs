@@ -125,7 +125,9 @@ fn dependency_result(
     language: ScriptLanguage,
     original: EvaluationResult,
 ) -> EvaluationResult {
-    if !path.components().any(|part| part.as_os_str() == "node_modules")
+    if !path
+        .components()
+        .any(|part| part.as_os_str() == "node_modules")
         || original.pattern_info.as_ref().is_some_and(|info| {
             info.source == crate::evaluator::MatchSource::ConfigOverride
                 || info.pack_id.as_deref() == Some("dcg.internal")
@@ -917,7 +919,10 @@ fn inspect_reference(
         let path = crate::node_sources::resolve(&reference.path, cwd, mode)?;
         return inspect_reference(
             &Reference {
-                path: path.to_str().ok_or("non-UTF-8 Node preload path")?.to_owned(),
+                path: path
+                    .to_str()
+                    .ok_or("non-UTF-8 Node preload path")?
+                    .to_owned(),
                 language: Some(ScriptLanguage::JavaScript),
                 sourced: false,
                 format: FileFormat::Script,
@@ -1543,6 +1548,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::literal_string_with_formatting_args)] // JavaScript `{recursive:true}`, not a format
     fn dependency_deferral_is_scoped_and_keeps_resolved_targets_outside_outputs() {
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().canonicalize().unwrap();
@@ -1607,9 +1613,22 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().canonicalize().unwrap();
         let dependency = cwd.join("node_modules/loader/entry.js");
-        let outputs = ["build", "dist", "target", ".cache", "coverage", "node_modules"];
+        let outputs = [
+            "build",
+            "dist",
+            "target",
+            ".cache",
+            "coverage",
+            "node_modules",
+        ];
         let other = [
-            ".env", "data.sqlite", ".build", ".next", ".turbo", "out", "dist-old",
+            ".env",
+            "data.sqlite",
+            ".build",
+            ".next",
+            ".turbo",
+            "out",
+            "dist-old",
         ];
         let writable = outputs
             .iter()
@@ -1686,7 +1705,10 @@ mod tests {
                 ("dist/x", EvaluationDecision::Deny),
             ] {
                 for (source, language) in [
-                    (format!("fs.rmSync('{target}');"), ScriptLanguage::JavaScript),
+                    (
+                        format!("fs.rmSync('{target}');"),
+                        ScriptLanguage::JavaScript,
+                    ),
                     (
                         format!("execSync('rm -rf {target}');"),
                         ScriptLanguage::JavaScript,

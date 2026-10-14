@@ -260,13 +260,8 @@ mod macos {
             "node --import ./node_modules/fixture-loader/loader.mjs --test case.test.cjs",
         ] {
             for (agent, capable) in [("claude-code", false), ("pi", true)] {
-                let output = hook_request(
-                    &fixture.project,
-                    &fixture.runtime,
-                    command,
-                    agent,
-                    capable,
-                );
+                let output =
+                    hook_request(&fixture.project, &fixture.runtime, command, agent, capable);
                 let request = rewritten_request(&output);
                 assert_eq!(request.command, command);
                 assert!(
@@ -321,7 +316,11 @@ mod macos {
         }
         let package = fixture.project.join("node_modules/fixture-loader");
         fs::create_dir_all(&package).unwrap();
-        fs::write(package.join("package.json"), r#"{"exports":"./loader.mjs"}"#).unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"exports":"./loader.mjs"}"#,
+        )
+        .unwrap();
         fs::write(
             fixture.project.join("package.json"),
             r#"{"scripts":{"test":"node --import fixture-loader --test case.test.cjs"}}"#,
@@ -369,13 +368,21 @@ mod macos {
         let sub = fixture.project.join("node-harness");
         let package = sub.join("node_modules/fixture-loader");
         fs::create_dir_all(&package).unwrap();
-        fs::write(package.join("package.json"), r#"{"exports":"./loader.mjs"}"#).unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"exports":"./loader.mjs"}"#,
+        )
+        .unwrap();
         fs::write(
             sub.join("package.json"),
             r#"{"scripts":{"test":"node --import fixture-loader --test case.test.cjs"}}"#,
         )
         .unwrap();
-        fs::write(sub.join("case.test.cjs"), "console.log('must not execute');").unwrap();
+        fs::write(
+            sub.join("case.test.cjs"),
+            "console.log('must not execute');",
+        )
+        .unwrap();
         for cwd in [&fixture.project, &sub] {
             fs::create_dir(cwd.join("dist")).unwrap();
             fs::write(cwd.join("dist/x"), "preserve fixture contents").unwrap();
@@ -420,11 +427,16 @@ mod macos {
     }
 
     #[test]
+    #[allow(clippy::literal_string_with_formatting_args)] // JavaScript `{recursive:true}`, not a format
     fn dependency_literal_targets_outside_outputs_and_direct_commands_stay_denied() {
         let fixture = Fixture::new("console.log('must not execute');");
         let package = fixture.project.join("node_modules/fixture-loader");
         fs::create_dir_all(&package).unwrap();
-        fs::write(package.join("package.json"), r#"{"exports":"./loader.mjs"}"#).unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"exports":"./loader.mjs"}"#,
+        )
+        .unwrap();
         fs::write(
             fixture.project.join("package.json"),
             r#"{"scripts":{"test":"node --import fixture-loader --test case.test.cjs"}}"#,
@@ -848,12 +860,8 @@ mod macos {
         let request = rewritten_request(&receipt);
         assert_eq!(request.command, "npm test");
         assert_eq!(request.timeout_secs, 595);
-        let result = confined::run(
-            &request,
-            &temp_root,
-            ConfinedLoopback::All,
-        )
-        .expect("run the prepared temporary pi-os copy under continuing confinement");
+        let result = confined::run(&request, &temp_root, ConfinedLoopback::All)
+            .expect("run the prepared temporary pi-os copy under continuing confinement");
         let stdout = String::from_utf8_lossy(&result.stdout);
         let stderr = String::from_utf8_lossy(&result.stderr);
         let report = format!(

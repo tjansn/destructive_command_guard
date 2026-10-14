@@ -140,8 +140,10 @@ pub fn eligible(command: &str, cwd: &Path) -> bool {
 }
 
 /// Re-evaluate dependency findings only for a hook that will emit a confined
-/// replacement. This scope never applies to observational trials or ordinary
-/// approvals. Failure to discover the real writable set preserves the denial.
+/// replacement.
+///
+/// This scope never applies to observational trials or ordinary approvals.
+/// Failure to discover the real writable set preserves the denial.
 pub fn inspect_for_rewrite<T>(
     command: &str,
     cwd: &Path,

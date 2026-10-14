@@ -1083,7 +1083,10 @@ fn bare_node_preloads_inspect_the_export_for_each_cli_spelling() {
         "node_modules/loader/package.json",
         r#"{"exports":{"custom":"./danger.cjs","default":"./entry.cjs"}}"#,
     );
-    fixture.write("node_modules/loader/entry.cjs", "console.log('safe default');");
+    fixture.write(
+        "node_modules/loader/entry.cjs",
+        "console.log('safe default');",
+    );
     fixture.write(
         "node_modules/loader/danger.cjs",
         "require('child_process').execSync('git reset --hard');",
