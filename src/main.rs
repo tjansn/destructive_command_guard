@@ -1180,6 +1180,12 @@ fn attempt_rebase_recovery(
 ) -> RecoveryAttempt {
     use destructive_command_guard::rebase_recovery;
 
+    // A recovery exemption cannot authorize other rules whose evaluation
+    // failed. Keep the already-proven denial instead of weakening it.
+    if result.regex_evaluation_incomplete {
+        return RecoveryAttempt::NotApplicable;
+    }
+
     let Some(info) = result.pattern_info.as_ref() else {
         return RecoveryAttempt::NotApplicable;
     };

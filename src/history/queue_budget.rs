@@ -184,7 +184,11 @@ mod tests {
                 });
             }
             drop(sent);
-            let accepted = received.iter().take(16).filter(|accepted| *accepted).count();
+            let accepted = received
+                .iter()
+                .take(16)
+                .filter(|accepted| *accepted)
+                .count();
             let usage = budget.usage();
             // Release before asserting so a failing assertion cannot strand
             // scoped workers behind the barrier during panic unwinding.
@@ -332,12 +336,7 @@ mod tests {
         let (writer, receiver) = unstarted_writer(2, 8192, 1);
         let budget = Arc::clone(writer.entry_budget.as_ref().unwrap());
         let mut batch = PendingHistoryBatch::new(2);
-        stage_commands(
-            &writer,
-            &receiver,
-            &mut batch,
-            &["busyfirst", "busysecond"],
-        );
+        stage_commands(&writer, &receiver, &mut batch, &["busyfirst", "busysecond"]);
         let locker = rusqlite::Connection::open(&path).unwrap();
         locker.execute_batch("BEGIN IMMEDIATE;").unwrap();
         let mut disabled = false;
@@ -462,7 +461,10 @@ mod tests {
         };
         assert_eq!(writer.try_log(entry), HistoryEnqueueOutcome::EntryTooLarge);
         assert_eq!(writer.entry_budget.as_ref().unwrap().usage(), (0, 0));
-        assert!(matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
     }
 
     #[test]
@@ -512,7 +514,10 @@ mod tests {
         let second = receiver.try_recv().unwrap();
         assert!(matches!(first, HistoryMessage::Flush(_)));
         assert!(matches!(second, HistoryMessage::Flush(_)));
-        assert!(matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         // The queued request, not the expired waiter, owns its reservation.
         drop((first, second));
         assert_eq!(writer.flush_budget.as_ref().unwrap().usage(), (0, 0));

@@ -1393,7 +1393,11 @@ mod tests {
                 flush_batch(&db, &mut batch, WorkerConfig::default().max_size_bytes),
                 FlushOutcome::Fatal
             );
-            assert_eq!(batch.len(), commands.len(), "uncommitted entries must remain queued");
+            assert_eq!(
+                batch.len(),
+                commands.len(),
+                "uncommitted entries must remain queued"
+            );
             assert_eq!(db.count_commands().unwrap(), 1);
 
             // Exercise the production recovery path, not a simulated reopen.
@@ -1407,7 +1411,10 @@ mod tests {
                 &mut disabled,
                 WorkerConfig::default().max_size_bytes,
             );
-            assert!(!disabled, "recovery must not contend with its own transaction");
+            assert!(
+                !disabled,
+                "recovery must not contend with its own transaction"
+            );
             assert!(db.connection().is_autocommit());
             assert!(batch.is_empty());
             assert_eq!(persisted_test_commands(&path), commands);
@@ -1425,7 +1432,9 @@ mod tests {
         // A rollback-journal reader permits BEGIN IMMEDIATE and the INSERTs,
         // but prevents COMMIT. This tests a different boundary from a competing
         // writer that rejects BEGIN before any entry has been attempted.
-        db.connection().execute("PRAGMA journal_mode=DELETE;").unwrap();
+        db.connection()
+            .execute("PRAGMA journal_mode=DELETE;")
+            .unwrap();
         let reader = rusqlite::Connection::open(&path).unwrap();
         reader.execute_batch("BEGIN;").unwrap();
         let before: i64 = reader
@@ -1436,8 +1445,14 @@ mod tests {
         let mut disabled = false;
         let max_size = WorkerConfig::default().max_size_bytes;
         flush_batch_with_recovery(&mut db, &mut batch, Some(&path), &mut disabled, max_size);
-        assert!(!disabled, "ordinary commit contention must not disable the writer");
-        assert!(db.connection().is_autocommit(), "failed COMMIT must be rolled back");
+        assert!(
+            !disabled,
+            "ordinary commit contention must not disable the writer"
+        );
+        assert!(
+            db.connection().is_autocommit(),
+            "failed COMMIT must be rolled back"
+        );
         assert!(batch.is_empty(), "contended telemetry remains best-effort");
         reader.execute_batch("ROLLBACK;").unwrap();
         drop(reader);
@@ -1630,7 +1645,11 @@ mod tests {
             }),
             FlushOutcome::Fatal
         );
-        assert_eq!(batch.len(), 2, "failed cleanup must not retire the pending entry");
+        assert_eq!(
+            batch.len(),
+            2,
+            "failed cleanup must not retire the pending entry"
+        );
     }
 
     #[test]
@@ -1924,7 +1943,10 @@ mod tests {
         let HistoryMessage::Flush(request) = receiver.try_recv().unwrap() else {
             panic!("flush request must follow the entry");
         };
-        assert!(request.ack.send(()).is_err(), "expired waiter must be disconnected");
+        assert!(
+            request.ack.send(()).is_err(),
+            "expired waiter must be disconnected"
+        );
         assert!(matches!(
             receiver.try_recv(),
             Err(mpsc::TryRecvError::Empty)

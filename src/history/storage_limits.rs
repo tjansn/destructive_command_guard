@@ -122,7 +122,11 @@ fn history_page_size(db: &HistoryDb) -> Result<u64, HistoryError> {
     Ok(size)
 }
 
-fn install_page_limit(db: &HistoryDb, max_bytes: u64, page_size: u64) -> Result<bool, HistoryError> {
+fn install_page_limit(
+    db: &HistoryDb,
+    max_bytes: u64,
+    page_size: u64,
+) -> Result<bool, HistoryError> {
     let max_pages = (max_bytes / page_size).max(1);
     // SQLite cannot lower this below the current logical page count. It may
     // also raise a previously installed limit when another connection grows
@@ -188,7 +192,11 @@ mod tests {
         assert!(wal_before > 0);
 
         assert!(db.enforce_live_size_limit(CAP).unwrap());
-        assert_eq!(wal_length(&path), wal_before, "cap setup must not drain WAL");
+        assert_eq!(
+            wal_length(&path),
+            wal_before,
+            "cap setup must not drain WAL"
+        );
         assert_eq!(db.file_size().unwrap(), main_before);
         assert_eq!(db.count_commands().unwrap(), 1);
         let page_size = pragma_integer(&db, "PRAGMA main.page_size").unwrap();
@@ -413,7 +421,10 @@ mod tests {
             command: "rejected".to_string(),
             ..Default::default()
         };
-        assert!(db.log_commands_batch_with_live_limit(&[good.clone(), rejected], CAP).is_err());
+        assert!(
+            db.log_commands_batch_with_live_limit(&[good.clone(), rejected], CAP)
+                .is_err()
+        );
         assert!(db.connection().is_autocommit());
         assert_eq!(db.count_commands().unwrap(), 0);
         db.log_command_with_live_limit(&good, CAP).unwrap();

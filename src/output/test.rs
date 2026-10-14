@@ -1044,6 +1044,7 @@ mod tests {
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
+            regex_evaluation_incomplete: false,
             quick_rejected: false,
             branch_context: None,
             session_occurrence: None,

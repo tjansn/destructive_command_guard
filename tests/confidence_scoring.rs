@@ -31,6 +31,7 @@ fn mock_deny_result(
         allowlist_override: None,
         effective_mode: Some(DecisionMode::Deny),
         skipped_due_to_budget: false,
+        regex_evaluation_incomplete: false,
         quick_rejected: false,
         branch_context: None,
         session_occurrence: None,
@@ -69,6 +70,34 @@ fn test_confidence_disabled_returns_unchanged_mode() {
         !confidence_result.downgraded,
         "Should not be marked as downgraded"
     );
+}
+
+#[test]
+fn incomplete_regex_analysis_cannot_be_downgraded_by_confidence() {
+    let config = ConfidenceConfig {
+        enabled: true,
+        warn_threshold: 1.0,
+        protect_critical: false,
+    };
+    let command = "grep 'rm -rf' notes.txt";
+    let mut result = mock_deny_result(
+        Severity::High,
+        MatchSource::Pack,
+        Some(MatchSpan { start: 6, end: 12 }),
+    );
+    let control = apply_confidence_scoring(command, None, &result, DecisionMode::Deny, &config);
+    assert_eq!(
+        control.mode,
+        DecisionMode::Warn,
+        "control must exercise an actual downgrade"
+    );
+    result.regex_evaluation_incomplete = true;
+    let protected = apply_confidence_scoring(command, None, &result, DecisionMode::Deny, &config);
+    assert_eq!(protected.mode, DecisionMode::Deny);
+    assert!(!protected.downgraded && protected.score.is_none());
+    let non_blocking =
+        apply_confidence_scoring(command, None, &result, DecisionMode::Warn, &config);
+    assert_eq!(non_blocking.mode, DecisionMode::Ask);
 }
 
 #[test]

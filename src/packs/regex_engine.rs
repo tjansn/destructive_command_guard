@@ -12,7 +12,61 @@
 //! improving startup latency for the common allow-path case.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::OnceLock;
+
+thread_local! {
+    // Only active evaluator calls retain failures. A completed request cannot
+    // poison the next request, and unrelated worker/diagnostic threads cannot
+    // change a command's result.
+    static EVALUATION_FAILURES: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Tracks incomplete regex work across nested evaluation and dialect views.
+///
+/// Successful matches retain their allocation-free path. Only an actual
+/// engine failure touches this thread-local stack. The guard is thread-bound
+/// because its lifetime and state belong to the evaluator that installed it.
+pub(crate) struct RegexEvaluationScope {
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+impl RegexEvaluationScope {
+    pub(crate) fn enter() -> Self {
+        EVALUATION_FAILURES.with(|stack| stack.borrow_mut().push(false));
+        Self {
+            _thread_bound: PhantomData,
+        }
+    }
+
+    pub(crate) fn has_failed(&self) -> bool {
+        EVALUATION_FAILURES.with(|stack| stack.borrow().last().copied().unwrap_or(false))
+    }
+}
+
+impl Drop for RegexEvaluationScope {
+    fn drop(&mut self) {
+        EVALUATION_FAILURES.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            let failed = stack.pop().unwrap_or(false);
+            if let Some(parent) = stack.last_mut() {
+                *parent |= failed;
+            }
+        });
+    }
+}
+
+fn record_evaluation_failure(stage: &'static str, error: &impl std::fmt::Display) {
+    EVALUATION_FAILURES.with(|stack| {
+        if let Some(failed) = stack.borrow_mut().last_mut() {
+            *failed = true;
+        }
+    });
+    // Engine diagnostics contain no submitted command text.
+    tracing::debug!(target: "dcg_perf", stage, error = %error, "regex analysis incomplete");
+}
 
 /// Maximum backtracking steps allowed per fancy_regex match.
 ///
@@ -21,7 +75,8 @@ use std::sync::OnceLock;
 /// external packs). At ~10ns per step on modern hardware, 100K steps ≈ 1ms
 /// which fits within the PATTERN_MATCH panic budget (1ms). When exceeded,
 /// `fancy_regex` returns `BacktrackLimitExceeded` and our match methods
-/// return `false`/`None` (fail-open).
+/// return `false`/`None`. Inside command evaluation an error also marks the
+/// analysis incomplete, so those fallback values can never prove an allow.
 pub const BACKTRACK_LIMIT: usize = 100_000;
 
 /// Linear-time expression that cannot match at any byte position.
@@ -163,7 +218,10 @@ impl CompiledRegex {
         let _phase = crate::perf::phase(crate::perf::ProfilePhase::RegexMatch);
         match self {
             Self::Linear(re) => re.is_match(text),
-            Self::Backtracking(re) => re.is_match(text).unwrap_or(false),
+            Self::Backtracking(re) => re.is_match(text).unwrap_or_else(|error| {
+                record_evaluation_failure("match", &error);
+                false
+            }),
         }
     }
 
@@ -175,7 +233,13 @@ impl CompiledRegex {
         let _phase = crate::perf::phase(crate::perf::ProfilePhase::RegexMatch);
         match self {
             Self::Linear(re) => re.find(text).map(|m| (m.start(), m.end())),
-            Self::Backtracking(re) => re.find(text).ok().flatten().map(|m| (m.start(), m.end())),
+            Self::Backtracking(re) => re
+                .find(text)
+                .unwrap_or_else(|error| {
+                    record_evaluation_failure("find", &error);
+                    None
+                })
+                .map(|m| (m.start(), m.end())),
         }
     }
 
@@ -194,8 +258,10 @@ impl CompiledRegex {
             Self::Linear(re) => re.find_at(text, start).map(|m| (m.start(), m.end())),
             Self::Backtracking(re) => re
                 .find_from_pos(text, start)
-                .ok()
-                .flatten()
+                .unwrap_or_else(|error| {
+                    record_evaluation_failure("find_from", &error);
+                    None
+                })
                 .map(|m| (m.start(), m.end())),
         }
     }
@@ -225,9 +291,10 @@ impl CompiledRegex {
         match self {
             Self::Linear(re) => re.replacen(text, limit, rep),
             // Use try_replacen to handle errors gracefully (returns Result)
-            Self::Backtracking(re) => re
-                .try_replacen(text, limit, rep)
-                .unwrap_or(Cow::Borrowed(text)),
+            Self::Backtracking(re) => re.try_replacen(text, limit, rep).unwrap_or_else(|error| {
+                record_evaluation_failure("replace", &error);
+                Cow::Borrowed(text)
+            }),
         }
     }
 }
@@ -539,12 +606,19 @@ impl LazyCompiledRegex {
 
     /// Get or compile the regex.
     ///
-    /// Returns `None` if compilation fails (fail-open).
+    /// Returns `None` if compilation fails and marks active evaluation incomplete.
     fn get_compiled(&self) -> Option<&CompiledRegex> {
-        self.compiled
+        match self
+            .compiled
             .get_or_init(|| CompiledRegex::new(self.pattern.as_str()))
             .as_ref()
-            .ok()
+        {
+            Ok(compiled) => Some(compiled),
+            Err(error) => {
+                record_evaluation_failure("compile", error);
+                None
+            }
+        }
     }
 
     /// Check if the pattern matches the text and is not fully exempted.
@@ -612,6 +686,90 @@ impl std::fmt::Display for LazyCompiledRegex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regex_errors_are_distinct_from_proven_misses_during_evaluation() {
+        let pattern = r"^(a|aa)+\1$";
+        let input = format!("{}!", "a".repeat(80));
+        let compiled = CompiledRegex::new_with_backtrack_limit(pattern, 100).unwrap();
+        let CompiledRegex::Backtracking(raw) = &compiled else {
+            panic!("regression must exercise the bounded VM");
+        };
+        assert!(
+            raw.is_match(&input).is_err(),
+            "fixture must exhaust real engine work"
+        );
+        for operation in 0..4 {
+            let scope = RegexEvaluationScope::enter();
+            match operation {
+                0 => {
+                    assert!(!compiled.is_match(&input));
+                }
+                1 => {
+                    assert!(compiled.find(&input).is_none());
+                }
+                2 => {
+                    assert!(compiled.find_from(&input, 0).is_none());
+                }
+                _ => {
+                    assert_eq!(compiled.replacen(&input, 1, "x"), input);
+                }
+            }
+            assert!(
+                scope.has_failed(),
+                "operation {operation} must retain the failure"
+            );
+        }
+        let scope = RegexEvaluationScope::enter();
+        assert!(!compiled.is_match("b"));
+        assert!(
+            !scope.has_failed(),
+            "a real miss must not become indeterminate"
+        );
+    }
+
+    #[test]
+    fn regex_failure_scope_propagates_only_within_its_request_and_thread() {
+        let re = CompiledRegex::new_with_backtrack_limit(r"^(a|aa)+\1$", 100).unwrap();
+        let input = format!("{}!", "a".repeat(80));
+        {
+            let parent = RegexEvaluationScope::enter();
+            {
+                let child = RegexEvaluationScope::enter();
+                assert!(re.find_from(&input, 0).is_none());
+                assert!(child.has_failed());
+            }
+            assert!(
+                parent.has_failed(),
+                "nested incomplete analysis reaches its parent"
+            );
+        }
+        let next = RegexEvaluationScope::enter();
+        assert!(
+            !next.has_failed(),
+            "completed request must not poison the next one"
+        );
+        std::thread::spawn(move || {
+            let worker = RegexEvaluationScope::enter();
+            assert!(!re.is_match(&input));
+            assert!(worker.has_failed());
+        })
+        .join()
+        .unwrap();
+        assert!(
+            !next.has_failed(),
+            "independent threads must not share failure state"
+        );
+    }
+
+    #[test]
+    fn lazy_compile_errors_also_leave_evaluation_incomplete() {
+        let invalid = LazyCompiledRegex::new("[");
+        let scope = RegexEvaluationScope::enter();
+        assert!(invalid.find("ordinary").is_none());
+        assert!(scope.has_failed());
+        assert!(!invalid.is_compiled());
+    }
 
     fn assert_same_regex_results(
         candidate: &LazyCompiledRegex,

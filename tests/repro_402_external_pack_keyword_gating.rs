@@ -74,6 +74,145 @@ struct Fixture {
     root: PathBuf,
 }
 
+#[test]
+fn regex_work_limit_cannot_silently_allow_a_hook_command() {
+    let fixture = Fixture::new();
+    let pack_path = fixture.root.join("packs/limited.yaml");
+    fs::write(
+        &pack_path,
+        r"schema_version: 1
+id: repro.limited
+name: Bounded regex regression
+version: 1.0.0
+destructive_patterns:
+  - name: backtracking-rule
+    pattern: '^(a|aa)+\1$'
+    severity: critical
+    description: Deliberately exercises the bounded backtracking engine
+",
+    )
+    .expect("write bounded regex pack");
+    let config = fixture.config(
+        "limited.toml",
+        &format!(
+            "[packs]\nenabled = [\"repro.limited\"]\ncustom_paths = [{}]\n",
+            serde_json::to_string(&pack_path).expect("pack path")
+        ),
+    );
+    let run = |command: &str, strict: bool| {
+        let payload = serde_json::json!({"tool_name": "Bash",
+            "tool_input": {"command": command}})
+        .to_string();
+        let mut builder = Command::new(dcg_binary());
+        // Every probe is hermetic: an inherited bypass or policy override
+        // must not turn an incomplete match into a successful control.
+        builder
+            .env_clear()
+            .args(["--agent", "claude-code"])
+            .env("HOME", &fixture.root)
+            .env("USERPROFILE", &fixture.root)
+            .env("XDG_CONFIG_HOME", fixture.root.join("config"))
+            .env("DCG_CONFIG", &config)
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .env("DCG_HISTORY_DISABLED", "1")
+            .env("DCG_SELF_HEAL_HOOK", "0")
+            .env(
+                "DCG_PENDING_EXCEPTIONS_PATH",
+                fixture.root.join("pending.jsonl"),
+            )
+            .current_dir(&fixture.root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if strict {
+            builder.env("DCG_UNVERIFIED_DECISION", "deny");
+        }
+        let mut child = builder.spawn().expect("spawn bounded regex probe");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(payload.as_bytes())
+            .expect("payload");
+        child.wait_with_output().expect("bounded regex response")
+    };
+    let expensive = format!("{}!", "a".repeat(80));
+    for (strict, expected) in [(false, "ask"), (true, "deny")] {
+        let result = run(&expensive, strict);
+        assert!(result.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&result.stdout)
+            .expect("regex work exhaustion must produce an explicit verdict");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"],
+            expected,
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let ordinary = run("b", false);
+    for nested in [
+        format!("sh -c '{expensive}'"),
+        format!("echo $({expensive})"),
+    ] {
+        let result = run(&nested, false);
+        let json: serde_json::Value = serde_json::from_slice(&result.stdout)
+            .expect("nested incomplete evaluation must not silently allow");
+        assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "ask");
+    }
+    assert!(ordinary.status.success() && ordinary.stdout.is_empty());
+    for data in [
+        format!("echo '{expensive}'"),
+        format!("cat <<'EOF'\n{expensive}\nEOF"),
+    ] {
+        let result = run(&data, false);
+        assert!(
+            result.status.success() && result.stdout.is_empty(),
+            "literal data must remain inert: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let matching = run("aaaa", false);
+    let json: serde_json::Value = serde_json::from_slice(&matching.stdout).expect("real match");
+    assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert_eq!(
+        json["hookSpecificOutput"]["ruleId"],
+        "repro.limited:backtracking-rule"
+    );
+    let nested_match = run("sh -c 'aaaa'", false);
+    let json: serde_json::Value = serde_json::from_slice(&nested_match.stdout)
+        .expect("keyword-less rules must also inspect executed shell bodies");
+    assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert_eq!(
+        json["hookSpecificOutput"]["ruleId"],
+        "repro.limited:backtracking-rule"
+    );
+
+    // A later proven rule still wins over an earlier incomplete rule.
+    let mut pack = fs::read_to_string(&pack_path).expect("read pack");
+    pack.push_str("  - name: literal-deny\n    pattern: 'a!'\n    severity: critical\n    description: Positive literal evidence\n");
+    fs::write(&pack_path, &pack).expect("add proven denial");
+    let result = run(&expensive, false);
+    let json: serde_json::Value = serde_json::from_slice(&result.stdout).expect("proven deny");
+    assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert_eq!(
+        json["hookSpecificOutput"]["ruleId"],
+        "repro.limited:literal-deny"
+    );
+
+    // A proven warning cannot hide a different rule's incomplete analysis.
+    let pack = pack.replace(
+        "name: literal-deny\n    pattern: 'a!'\n    severity: critical",
+        "name: literal-deny\n    pattern: 'a!'\n    severity: medium",
+    );
+    fs::write(&pack_path, pack).expect("make literal finding non-blocking");
+    for (strict, expected) in [(false, "ask"), (true, "deny")] {
+        let result = run(&expensive, strict);
+        let json: serde_json::Value = serde_json::from_slice(&result.stdout)
+            .expect("incomplete warning needs explicit review");
+        assert_eq!(json["hookSpecificOutput"]["permissionDecision"], expected);
+    }
+}
+
 impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("temp dir");

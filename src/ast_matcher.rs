@@ -2665,8 +2665,7 @@ mod tests {
     mod interpreter_literal_budget_regressions_560 {
         use super::*;
 
-        const LANGUAGES: [ScriptLanguage; 2] =
-            [ScriptLanguage::Python, ScriptLanguage::JavaScript];
+        const LANGUAGES: [ScriptLanguage; 2] = [ScriptLanguage::Python, ScriptLanguage::JavaScript];
 
         fn append_assignment(source: &mut String, language: ScriptLanguage, literal: &str) {
             let index = source.len();
@@ -2737,7 +2736,10 @@ mod tests {
         fn encoded_markers_cannot_borrow_the_plain_string_exemption() {
             for (language, literal) in [
                 (ScriptLanguage::Python, r"'\x24\x28git reset --hard)'"),
-                (ScriptLanguage::JavaScript, r"'\u0024\u0028git reset --hard)'"),
+                (
+                    ScriptLanguage::JavaScript,
+                    r"'\u0024\u0028git reset --hard)'",
+                ),
             ] {
                 let mut source = assignments(
                     language,
@@ -2749,7 +2751,10 @@ mod tests {
                     interpreter_literal_shell_commands_inner(&source, language, false).unwrap();
                 assert_eq!(commands.len(), 1);
                 assert_eq!(commands[0].command, "$(git reset --hard)");
-                assert_eq!(source.get(commands[0].start..commands[0].end), Some(literal));
+                assert_eq!(
+                    source.get(commands[0].start..commands[0].end),
+                    Some(literal)
+                );
             }
         }
 

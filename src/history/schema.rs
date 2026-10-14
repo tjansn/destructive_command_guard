@@ -943,8 +943,7 @@ impl HistoryDb {
         let installed = self
             .conn
             .query_row(&format!("PRAGMA max_page_count={max_pages};"))?;
-        let installed_pages =
-            u64::try_from(sv_to_i64(&installed.values()[0])).unwrap_or(u64::MAX);
+        let installed_pages = u64::try_from(sv_to_i64(&installed.values()[0])).unwrap_or(u64::MAX);
 
         let journal_limit = (max_bytes / 10).clamp(page_size, 16 * 1024 * 1024);
         self.conn
