@@ -129,6 +129,9 @@ fn permission_invocation(command: &str) -> Option<PermissionInvocation> {
         .collect::<Option<Vec<_>>>()?;
     let mut words = words.into_iter();
     let executable = words.next()?.text.rsplit('/').next()?.to_string();
+    if executable == "setfacl" {
+        return setfacl_invocation(words);
+    }
     if !matches!(executable.as_str(), "chmod" | "chown" | "chgrp") {
         return None;
     }
@@ -216,6 +219,169 @@ fn permission_invocation(command: &str) -> Option<PermissionInvocation> {
         mode_or_owner,
         targets,
     })
+}
+
+/// Resolve exact long options before considering unique abbreviations. In
+/// particular, --modify and --remove are not ambiguous with their -file forms.
+fn setfacl_long_option(name: &str) -> Option<char> {
+    const OPTIONS: &[(&str, char)] = &[
+        ("set", 's'),
+        ("set-file", 'S'),
+        ("mask", 'r'),
+        ("recursive", 'R'),
+        ("logical", 'L'),
+        ("physical", 'P'),
+        ("restore", 'B'),
+        ("test", 't'),
+        ("modify", 'm'),
+        ("modify-file", 'M'),
+        ("remove", 'x'),
+        ("remove-file", 'X'),
+        ("default", 'd'),
+        ("no-mask", 'n'),
+        ("remove-all", 'b'),
+        ("remove-default", 'k'),
+        ("version", 'v'),
+        ("help", 'h'),
+    ];
+    if let Some((_, option)) = OPTIONS.iter().find(|(candidate, _)| *candidate == name) {
+        return Some(*option);
+    }
+    if name.is_empty() {
+        return None;
+    }
+    let mut candidates = OPTIONS
+        .iter()
+        .filter(|(candidate, _)| candidate.starts_with(name));
+    let (_, option) = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    Some(*option)
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum SetfaclSequence {
+    #[default]
+    Empty,
+    Operations,
+    Files,
+}
+
+#[derive(Default)]
+struct SetfaclState {
+    recursive: bool,
+    test: bool,
+    sequence: SetfaclSequence,
+}
+
+impl SetfaclState {
+    /// The native utility processes operands as it reads them. ANY option
+    /// following a file starts a new ACL operation sequence, but recursion and
+    /// test mode persist. `--` is not an option event and does not clear it.
+    fn option(&mut self, option: char) -> Option<bool> {
+        if self.sequence == SetfaclSequence::Files {
+            self.sequence = SetfaclSequence::Empty;
+        }
+        match option {
+            'R' => self.recursive = true,
+            't' => self.test = true,
+            'b' | 'k' | 'm' | 'M' | 'x' | 'X' | 's' | 'S' => {
+                self.sequence = SetfaclSequence::Operations;
+            }
+            'L' | 'P' | 'n' | 'r' | 'd' => {}
+            'h' | 'v' => return Some(true),
+            // Restore names targets inside an external stream and has separate
+            // ownership/mode effects. Even --test cannot prove it harmless here.
+            _ => return None,
+        }
+        Some(false)
+    }
+}
+
+/// Project an ordered ACL invocation onto the recursive effects this pack
+/// already claims. `targets` contains only a target reached with an ACL
+/// operation, recursion enabled and test mode disabled; it is NOT a bag of
+/// every path-like argument. There is no new rule or default-on policy here.
+///
+/// Linux acl `tools/setfacl.c` uses `getopt`'s `RETURN_IN_ORDER` mode and calls
+/// `next_file` immediately. A trailing --test/--help/invalid option cannot undo
+/// an earlier target. Return the first proven protected mutation before any
+/// subsequent option can discard it. Unsupported argv retains regex fallback.
+fn setfacl_invocation(
+    mut words: impl Iterator<Item = PermissionWord>,
+) -> Option<PermissionInvocation> {
+    let mut invocation = PermissionInvocation {
+        executable: "setfacl".to_string(),
+        recursive: true,
+        mode_or_owner: None,
+        targets: Vec::new(),
+    };
+    let mut state = SetfaclState::default();
+    let mut options = true;
+    while let Some(word) = words.next() {
+        if options && word.text == "--" {
+            options = false;
+            continue;
+        }
+        if !options || !word.text.starts_with('-') || word.text == "-" {
+            // An operand without an ACL operation ends the native invocation;
+            // later options do not retroactively make that operand actionable.
+            if state.sequence == SetfaclSequence::Empty {
+                return Some(invocation);
+            }
+            // A bare dash reads TARGETS from stdin, unlike -M/-X's ACL input.
+            // The literal word does not establish which trees will be changed.
+            if word.text == "-" {
+                return None;
+            }
+            state.sequence = SetfaclSequence::Files;
+            if state.recursive && !state.test && protected_permission_target(&word) {
+                invocation.targets.push(word);
+                return Some(invocation);
+            }
+            continue;
+        }
+        if let Some(long) = word.text.strip_prefix("--") {
+            let (name, value) = long
+                .split_once('=')
+                .map_or((long, None), |(name, value)| (name, Some(value)));
+            let option = setfacl_long_option(name)?;
+            if matches!(option, 's' | 'S' | 'm' | 'M' | 'x' | 'X' | 'B') {
+                if value.is_none() {
+                    words.next()?;
+                }
+            } else if value.is_some() {
+                return None;
+            }
+            if state.option(option)? {
+                return Some(invocation);
+            }
+        } else {
+            for (index, option) in word.text[1..].char_indices() {
+                // s/S/r/t/B are long-option return codes, NOT short options.
+                if !matches!(
+                    option,
+                    'b' | 'k' | 'n' | 'd' | 'v' | 'h' | 'm' | 'M' | 'x' | 'X' | 'R' | 'L' | 'P'
+                ) {
+                    return None;
+                }
+                let takes_value = matches!(option, 'm' | 'M' | 'x' | 'X');
+                if takes_value && index + 2 == word.text.len() {
+                    words.next()?;
+                }
+                if state.option(option)? {
+                    return Some(invocation);
+                }
+                if takes_value {
+                    // All remaining bytes belong to this option's value, not
+                    // more flags. A filename such as -R must never enable -R.
+                    break;
+                }
+            }
+        }
+    }
+    Some(invocation)
 }
 
 /// Return the existing chmod predicates for a supported literal mode. Complex
@@ -379,6 +545,7 @@ pub(crate) fn posix_permission_decision(
         rules.push(match invocation.executable.as_str() {
             "chmod" => "chmod-recursive-root",
             "chown" => "chown-recursive-root",
+            "setfacl" => "setfacl-all",
             _ => "chgrp-recursive-root",
         });
     }
@@ -730,6 +897,226 @@ mod tests {
     use crate::packs::test_helpers::*;
 
     #[test]
+    fn setfacl_recursive_effects_use_target_roles_and_aliases() {
+        let pack = create_pack();
+        for target in [
+            "/etc",
+            "/./etc",
+            "/tmp/../etc",
+            "/home//user",
+            "/home/user/project/..",
+            "/Users/user/.",
+            "~/.",
+            "$HOME/project/..",
+            "\"${HOME}/project/..\"",
+        ] {
+            for options in [
+                "-Rb",
+                "-bR",
+                "-bLR",
+                "--rec --remove-all",
+                "--recursive --modify=u:app:rwx",
+                "--recursive --remove=u:app",
+                "-R --set=u::rwx,g::r-x,o::---",
+                "-R --set-file=/tmp/acl",
+                "-RM/tmp/acl",
+                "-RX/tmp/acl",
+                "-R --modify-file /tmp/acl",
+                "-R --remove-file /tmp/acl",
+            ] {
+                let command = format!("setfacl {options} {target}");
+                assert_eq!(
+                    posix_permission_decision(&command, ShellDialect::Posix),
+                    PosixPermissionDecision::Destructive(vec!["setfacl-all"]),
+                    "{command:?}"
+                );
+                assert!(!pack.matches_safe(&command), "{command:?}");
+                assert_blocks_with_pattern(&pack, &command, "setfacl-all");
+            }
+        }
+        for command in [
+            "sudo -n /usr/bin/setfacl -bR /tmp/../etc",
+            "setfacl -R -b ./project /tmp/../etc",
+            "setfacl -R -b -- /tmp/../etc",
+            "setfacl -R -m u:app:rwx /etc",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "setfacl-all");
+        }
+    }
+
+    #[test]
+    fn setfacl_later_options_cannot_erase_a_protected_mutation() {
+        let pack = create_pack();
+        for prefix in [
+            "setfacl -R -b /etc",
+            "setfacl -bR /tmp/../etc",
+            "setfacl --rec --remove-all ~/project/..",
+        ] {
+            for suffix in [
+                " --test",
+                " --test -b ./project",
+                " --help",
+                " --version",
+                " -vh",
+                " --unknown",
+                " --restore=/tmp/backup",
+                " -M",
+                " --test=invalid",
+            ] {
+                let command = format!("{prefix}{suffix}");
+                assert_eq!(
+                    posix_permission_decision(&command, ShellDialect::Posix),
+                    PosixPermissionDecision::Destructive(vec!["setfacl-all"]),
+                    "{command:?}"
+                );
+                assert_blocks_with_pattern(&pack, &command, "setfacl-all");
+            }
+        }
+    }
+
+    #[test]
+    fn setfacl_test_and_terminal_options_apply_only_when_reached() {
+        let pack = create_pack();
+        for command in [
+            "setfacl --test -Rb /etc",
+            "setfacl --te -bR /tmp/../etc",
+            "setfacl -R --test --remove-all /etc",
+            "setfacl --test -R -M /tmp/acl /etc",
+            "setfacl --help -Rb /etc",
+            "setfacl -hRb /etc",
+            "setfacl --version -Rb /etc",
+            "setfacl -vRb /etc",
+            // The first target is non-recursive. The later test flag applies
+            // only to subsequent targets, and never gets mistaken for a value.
+            "setfacl -b /etc --test -Rb /etc",
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::NonDestructive,
+                "{command:?}"
+            );
+            assert_allows(&pack, command);
+        }
+    }
+
+    #[test]
+    fn setfacl_acl_values_are_neither_options_nor_target_paths() {
+        let pack = create_pack();
+        for command in [
+            "setfacl -M -R /etc",
+            "setfacl -M-R /etc",
+            "setfacl --modify-file=-R /etc",
+            "setfacl -R -M /etc/acl ./project",
+            "setfacl -R -M /etc/acl /home/user/project",
+            "setfacl -R --remove-file /etc/acl ./project",
+            "setfacl -R --set-file=/etc/acl ./project",
+            "setfacl -R --modify-file '/etc/-R --test' ./project",
+            "setfacl -b -- -R /etc",
+            "setfacl --remove-all /etc",
+            "setfacl --remove=u:app /etc",
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::NonDestructive,
+                "{command:?}"
+            );
+            assert_allows(&pack, command);
+        }
+        // A test-looking VALUE does not enable test mode.
+        for command in [
+            "setfacl -R -M --test /etc",
+            "setfacl -RM--test /etc",
+            "setfacl --recursive --modify-file=--test /etc",
+            "setfacl -R -X --test /etc",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "setfacl-all");
+        }
+    }
+
+    #[test]
+    fn setfacl_operation_sequences_follow_native_operand_order() {
+        let pack = create_pack();
+        for command in [
+            "setfacl -b /etc -R -b ./project",
+            // Any option after a target clears the ACL sequence. A new
+            // operation is required before the next target can be processed.
+            "setfacl -b ./project -R /etc",
+            "setfacl -Rb ./project -P /etc",
+            // -- does not clear the current operation sequence.
+            "setfacl -b ./project -- /etc",
+            // Invalid leading operands stop before later options can run.
+            "setfacl /tmp/file -Rb /etc",
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::NonDestructive,
+                "{command:?}"
+            );
+            assert_allows(&pack, command);
+        }
+        for command in [
+            "setfacl -b ./project -R -b /etc",
+            "setfacl -Rb ./project -P -b /etc",
+            "setfacl -Rb ./project -- /etc",
+            // --test is a TARGET after --, not a reason to skip /etc.
+            "setfacl -Rb ./project -- --test /etc",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "setfacl-all");
+        }
+    }
+
+    #[test]
+    fn setfacl_unsupported_inputs_keep_the_conservative_fallback() {
+        for command in [
+            "setfacl -R -M",
+            "setfacl -R --modify-file",
+            "setfacl --re -b /etc",
+            "setfacl --test=1 -Rb /etc",
+            "setfacl -r -b /etc",
+            "setfacl -t -Rb /etc",
+            "setfacl -s u::rwx /etc",
+            "setfacl -R -b -",
+            "setfacl --restore=/tmp/backup",
+            "setfacl --test --restore=/tmp/backup",
+            "setfacl -R -m $ACL /etc",
+            "setfacl -R -b /tmp/*",
+            "setfacl -R -b /etc; echo done",
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::NoMatch,
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn setfacl_keeps_project_and_literal_home_carve_outs() {
+        let pack = create_pack();
+        for target in [
+            "./project",
+            "/tmp/work",
+            "/home/user/project",
+            "/home/user/project/src/..",
+            "/Users/user/project",
+            "~/project",
+            "\"$HOME/project\"",
+            "'~/project/..'",
+            "'$HOME/project/..'",
+            "/etc_backup",
+            "/etcetera",
+        ] {
+            let command = format!("setfacl -Rb {target}");
+            assert_eq!(
+                posix_permission_decision(&command, ShellDialect::Posix),
+                PosixPermissionDecision::NonDestructive,
+                "{command:?}"
+            );
+            assert_allows(&pack, &command);
+        }
+    }
+
+    #[test]
     fn chmod_exemption_requires_the_complete_invocation() {
         let pack = create_pack();
         for command in [
@@ -868,7 +1255,7 @@ mod tests {
     #[test]
     fn ls_long_form_in_argument_data_does_not_disarm_the_pack_issue_448() {
         // `ls\s+.*-l` unanchored could be found inside another command's
-        // arguments. `chmod -R 777 /etc ls -l` was allowed against v0.14.4.
+        // arguments, and a safe match short-circuits the pack (#448).
         let pack = create_pack();
         for command in ["chmod -R 777 /etc ls -l", "chown -R nobody /etc ls -al"] {
             assert!(
