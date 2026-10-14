@@ -915,31 +915,42 @@ impl HistoryDb {
             return Ok(true);
         }
 
-        self.checkpoint_truncate()?;
-        if self.file_size()? > max_bytes {
-            let freelist = self.conn.query_row("PRAGMA freelist_count")?;
-            if sv_to_i64(&freelist.values()[0]) > 0 {
-                self.vacuum()?;
-                self.checkpoint_truncate()?;
-            }
-        }
-
+        // The main file can be smaller than committed logical pages still in
+        // the WAL. Do not require an exclusive TRUNCATE checkpoint on every
+        // open: readers may pin the WAL, and the check must remain accurate.
         let page_size_row = self.conn.query_row("PRAGMA page_size")?;
         let page_size = u64::try_from(sv_to_i64(&page_size_row.values()[0]))
             .unwrap_or(4096)
             .max(1);
         let max_pages = (max_bytes / page_size).max(1);
-        self.conn
-            .execute(&format!("PRAGMA max_page_count={max_pages};"))?;
+        let page_count = self.conn.query_row("PRAGMA page_count")?;
+        let mut current_pages =
+            u64::try_from(sv_to_i64(&page_count.values()[0])).unwrap_or(u64::MAX);
 
-        // Keep a checkpointed WAL bounded as well. SQLite may temporarily
-        // exceed this while transactions are active, but truncates back to the
-        // configured limit at checkpoints and process shutdown.
+        if current_pages > max_pages {
+            let freelist = self.conn.query_row("PRAGMA freelist_count")?;
+            if sv_to_i64(&freelist.values()[0]) > 0 {
+                self.vacuum()?;
+                let page_count = self.conn.query_row("PRAGMA page_count")?;
+                current_pages =
+                    u64::try_from(sv_to_i64(&page_count.values()[0])).unwrap_or(u64::MAX);
+            }
+        }
+
+        // SQLite silently refuses to lower max_page_count below the current
+        // database size. Read the effective limit rather than assuming that
+        // executing the PRAGMA installed the requested cap.
+        let installed = self
+            .conn
+            .query_row(&format!("PRAGMA max_page_count={max_pages};"))?;
+        let installed_pages =
+            u64::try_from(sv_to_i64(&installed.values()[0])).unwrap_or(u64::MAX);
+
         let journal_limit = (max_bytes / 10).clamp(page_size, 16 * 1024 * 1024);
         self.conn
             .execute(&format!("PRAGMA journal_size_limit={journal_limit};"))?;
 
-        Ok(self.file_size()? <= max_bytes)
+        Ok(current_pages <= max_pages && installed_pages <= max_pages)
     }
 
     /// Count total commands in the database.
