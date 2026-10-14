@@ -42,18 +42,8 @@ impl QueueBudget {
         // These counters protect capacity, not publication of payload data.
         // The channel publishes the payload; Relaxed ordering is sufficient
         // for atomic accounting and avoids a global ordering requirement.
-        self.entries
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                used.checked_add(1).filter(|next| *next <= self.max_entries)
-            })
-            .map_err(|_| ReserveError::Full)?;
-        if self
-            .bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                used.checked_add(bytes).filter(|next| *next <= self.max_bytes)
-            })
-            .is_err()
-        {
+        reserve_counter(&self.entries, 1, self.max_entries)?;
+        if reserve_counter(&self.bytes, bytes, self.max_bytes).is_err() {
             self.entries.fetch_sub(1, Ordering::Relaxed);
             return Err(ReserveError::Full);
         }
@@ -69,6 +59,23 @@ impl QueueBudget {
             self.entries.load(Ordering::Relaxed),
             self.bytes.load(Ordering::Relaxed),
         )
+    }
+}
+
+/// Checked atomic addition without the deprecated `fetch_update` API.
+/// Recompute against the observed value after a failed or spurious CAS; a
+/// competing reservation must never make a stale capacity check succeed.
+fn reserve_counter(counter: &AtomicUsize, amount: usize, limit: usize) -> Result<(), ReserveError> {
+    let mut used = counter.load(Ordering::Relaxed);
+    loop {
+        let next = used
+            .checked_add(amount)
+            .filter(|next| *next <= limit)
+            .ok_or(ReserveError::Full)?;
+        match counter.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(()),
+            Err(observed) => used = observed,
+        }
     }
 }
 
@@ -96,6 +103,24 @@ mod tests {
     };
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn counter_reservation_checks_exact_limit_and_overflow_without_mutation() {
+        let counter = AtomicUsize::new(usize::MAX - 1);
+        assert_eq!(reserve_counter(&counter, 1, usize::MAX), Ok(()));
+        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
+        assert_eq!(
+            reserve_counter(&counter, 1, usize::MAX),
+            Err(ReserveError::Full)
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
+        assert_eq!(reserve_counter(&counter, 0, usize::MAX), Ok(()));
+        assert_eq!(
+            reserve_counter(&counter, 0, usize::MAX - 1),
+            Err(ReserveError::Full)
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
+    }
 
     #[test]
     fn entry_and_byte_limits_are_independent_and_reusable() {
