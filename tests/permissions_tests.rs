@@ -280,3 +280,142 @@ fn fallback_keeps_decoding_the_executable_without_proving_safety_from_masked_arg
     fixture.allowed("ch$'mod' 600 /root/key; grep -R foo /etc");
     fixture.allowed(r#"printf '%s' "ch\$'mod' -R 755 /etc""#);
 }
+
+#[test]
+fn protected_aliases_are_enforced_by_the_real_hook() {
+    let fixture = Fixture::new(&[]);
+    for (executable, operand, rule) in [
+        ("chmod", "000", "chmod-recursive-root"),
+        ("chown", "nobody", "chown-recursive-root"),
+        ("chgrp", "nogroup", "chgrp-recursive-root"),
+    ] {
+        for target in [
+            "/./etc",
+            "/tmp/../etc",
+            "/home//user",
+            "/home/user/project/..",
+            "/Users/user/project/..",
+            "~/project/..",
+            "$HOME/project/..",
+            "\"${HOME}/project/..\"",
+        ] {
+            fixture.denied(&format!("{executable} -R {operand} {target}"), rule);
+        }
+        for target in [
+            "/home/user/project/src/..",
+            "~/project/src/..",
+            "'$HOME/project/..'",
+            "\"~/project/..\"",
+        ] {
+            fixture.allowed(&format!("{executable} -R {operand} {target}"));
+        }
+    }
+}
+
+#[test]
+fn setfacl_hook_tracks_bundled_flags_and_acl_value_roles() {
+    let fixture = Fixture::new(&[]);
+    for command in [
+        "setfacl -bR /tmp/../etc",
+        "setfacl --rec --remove-all /home/user/project/..",
+        "setfacl -R --modify=u:app:rwx /etc",
+        "setfacl -R --remove=u:app /etc",
+        "setfacl -RM--test /etc",
+        "setfacl --recursive --modify-file=--test /etc",
+        "sudo -n /usr/bin/setfacl -bR /./etc",
+        "'setfacl' -Rb \"/etc\"",
+    ] {
+        fixture.denied(command, "setfacl-all");
+    }
+    for command in [
+        "setfacl -M -R /etc",
+        "setfacl -M-R /etc",
+        "setfacl -R -M /etc/acl ./project",
+        "setfacl -R --modify-file '/etc/-R --test' ./project",
+        "setfacl -b -- -R /etc",
+        "setfacl -Rb /home/user/project",
+        "setfacl -Rb '$HOME/project/..'",
+        "setfacl -Rb \"~/project/..\"",
+    ] {
+        fixture.allowed(command);
+    }
+}
+
+#[test]
+fn setfacl_hook_keeps_prior_mutations_when_later_options_terminate_or_test() {
+    let fixture = Fixture::new(&[]);
+    for prefix in ["setfacl -Rb /etc", "setfacl -bR /tmp/../etc"] {
+        for suffix in [
+            " --test",
+            " --help",
+            " --version",
+            " --unknown",
+            " --restore=/tmp/backup",
+            " -M",
+            " --test=invalid",
+        ] {
+            fixture.denied(&format!("{prefix}{suffix}"), "setfacl-all");
+        }
+    }
+    for command in [
+        "setfacl --test -Rb /etc",
+        "setfacl -hRb /etc",
+        "setfacl --version -bR /tmp/../etc",
+        "setfacl -b /etc --test -Rb /etc",
+    ] {
+        fixture.allowed(command);
+    }
+}
+
+#[test]
+fn setfacl_hook_preserves_operation_order_and_compound_boundaries() {
+    let fixture = Fixture::new(&[]);
+    for command in [
+        "setfacl -b ./project -R -b /etc",
+        "setfacl -Rb ./project -P -b /etc",
+        "setfacl -Rb ./project -- --test /etc",
+        "true && setfacl -bR /tmp/../etc",
+        "setfacl --test -Rb /etc; setfacl -Rb /etc",
+        "setfacl -bR /tmp/../etc; setfacl --test -Rb /etc",
+    ] {
+        fixture.denied(command, "setfacl-all");
+    }
+    for command in [
+        "setfacl -b ./project -R /etc",
+        "setfacl -Rb ./project -P /etc",
+        "setfacl /tmp/file -Rb /etc",
+        "setfacl --test -Rb /etc; printf done",
+        "printf '%s' 'setfacl -Rb /etc'",
+    ] {
+        fixture.allowed(command);
+    }
+}
+
+#[test]
+fn setfacl_rule_grants_do_not_exempt_other_permission_effects() {
+    let acl_grant = Fixture::new(&["setfacl-all"]);
+    acl_grant.allowed("setfacl -bR /tmp/../etc");
+    for command in [
+        "chmod -R 000 /etc",
+        "setfacl -Rb /etc; chmod -R 000 /etc",
+        "chmod -R 000 /etc; setfacl -Rb /etc",
+    ] {
+        acl_grant.denied(command, "chmod-recursive-root");
+    }
+
+    let chmod_grant = Fixture::new(&["chmod-recursive-root"]);
+    chmod_grant.allowed("chmod -R 000 /tmp/../etc");
+    for command in [
+        "setfacl -Rb /etc",
+        "chmod -R 000 /etc; setfacl -Rb /etc",
+    ] {
+        chmod_grant.denied(command, "setfacl-all");
+    }
+
+    let both_grants = Fixture::new(&["setfacl-all", "chmod-recursive-root"]);
+    both_grants.allowed("setfacl -Rb /etc; chmod -R 000 /etc");
+    both_grants.denied(
+        "setfacl -Rb /etc; chmod -R 000 /etc; chown -R nobody /etc",
+        "chown-recursive-root",
+    );
+}
