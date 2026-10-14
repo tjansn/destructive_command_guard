@@ -448,10 +448,8 @@ fn chmod_mode(mode: &str) -> Option<(bool, bool, bool)> {
         let bits = u16::from_str_radix(mode, 8).ok()?;
         return Some((bits == 0o777, bits & 0o4000 != 0, bits & 0o2000 != 0));
     }
-    let permissions = mode
-        .strip_prefix(['u', 'g', 'o', 'a'])
-        .unwrap_or(mode)
-        .strip_prefix(['+', '-'])?;
+    let operation = mode.strip_prefix(['u', 'g', 'o', 'a']).unwrap_or(mode);
+    let permissions = operation.strip_prefix(['+', '-'])?;
     if permissions.is_empty()
         || !permissions
             .chars()
@@ -459,9 +457,15 @@ fn chmod_mode(mode: &str) -> Option<(bool, bool, bool)> {
     {
         return None;
     }
-    // Preserve the currently authored symbolic predicates; changing which
-    // permission modes this opt-in pack claims is a separate posture decision.
-    Some((false, mode.starts_with("u+s"), mode.starts_with("g+s")))
+    // `s` is an unordered permission letter: u+xs sets the same special bit
+    // as u+sx. An omitted class or `a` selects both user and group; o+s has no
+    // effect. Keep the accepted grammar and relative-file exemption unchanged.
+    let sets_special = operation.starts_with('+') && permissions.contains('s');
+    Some((
+        false,
+        sets_special && mode.starts_with(['u', 'a', '+']),
+        sets_special && mode.starts_with(['g', 'a', '+']),
+    ))
 }
 
 fn routine_chmod(invocation: &PermissionInvocation) -> bool {
@@ -717,6 +721,12 @@ fn create_safe_patterns() -> Vec<SafePattern> {
 }
 
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
+    // These are also the fallback when a later expansion prevents a complete
+    // argv proof. Do not recover a truncated prefix as NonDestructive or skip
+    // the remaining rules after an allowlist hit. In that fallback, dot/parent
+    // components and repeated separators are unverified ancestry, not evidence
+    // of a bounded project target. Complete literal project paths still take
+    // the semantic NonDestructive path above. Retain every legacy regex hit.
     vec![
         // chmod 777 (world writable)
         // These patterns use unbounded .* gap-matchers, so on a full command
@@ -764,7 +774,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // quotes but not single ones, so it takes an optional `"` only.
         destructive_pattern!(
             "chmod-recursive-root",
-            r#"chmod\s+(?:.*(?:-[a-zA-Z]*[rR]|--recursive)).*\s+(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))"#,
+            r#"chmod\s+(?:.*(?:-[a-zA-Z]*[rR]|--recursive)).*\s+(?:(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))|(?:['"]?/|~/|"?\$(?:HOME|\{HOME\})/)(?:(?:[^\s"';&|]*/)?\.{1,2}(?:/|[\s"']|$)|(?:[^\s"';&|]*/)?/))"#,
             "chmod -R on system directories can break system permissions.",
             Critical,
             "Recursively changing permissions on system directories can render the system \
@@ -778,7 +788,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // chown -R on root or system directories
         destructive_pattern!(
             "chown-recursive-root",
-            r#"chown\s+(?:.*(?:-[a-zA-Z]*[rR]|--recursive)).*\s+(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))"#,
+            r#"chown\s+(?:.*(?:-[a-zA-Z]*[rR]|--recursive)).*\s+(?:(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))|(?:['"]?/|~/|"?\$(?:HOME|\{HOME\})/)(?:(?:[^\s"';&|]*/)?\.{1,2}(?:/|[\s"']|$)|(?:[^\s"';&|]*/)?/))"#,
             "chown -R on system directories can break system ownership.",
             High,
             "Recursive ownership changes on system directories can disrupt services, \
@@ -799,7 +809,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // the effect is the same kind of change to the same metadata.
         destructive_pattern!(
             "chgrp-recursive-root",
-            r#"chgrp\s+(?:.*(?:-[a-zA-Z]*[rR]|--recursive)).*\s+(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))"#,
+            r#"chgrp\s+(?:.*(?:-[a-zA-Z]*[rR]|--recursive)).*\s+(?:(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))|(?:['"]?/|~/|"?\$(?:HOME|\{HOME\})/)(?:(?:[^\s"';&|]*/)?\.{1,2}(?:/|[\s"']|$)|(?:[^\s"';&|]*/)?/))"#,
             "chgrp -R on system directories can break system group ownership.",
             High,
             "Recursive group changes on system directories can disrupt services that \
@@ -884,7 +894,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // chmod u+s (setuid)
         destructive_pattern!(
             "chmod-setuid",
-            r"chmod\s+.*u\+s|chmod\s+[4-7]\d{3}",
+            r#"chmod\s+.*u\+s|chmod\s+[4-7]\d{3}|chmod\s+(?:.*\s+)?["']?0*[4-7][0-7]{3}(?:[\s"']|$)|chmod\s+(?:.*\s+)?["']?(?:[ugoa]*[ua][ugoa]*)?\+[rwxXst]*s[rwxXst]*(?:[\s"']|$)"#,
             "Setting setuid bit (chmod u+s) is a security-sensitive operation.",
             High,
             "The setuid bit causes a program to run with the file owner's privileges \
@@ -899,7 +909,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // chmod g+s (setgid)
         destructive_pattern!(
             "chmod-setgid",
-            r"chmod\s+.*g\+s|chmod\s+[2367]\d{3}",
+            r#"chmod\s+.*g\+s|chmod\s+[2367]\d{3}|chmod\s+(?:.*\s+)?["']?0*[2367][0-7]{3}(?:[\s"']|$)|chmod\s+(?:.*\s+)?["']?(?:[ugoa]*[ga][ugoa]*)?\+[rwxXst]*s[rwxXst]*(?:[\s"']|$)"#,
             "Setting setgid bit (chmod g+s) is a security-sensitive operation.",
             High,
             "The setgid bit on an executable causes it to run with the file group's \
@@ -929,7 +939,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // setfacl with dangerous patterns
         destructive_pattern!(
             "setfacl-all",
-            r#"setfacl\s+.*-[rR].*\s+['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))"#,
+            r#"setfacl\s+(?:.*(?:-[a-zA-Z]*[rR]|--recursive)).*\s+(?:(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))|(?:['"]?/|~/|"?\$(?:HOME|\{HOME\})/)(?:(?:[^\s"';&|]*/)?\.{1,2}(?:/|[\s"']|$)|(?:[^\s"';&|]*/)?/))"#,
             "setfacl -R on system directories can modify access control across the filesystem.",
             Critical,
             "Recursively modifying ACLs on system directories changes fine-grained access \
@@ -1922,6 +1932,120 @@ mod tests {
         ] {
             let word = permission_word(target).expect("literal target");
             assert!(protected_permission_target(&word), "{target:?}");
+        }
+    }
+
+    #[test]
+    fn symbolic_special_bits_do_not_depend_on_permission_letter_order() {
+        let pack = create_pack();
+        for (mode, setuid, setgid) in [
+            ("u+s", true, false),
+            ("u+xs", true, false),
+            ("u+rws", true, false),
+            ("g+s", false, true),
+            ("g+xs", false, true),
+            ("g+rs", false, true),
+            ("a+s", true, true),
+            ("+s", true, true),
+            ("a+xs", true, true),
+        ] {
+            assert_eq!(chmod_mode(mode), Some((false, setuid, setgid)), "{mode}");
+            let mut rules = Vec::new();
+            if setuid {
+                rules.push("chmod-setuid");
+            }
+            if setgid {
+                rules.push("chmod-setgid");
+            }
+            let command = format!("chmod {mode} /tmp/file");
+            assert_eq!(
+                posix_permission_decision(&command, ShellDialect::Posix),
+                PosixPermissionDecision::Destructive(rules.clone()),
+                "{command}"
+            );
+            assert_blocks_with_pattern(&pack, &command, rules[0]);
+        }
+        for mode in ["u-s", "g-s", "a-s", "o+s", "u+x"] {
+            assert_eq!(chmod_mode(mode), Some((false, false, false)), "{mode}");
+            assert_allows(&pack, &format!("chmod {mode} /tmp/file"));
+        }
+        // Do not broaden which mode grammar can prove the relative-file
+        // exemption. Unsupported compound modes retain their fallback.
+        assert_eq!(chmod_mode("ug+s"), None);
+        assert_eq!(chmod_mode("u+s,g-s"), None);
+        assert_allows(&pack, "chmod u+xs ./file");
+    }
+
+    #[test]
+    fn unresolved_argv_keeps_recursive_alias_and_bundle_backstops() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("chmod -R 000 /tmp/../etc", "chmod-recursive-root"),
+            ("chmod -R 000 /./etc", "chmod-recursive-root"),
+            ("chown -R nobody /tmp/../etc", "chown-recursive-root"),
+            ("chgrp -R staff /home//user", "chgrp-recursive-root"),
+            ("setfacl -bR /etc", "setfacl-all"),
+            ("setfacl -bR /tmp/../etc", "setfacl-all"),
+            ("setfacl -R -b ~/project/..", "setfacl-all"),
+            ("setfacl -R -b \"${HOME}/project/..\"", "setfacl-all"),
+        ] {
+            for suffix in [" \"$EXTRA\"", " $EXTRA"] {
+                let command = format!("{command}{suffix}");
+                // This remains unresolved; no truncated argv is promoted to
+                // a safety proof or a complete list of permission effects.
+                assert_eq!(
+                    posix_permission_decision(&command, ShellDialect::Posix),
+                    PosixPermissionDecision::NoMatch,
+                    "{command}"
+                );
+                assert!(!pack.matches_safe(&command), "{command}");
+                assert_blocks_with_pattern(&pack, &command, rule);
+            }
+        }
+        // The broader alias backstop is used only without a complete proof.
+        for command in [
+            "chmod -R 755 /tmp/./project",
+            "chown -R nobody /tmp/project/..",
+            "chgrp -R staff /home/user/project/src/..",
+            "setfacl -Rb /tmp//project",
+        ] {
+            assert_allows(&pack, command);
+        }
+    }
+
+    #[test]
+    fn unresolved_modes_keep_all_independent_special_bit_rules() {
+        let pack = create_pack();
+        for (command, expected) in [
+            (
+                "chmod -R 6755 /tmp/../etc \"$EXTRA\"",
+                vec!["chmod-recursive-root", "chmod-setuid", "chmod-setgid"],
+            ),
+            (
+                "chmod a+xs /tmp/file \"$EXTRA\"",
+                vec!["chmod-setuid", "chmod-setgid"],
+            ),
+            (
+                "chmod u+xs /tmp/file \"$EXTRA\"",
+                vec!["chmod-setuid"],
+            ),
+            (
+                "chmod -R 2755 /tmp/file \"$EXTRA\"",
+                vec!["chmod-setgid"],
+            ),
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::NoMatch,
+                "{command}"
+            );
+            let hits: Vec<_> = pack
+                .destructive_patterns
+                .iter()
+                .filter(|pattern| pattern.regex.is_match(command))
+                .filter_map(|pattern| pattern.name)
+                .collect();
+            assert_eq!(hits, expected, "{command}");
         }
     }
 }
