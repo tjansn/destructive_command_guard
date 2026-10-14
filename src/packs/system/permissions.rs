@@ -257,12 +257,64 @@ fn routine_chmod(invocation: &PermissionInvocation) -> bool {
 
 fn protected_permission_target(target: &PermissionWord) -> bool {
     if target.expands_home {
-        return matches!(target.text.trim_end_matches('/'), "~" | "$HOME" | "${HOME}");
+        // permission_word has already proved that this is a leading home
+        // expansion, not a quoted literal or a different variable. A path
+        // returning to (or escaping above) that root is not project-scoped.
+        let suffix = target
+            .text
+            .strip_prefix("${HOME}")
+            .or_else(|| target.text.strip_prefix("$HOME"))
+            .or_else(|| target.text.strip_prefix('~'));
+        let Some(suffix) = suffix else {
+            return true;
+        };
+        let mut depth = 0_usize;
+        for component in suffix.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => {
+                    let Some(parent_depth) = depth.checked_sub(1) else {
+                        return true;
+                    };
+                    depth = parent_depth;
+                }
+                _ => depth += 1,
+            }
+        }
+        return depth == 0;
     }
     let Some(path) = target.text.strip_prefix('/') else {
         return false;
     };
-    let mut components = path.trim_end_matches('/').split('/');
+    let path = path.trim_end_matches('/');
+    if protected_permission_components(path.split('/')) {
+        return true;
+    }
+    if !path
+        .split('/')
+        .any(|component| matches!(component, "" | "." | ".."))
+    {
+        return false;
+    }
+
+    // This is an additional DENY-only view, never a filesystem safety proof.
+    // Keep the raw-path decision above: symlinks can change what `..` means,
+    // so reducing `/etc/../tmp` must not turn an existing denial into allow.
+    // No local filesystem lookup is valid evidence for a remote receiver.
+    let mut components = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                let _ = components.pop();
+            }
+            _ => components.push(component),
+        }
+    }
+    protected_permission_components(components.into_iter())
+}
+
+fn protected_permission_components<'a>(mut components: impl Iterator<Item = &'a str>) -> bool {
     let root = components.next().unwrap_or_default();
     if root.is_empty() {
         return true;
@@ -645,7 +697,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "Transferring file ownership to root makes the files inaccessible to normal \
              users and may break applications that need to write to those files. Services \
              running as non-root users will lose access.\n\n\
-             Check who currently owns the file:\n  \
+             Check the current owner first:\n  \
              ls -la <path>\n\n\
              Consider using group ownership instead:\n  \
              chgrp <group> <path>",
@@ -1259,5 +1311,133 @@ mod tests {
         assert_blocks_with_pattern(&pack, "chmod -R 755 /etc", "chmod-recursive-root");
         assert_blocks_with_pattern(&pack, "chown -R user:group /var", "chown-recursive-root");
         assert_blocks_with_pattern(&pack, "setfacl -R -m u:app:rwx /etc", "setfacl-all");
+    }
+
+    #[test]
+    fn recursive_permission_aliases_retain_their_exact_rules() {
+        let pack = create_pack();
+        for (executable, operand, rule) in [
+            ("chmod", "000", "chmod-recursive-root"),
+            ("chown", "nobody", "chown-recursive-root"),
+            ("chgrp", "nogroup", "chgrp-recursive-root"),
+        ] {
+            for target in [
+                "/./etc",
+                "/tmp/../etc",
+                "/tmp/cache/../../usr",
+                "/tmp/../../etc",
+                "/home//user",
+                "/home/user/project/..",
+                "/home/user/.",
+                "/Users/user/project/..",
+                "'/tmp/../etc'",
+                "\"/tmp/../etc\"",
+                "~",
+                "~/.",
+                "~/project/..",
+                "~/project/../.",
+                "~/../elsewhere",
+                "$HOME/.",
+                "$HOME/project/..",
+                "${HOME}/project/..",
+                "\"$HOME/project/..\"",
+                "\"${HOME}/project/..\"",
+            ] {
+                for command in [
+                    format!("{executable} -R {operand} {target}"),
+                    format!("{executable} {operand} {target} -vR"),
+                    format!("{executable} --recursive {operand} {target}"),
+                    format!("{executable} -R --reference=/tmp/reference {target}"),
+                ] {
+                    assert_eq!(
+                        posix_permission_decision(&command, ShellDialect::Posix),
+                        PosixPermissionDecision::Destructive(vec![rule]),
+                        "{command:?}"
+                    );
+                    assert!(!pack.matches_safe(&command), "{command:?}");
+                    assert_blocks_with_pattern(&pack, &command, rule);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn permission_aliases_preserve_every_independent_rule() {
+        for (command, rules) in [
+            (
+                "chmod -R 777 /tmp/../etc",
+                vec!["chmod-777", "chmod-recursive-root"],
+            ),
+            (
+                "chmod -R 6755 /tmp/../etc",
+                vec!["chmod-recursive-root", "chmod-setuid", "chmod-setgid"],
+            ),
+            (
+                "chown -R root /tmp/../etc",
+                vec!["chown-recursive-root", "chown-to-root"],
+            ),
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::Destructive(rules),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_aliases_do_not_reinterpret_literal_home_names() {
+        for target in [
+            "'~/project/..'",
+            "\"~/project/..\"",
+            "'$HOME/project/..'",
+            "'${HOME}/project/..'",
+            "/tmp/work",
+            "/tmp/./work",
+            "/home/user/project",
+            "/home/user/./project",
+            "/home/user/project/src/..",
+            "/Users/user/project",
+            "~/project",
+            "~/project/src/..",
+            "$HOME/project",
+            "${HOME}/project",
+            "${HOME}/project//build/..",
+            "/etc_backup",
+            "/etcetera",
+        ] {
+            let word = permission_word(target).expect("literal target or modeled home expansion");
+            assert!(!protected_permission_target(&word), "{target:?}");
+            for (executable, operand) in
+                [("chmod", "000"), ("chown", "nobody"), ("chgrp", "nogroup")]
+            {
+                let command = format!("{executable} -R {operand} {target}");
+                assert_eq!(
+                    posix_permission_decision(&command, ShellDialect::Posix),
+                    PosixPermissionDecision::NonDestructive,
+                    "{command:?}"
+                );
+            }
+        }
+        for target in ["$HOME_suffix/..", "$TARGET/..", "/tmp/$(name)/..", "/tmp/*/.."] {
+            assert!(permission_word(target).is_none(), "{target:?}");
+        }
+    }
+
+    #[test]
+    fn alias_view_never_weakens_an_existing_raw_path_denial() {
+        for target in [
+            "/",
+            "/etc/../tmp",
+            "/var/cache/../../tmp",
+            "/usr/../home/user/project",
+            "/etc-other/../tmp",
+            "//tmp/project",
+            "/home/user",
+            "/Users/user",
+        ] {
+            let word = permission_word(target).expect("literal target");
+            assert!(protected_permission_target(&word), "{target:?}");
+        }
     }
 }
