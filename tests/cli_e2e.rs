@@ -778,6 +778,360 @@ fn documented_global_boolean_env_values_do_not_fail_clap_parsing() {
     }
 }
 
+// Issue #549: evaluate recursive-delete inputs only. No Python interpreter or
+// deletion command is ever executed by these regressions.
+mod python_temp_root_tests {
+    use super::*;
+
+    const TEMP_ROOTS: [&str; 4] = ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"];
+
+    struct TestEnv {
+        root: tempfile::TempDir,
+    }
+
+    impl TestEnv {
+        fn new() -> Self {
+            Self::with_heredoc_limit("")
+        }
+
+        fn with_heredoc_limit(limit: &str) -> Self {
+            let root = tempfile::tempdir().expect("create isolated CLI environment");
+            std::fs::create_dir_all(root.path().join("home/.config/dcg")).unwrap();
+            std::fs::create_dir_all(root.path().join("tmp")).unwrap();
+            std::fs::write(
+                root.path().join("config.toml"),
+                format!(
+                    "[heredoc]\nenabled = true\ntimeout_ms = 5000\n{limit}\n\
+                 [history]\nenabled = false\n\
+                 [packs]\ndisabled = [\"windows.filesystem\", \"windows.system\"]\n"
+                ),
+            )
+            .expect("write isolated policy config");
+            Self { root }
+        }
+
+        fn assert_verdict(&self, command: &str, expected: &str) {
+            let home = self.root.path().join("home");
+            let scratch = self.root.path().join("tmp");
+            let config = self.root.path().join("config.toml");
+            let mut child = Command::new(dcg_binary())
+                .args([
+                    "test",
+                    "--stdin",
+                    "--dialect",
+                    "posix",
+                    "--format",
+                    "json",
+                    "--config",
+                ])
+                .arg(&config)
+                .env_clear()
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env("APPDATA", home.join("appdata"))
+                .env("LOCALAPPDATA", home.join("localappdata"))
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("XDG_DATA_HOME", home.join(".local/share"))
+                .env("TMPDIR", &scratch)
+                .env("TEMP", &scratch)
+                .env("TMP", &scratch)
+                .env("DCG_CONFIG", &config)
+                .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+                .env("DCG_SELF_HEAL_HOOK", "0")
+                // These are semantic regressions. A scheduling delay must not
+                // replace a completed verdict with the bounded fallback.
+                .env("DCG_AST_TIMEOUT_MS", "5000")
+                .env("DCG_HOOK_TIMEOUT_MS", "5000")
+                .current_dir(self.root.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn dcg test");
+            child
+                .stdin
+                .take()
+                .expect("dcg stdin")
+                .write_all(command.as_bytes())
+                .expect("send command as inert evaluation input");
+            let output = child.wait_with_output().expect("wait for dcg test");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let result: serde_json::Value =
+                serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                    panic!("invalid verdict JSON for {command:?}: {error}\n{stdout}\n{stderr}")
+                });
+            assert_eq!(
+                result["decision"], expected,
+                "unexpected verdict for {command:?}\n{stdout}\n{stderr}"
+            );
+        }
+
+        fn assert_python_target(&self, target: &str, expected: &str) {
+            let body = format!("import shutil; shutil.rmtree('{target}')");
+            self.assert_python_body(&body, expected);
+        }
+
+        fn assert_python_body(&self, body: &str, expected: &str) {
+            self.assert_verdict(&format!("python3 -c \"{body}\""), expected);
+            self.assert_verdict(&format!("python3 - <<'PY'\n{body}\nPY"), expected);
+        }
+    }
+
+    #[test]
+    fn python_temp_roots_and_normalized_aliases_deny_issue_549() {
+        let env = TestEnv::new();
+        for root in TEMP_ROOTS {
+            for suffix in ["", "/", "//", "/.", "/./", "//.//./", "/build/.."] {
+                env.assert_python_target(&format!("{root}{suffix}"), "deny");
+            }
+        }
+        for target in [
+            "/./tmp",
+            "//tmp",
+            "/var//tmp",
+            "/private/./tmp",
+            "/private//var/./tmp",
+        ] {
+            env.assert_python_target(target, "deny");
+        }
+    }
+
+    #[test]
+    fn python_temp_traversal_and_prefix_lookalikes_deny_issue_549() {
+        let env = TestEnv::new();
+        for target in [
+            "/tmp/../etc",
+            "/tmp/build/../../etc",
+            "/var/tmp/../../etc",
+            "/private/tmp/../../etc",
+            "/private/var/tmp/../../../etc",
+            "/tmp//..//etc",
+            // Preserve the established rejection of every parent component,
+            // even when lexical normalization would land inside a temp tree.
+            "/tmp/build/../cache",
+            "/tmp/../tmp/build",
+            "/tmp-backup/build",
+            "/private/tmp-backup/build",
+            "/var/tmpfile/build",
+        ] {
+            env.assert_python_target(target, "deny");
+        }
+    }
+
+    #[test]
+    fn python_actual_temp_descendants_allow_issue_549() {
+        let env = TestEnv::new();
+        for root in TEMP_ROOTS {
+            for suffix in [
+                "/build",
+                "/build/",
+                "//build//",
+                "/./build/.",
+                "/build..cache",
+            ] {
+                env.assert_python_target(&format!("{root}{suffix}"), "allow");
+            }
+        }
+        for target in [
+            "/./tmp/build",
+            "/var//tmp/./build",
+            "/private/./tmp/build",
+            "/private//var/tmp/build",
+            "/tmp/.hidden",
+        ] {
+            env.assert_python_target(target, "allow");
+        }
+    }
+
+    #[test]
+    fn python_execution_forms_preserve_temp_boundary_issue_549() {
+        let env = TestEnv::new();
+        for (target, expected) in [("/tmp/.", "deny"), ("/tmp/build", "allow")] {
+            for command in [
+                format!("python -c 'import shutil; shutil.rmtree(\"{target}\")'"),
+                format!("python3 -I -c \"import shutil; shutil.rmtree('{target}')\""),
+                format!(
+                    "python3 -W ignore::DeprecationWarning -c \"import shutil; shutil.rmtree('{target}')\""
+                ),
+                format!(
+                    "python3 -c \"import shutil as sh; sh.rmtree('{target}', ignore_errors=True)\""
+                ),
+                format!("python3 -c \"import shutil; shutil.rmtree(path='{target}')\""),
+                format!("python3 -c \"import shutil; shutil.rmtree(('{target}'))\""),
+                format!("python3 <<'PY'\nimport shutil as sh\nsh.rmtree('{target}')\nPY"),
+                format!("python3 -I - <<'PY'\nimport shutil\nshutil.rmtree('{target}')\nPY"),
+            ] {
+                env.assert_verdict(&command, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn python_temp_exemption_cannot_borrow_unrelated_evidence_issue_549() {
+        let env = TestEnv::new();
+        for call in [
+            "shutil.rmtree('/tmp/build' + '/..')",
+            "shutil.rmtree('/tmp/build' + '/../../home/user/Documents')",
+            "shutil.rmtree('/tmp/build' + suffix)",
+            "shutil.rmtree('/tmp/build'[:-5])",
+            "shutil.rmtree(Path('/tmp/build').parent)",
+            "shutil.rmtree(os.path.join('/tmp/build', '../../etc'))",
+            "shutil.rmtree('/tmp/\\x2e')",
+            "shutil.rmtree(path='/tmp', onerror=lambda *args: tempfile.mkdtemp())",
+            "shutil.rmtree(Path(tempfile.mkdtemp()).parent)",
+            "shutil.rmtree(tempfile.mkdtemp() + '/..')",
+        ] {
+            let body = format!("import os, shutil, tempfile; from pathlib import Path; {call}");
+            env.assert_verdict(&format!("python3 -c \"{body}\""), "deny");
+            env.assert_verdict(&format!("python3 - <<'PY'\n{body}\nPY"), "deny");
+        }
+    }
+
+    #[test]
+    fn python_fresh_temp_cleanup_and_inert_examples_remain_allowed_issue_549() {
+        let env = TestEnv::new();
+        for body in [
+            "import shutil, tempfile; shutil.rmtree(tempfile.mkdtemp())",
+            "import shutil; from tempfile import mkdtemp; shutil.rmtree(mkdtemp())",
+            "import shutil; import tempfile as tf; shutil.rmtree(tf.mkdtemp())",
+            "import shutil; import tempfile as tf; shutil.rmtree(tf.mkdtemp(prefix='build-'))",
+            "import shutil; import tempfile as tf; shutil.rmtree(tf.TemporaryDirectory().name)",
+        ] {
+            env.assert_verdict(&format!("python3 -c \"{body}\""), "allow");
+            env.assert_verdict(&format!("python3 - <<'PY'\n{body}\nPY"), "allow");
+        }
+        env.assert_verdict(
+            "cat <<'PY'\nimport shutil\nshutil.rmtree('/tmp')\nPY",
+            "allow",
+        );
+        env.assert_verdict("python3 -c \"print('shutil.rmtree(/tmp)')\"", "allow");
+    }
+
+    #[test]
+    fn shell_temp_cleanup_policy_remains_supported_issue_549() {
+        let env = TestEnv::new();
+        for root in TEMP_ROOTS {
+            env.assert_verdict(&format!("rm -rf {root}"), "deny");
+            env.assert_verdict(&format!("rm -rf {root}/build"), "allow");
+        }
+    }
+
+    #[test]
+    fn python_imported_rmtree_preserves_temp_root_boundary() {
+        let env = TestEnv::new();
+        for (import, function) in [
+            ("from shutil import rmtree", "rmtree"),
+            ("from shutil import rmtree as wipe", "wipe"),
+        ] {
+            for root in TEMP_ROOTS {
+                for (suffix, expected) in [
+                    ("", "deny"),
+                    ("//.//", "deny"),
+                    ("/build/..", "deny"),
+                    ("/build", "allow"),
+                    ("/./build/.", "allow"),
+                ] {
+                    env.assert_python_body(
+                        &format!("{import}; {function}('{root}{suffix}')"),
+                        expected,
+                    );
+                }
+            }
+            for target in [
+                "/etc",
+                "/tmp/../etc",
+                "/private/var/tmp/../../../etc",
+                "/tmp/build/../cache",
+                "/tmp-backup/build",
+            ] {
+                env.assert_python_body(&format!("{import}; {function}('{target}')"), "deny");
+            }
+        }
+    }
+
+    #[test]
+    fn python_imported_rmtree_handles_grouping_and_complete_targets() {
+        let env = TestEnv::new();
+        for body in [
+            "from shutil import copytree, rmtree as wipe; wipe('/tmp')",
+            "from shutil import (copytree, rmtree as wipe); wipe('/private/tmp/.')",
+            "from shutil import (\n    copytree,\n    rmtree as wipe,\n)\nwipe('/var/tmp')",
+            "from shutil import rmtree as wipe; wipe(path='/private/var/tmp')",
+            "from shutil import rmtree as wipe; wipe(('/tmp/.'))",
+            "from shutil import rmtree as wipe; wipe('/tmp/build' + '/..')",
+            "from shutil import rmtree as wipe; suffix = '/..'; wipe('/tmp/build' + suffix)",
+            "from shutil import rmtree as wipe; wipe('/tmp/build'[:-5])",
+            "from shutil import rmtree as wipe; import tempfile; wipe(path='/tmp', onerror=lambda *args: tempfile.mkdtemp())",
+        ] {
+            env.assert_python_body(body, "deny");
+        }
+        for body in [
+            "from shutil import copytree, rmtree as wipe; wipe('/tmp/build')",
+            "from shutil import (\n    rmtree as wipe,\n)\nwipe('/private//var/./tmp/build')",
+            "from shutil import rmtree as wipe; wipe(path='/var/tmp/build', ignore_errors=True)",
+            "from shutil import rmtree as wipe; wipe('/tmp/' + 'build')",
+            "from shutil import rmtree as wipe; import tempfile; wipe(tempfile.mkdtemp())",
+            "from shutil import rmtree; from tempfile import mkdtemp; rmtree(mkdtemp())",
+        ] {
+            env.assert_python_body(body, "allow");
+        }
+        env.assert_verdict(
+            "python -I -W ignore::DeprecationWarning -c 'from shutil import rmtree as wipe; wipe(\"/tmp\")'",
+            "deny",
+        );
+        env.assert_verdict(
+            "python3 -I <<'PY'\nfrom shutil import rmtree as wipe\nwipe('/tmp/build')\nPY",
+            "allow",
+        );
+    }
+
+    #[test]
+    fn python_imported_rmtree_respects_bindings_and_scope() {
+        let env = TestEnv::new();
+        for body in [
+            "from shutil import rmtree as wipe; print('imported for later cleanup')",
+            "from project_helpers import rmtree; rmtree('/tmp')",
+            "from project_helpers import rmtree as wipe; wipe('/tmp')",
+            "def rmtree(path):\n    print(path)\nrmtree('/tmp')",
+            "from shutil import rmtree as wipe; wipe = print; wipe('/tmp')",
+            "from shutil import rmtree as wipe\ndef wipe(path):\n    print(path)\nwipe('/tmp')",
+            "from shutil import rmtree as wipe; from project_helpers import wipe; wipe('/tmp')",
+            "from shutil import rmtree as wipe\ndef report(wipe):\n    wipe('/tmp')\nreport(print)",
+            "wipe = print\ndef load_cleanup():\n    from shutil import rmtree as wipe\nwipe('/tmp')",
+            "wipe = print\n# from shutil import rmtree as wipe\nwipe('/tmp')",
+            "wipe = print; example = 'from shutil import rmtree as wipe'; wipe('/tmp')",
+        ] {
+            env.assert_python_body(body, "allow");
+        }
+        for body in [
+            "def cleanup():\n    from shutil import rmtree as wipe\n    wipe('/tmp')\ncleanup()",
+            "from shutil import rmtree as wipe\ndef cleanup():\n    wipe('/tmp')\ncleanup()",
+            "import os\nfrom shutil import rmtree as wipe\nif os.getenv('DRY_RUN'):\n    wipe = print\nwipe('/tmp')",
+            "import os\nwipe = print\nif os.getenv('CLEANUP'):\n    from shutil import rmtree as wipe\nwipe('/tmp')",
+        ] {
+            env.assert_python_body(body, "deny");
+        }
+        env.assert_verdict(
+            "cat <<'PY'\nfrom shutil import rmtree as wipe\nwipe('/tmp')\nPY",
+            "allow",
+        );
+    }
+
+    #[test]
+    fn python_imported_rmtree_keeps_protection_when_extraction_is_incomplete() {
+        // Input-size limits force the fallback deterministically, without
+        // relying on scheduler delays, AST timing, or repeated attempts.
+        let line_limited = TestEnv::with_heredoc_limit("max_body_lines = 1");
+        let byte_limited = TestEnv::with_heredoc_limit("max_body_bytes = 1");
+        for root in TEMP_ROOTS {
+            let body = format!("from shutil import rmtree as wipe\nwipe('{root}')");
+            line_limited.assert_verdict(&format!("python3 - <<'PY'\n{body}\nPY"), "deny");
+            byte_limited.assert_python_body(&body, "deny");
+        }
+    }
+}
+
 // ============================================================================
 // DCG EXPLAIN Tests
 // ============================================================================
@@ -3548,6 +3902,713 @@ mod config_tests {
             checks.iter().any(|c| c["id"] == "binary_path"),
             "expected binary_path check in JSON output"
         );
+    }
+
+    /// Keep allowlist audits isolated from the operator's policy and session.
+    fn allowlist_doctor_command(temp: &tempfile::TempDir) -> Command {
+        let mut command = Command::new(dcg_binary());
+        command
+            .env_clear()
+            .env("HOME", temp.path().join("home"))
+            .env("USERPROFILE", temp.path().join("home"))
+            .env("XDG_CONFIG_HOME", temp.path().join("xdg_config"))
+            .env("ProgramData", temp.path().join("system"))
+            .env("TMPDIR", temp.path())
+            .env("TEMP", temp.path())
+            .env("TMP", temp.path())
+            .env("PATH", temp.path().join("bin"))
+            .env("USER", "doctor-audit-reviewer")
+            .env("DCG_SESSION_ID", "doctor-audit-session")
+            .env(
+                "DCG_ALLOWLIST_SYSTEM_PATH",
+                temp.path().join("system-allowlist.toml"),
+            )
+            .env("DCG_SELF_HEAL_HOOK", "0")
+            .env("DCG_NO_UPDATE_CHECK", "1")
+            .env("NO_COLOR", "1")
+            .env("DCG_NO_RICH", "1")
+            .current_dir(temp.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    fn write_doctor_allowlist(path: &std::path::Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().expect("allowlist parent"))
+            .expect("allowlist directory");
+        std::fs::write(path, contents).expect("write allowlist fixture");
+    }
+
+    fn parse_allowlist_doctor_report(output: &std::process::Output) -> serde_json::Value {
+        // Parsing the entire stream also rejects a second document or prose
+        // accidentally printed by doctor --fix before the JSON report.
+        let report: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+                panic!(
+                    "invalid doctor JSON ({e}): stdout={} stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        assert_eq!(report["schema_version"], 1, "{report}");
+        let fields = report.as_object().expect("doctor report object");
+        assert_eq!(
+            fields.len(),
+            5,
+            "doctor v1 top-level shape changed: {report}"
+        );
+        assert!(report["issues"].is_u64(), "{report}");
+        assert!(report["fixed"].is_u64(), "{report}");
+        assert!(report["ok"].is_boolean(), "{report}");
+        for check in report["checks"].as_array().expect("doctor checks") {
+            assert!(check["id"].is_string(), "{check}");
+            assert!(check["name"].is_string(), "{check}");
+            assert!(check["message"].is_string(), "{check}");
+            assert!(
+                matches!(
+                    check["status"].as_str(),
+                    Some("ok" | "warning" | "error" | "skipped")
+                ),
+                "{check}"
+            );
+            if let Some(remediation) = check.get("remediation") {
+                assert!(remediation.is_string(), "{check}");
+            }
+            if let Some(fixed) = check.get("fixed") {
+                assert!(fixed.is_boolean(), "{check}");
+            }
+        }
+        report
+    }
+
+    fn allowlist_doctor_check(report: &serde_json::Value) -> &serde_json::Value {
+        report["checks"]
+            .as_array()
+            .expect("doctor checks")
+            .iter()
+            .find(|check| check["id"] == "allowlists")
+            .expect("existing allowlists check")
+    }
+
+    /// #545's exact reproduction must produce actionable warnings in every
+    /// renderer, while the diagnostic and --fix preserve the granted policy.
+    #[test]
+    fn doctor_warns_about_global_indefinite_user_rule_issue_545() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_, xdg_config, _) = setup_doctor_env(&temp);
+        let path = xdg_config.join("dcg/allowlist.toml");
+        let added = allowlist_doctor_command(&temp)
+            .args([
+                "allowlist",
+                "add",
+                "core.filesystem:rm-rf-general",
+                "-r",
+                "test",
+                "--user",
+            ])
+            .output()
+            .expect("run reported allowlist add command");
+        assert!(
+            added.status.success(),
+            "allowlist add: {}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+        let original = std::fs::read(&path).expect("CLI-created allowlist");
+        let file: toml::Value =
+            toml::from_str(std::str::from_utf8(&original).expect("allowlist UTF-8"))
+                .expect("allowlist TOML");
+        let entry = &file["allow"][0];
+        let added_at = entry["added_at"].as_str().expect("CLI audit timestamp");
+        assert!(entry.get("expires_at").is_none());
+        assert!(entry.get("paths").is_none());
+
+        for args in [
+            vec!["doctor", "--format", "json"],
+            vec!["doctor", "--strict", "--format", "json"],
+            vec!["doctor", "--fix", "--strict", "--format", "json"],
+        ] {
+            let output = allowlist_doctor_command(&temp)
+                .args(&args)
+                .output()
+                .expect("run allowlist doctor");
+            let report = parse_allowlist_doctor_report(&output);
+            assert!(output.status.success(), "{args:?}: {report}");
+            assert_eq!(
+                report["ok"], true,
+                "warnings keep the exit contract: {report}"
+            );
+            let check = allowlist_doctor_check(&report);
+            assert_eq!(check["status"], "warning", "{args:?}: {check}");
+            let message = check["message"].as_str().expect("allowlist message");
+            for expected in [
+                "active globally scoped, indefinite allowlist exception",
+                "core.filesystem:rm-rf-general",
+                "HIGH RISK",
+                "destructive filesystem protection",
+                "user:",
+                "test",
+                "doctor-audit-reviewer",
+                added_at,
+                &path.display().to_string(),
+            ] {
+                assert!(message.contains(expected), "missing {expected:?}: {check}");
+            }
+            let remediation = check["remediation"].as_str().expect("audit remediation");
+            for expected in ["paths", "expires_at", "allow-once"] {
+                assert!(
+                    remediation.contains(expected),
+                    "missing actionable {expected:?}: {check}"
+                );
+            }
+            assert_ne!(
+                check["fixed"], true,
+                "doctor cannot fix an exception: {check}"
+            );
+            let fixed_checks = report["checks"]
+                .as_array()
+                .expect("checks")
+                .iter()
+                .filter(|check| check["fixed"] == true)
+                .count();
+            assert_eq!(
+                report["fixed"],
+                serde_json::json!(fixed_checks),
+                "allowlist warnings must not receive an extra fix count: {report}"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("allowlist after doctor"),
+                original,
+                "{args:?} must preserve allowlist bytes"
+            );
+        }
+
+        let pretty = allowlist_doctor_command(&temp)
+            .args(["doctor", "--strict"])
+            .output()
+            .expect("run pretty doctor");
+        assert!(pretty.status.success());
+        let stdout = String::from_utf8_lossy(&pretty.stdout);
+        assert!(
+            stdout.contains("Checking allowlist entries... WARNING"),
+            "{stdout}"
+        );
+        assert!(stdout.contains("core.filesystem:rm-rf-general"), "{stdout}");
+        assert!(
+            stdout.contains("destructive filesystem protection"),
+            "{stdout}"
+        );
+        assert_eq!(std::fs::read(&path).expect("unchanged allowlist"), original);
+    }
+
+    #[test]
+    fn doctor_recognizes_effectively_global_allowlist_paths_and_metadata() {
+        for extra in [
+            "",
+            "paths = []",
+            "paths = [\"*\"]",
+            "paths = [\"**/\"]",
+            "paths = [\"**/*\"]",
+            "paths = [\"**/**\"]",
+            "paths = [\"**/**/**\"]",
+            "paths = [\"/reviewed/workspace/**\", \"*\"]",
+            "paths = [\"/reviewed/workspace/**\", \"**/*\"]",
+            "session = false",
+            "conditions = { AUDIT_REVIEWED = \"yes\" }",
+            "environments = [\"not-the-current-environment\"]",
+            "context = \"string-argument\"",
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (_, xdg_config, _) = setup_doctor_env(&temp);
+            let path = xdg_config.join("dcg/allowlist.toml");
+            let original = format!(
+                "[[allow]]\nrule = \"core.git:reset-hard\"\nreason = \"reviewed exception\"\n{extra}\n"
+            );
+            write_doctor_allowlist(&path, &original);
+            let output = allowlist_doctor_command(&temp)
+                .env("AUDIT_REVIEWED", "yes")
+                .args(["doctor", "--format", "json"])
+                .output()
+                .expect("run global-scope audit");
+            let report = parse_allowlist_doctor_report(&output);
+            let check = allowlist_doctor_check(&report);
+            assert_eq!(check["status"], "warning", "{extra:?}: {check}");
+            let message = check["message"].as_str().expect("message");
+            assert!(
+                message.contains("active globally scoped, indefinite allowlist exception"),
+                "{extra:?} must not hide an unrestricted grant: {check}"
+            );
+            assert!(message.contains("destructive Git protection"), "{check}");
+            assert!(message.contains("core.git:reset-hard"), "{check}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn doctor_audits_only_active_rules_including_external_packs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_, xdg_config, _) = setup_doctor_env(&temp);
+        let config_dir = xdg_config.join("dcg");
+        let allowlist_path = config_dir.join("allowlist.toml");
+        let pack_path = config_dir.join("packs/custom.yaml");
+        std::fs::create_dir_all(pack_path.parent().expect("pack parent"))
+            .expect("custom pack directory");
+        std::fs::write(
+            &pack_path,
+            r#"
+schema_version: 1
+id: custom.deploy
+name: Custom Deploy Rules
+version: 1.0.0
+keywords: [deploy]
+destructive_patterns:
+  - name: prod-deploy
+    pattern: deploy\s+--env\s*=?\s*prod
+    severity: critical
+    description: Direct production deployment blocked
+"#,
+        )
+        .expect("valid external pack fixture");
+
+        let original = [
+            "unknown.audit.pack:destroy",
+            "core:reset-hard",
+            "core.git:typo",
+            "core.git:reset-*",
+            "core.git:reset-hard",
+            "containers.docker:system-prune",
+            "custom.deploy:prod-deploy",
+            "custom.deploy:missing-rule",
+        ]
+        .map(|rule| format!("[[allow]]\nrule = \"{rule}\"\nreason = \"namespace audit\"\n"))
+        .join("\n");
+        write_doctor_allowlist(&allowlist_path, &original);
+        let quoted_pack_path = toml::Value::String(pack_path.to_string_lossy().into_owned());
+
+        for (optional_active, config) in [
+            (
+                false,
+                "[packs]\nenabled = [\"core\", \"containers.docker\", \"unknown.audit.pack\"]\ndisabled = [\"containers.docker\"]\n"
+                    .to_string(),
+            ),
+            (
+                true,
+                format!(
+                    "[packs]\nenabled = [\"core\", \"containers.docker\", \"unknown.audit.pack\"]\ncustom_paths = [{quoted_pack_path}]\n"
+                ),
+            ),
+        ] {
+            std::fs::write(config_dir.join("config.toml"), config).expect("active pack config");
+            let output = allowlist_doctor_command(&temp)
+                .args(["doctor", "--format", "json"])
+                .output()
+                .expect("audit configured pack namespaces");
+            let report = parse_allowlist_doctor_report(&output);
+            assert!(output.status.success(), "{report}");
+            let check = allowlist_doctor_check(&report);
+            assert_eq!(check["status"], "warning", "{check}");
+            let message = check["message"].as_str().expect("message");
+            for (rule, expected_active) in [
+                ("unknown.audit.pack:destroy", false),
+                ("core:reset-hard", false),
+                ("core.git:typo", false),
+                ("core.git:reset-*", false),
+                ("core.git:reset-hard", true),
+                ("containers.docker:system-prune", optional_active),
+                ("custom.deploy:prod-deploy", optional_active),
+                ("custom.deploy:missing-rule", false),
+            ] {
+                let warning = format!(
+                    "active globally scoped, indefinite allowlist exception for rule {rule}"
+                );
+                assert_eq!(
+                    message.contains(&warning),
+                    expected_active,
+                    "optional_active={optional_active}, rule={rule}: {check}"
+                );
+            }
+            assert_eq!(
+                message
+                    .matches("active globally scoped, indefinite allowlist exception")
+                    .count(),
+                if optional_active { 3 } else { 1 },
+                "the audit must expand groups into concrete active packs: {check}"
+            );
+            assert_eq!(std::fs::read_to_string(&allowlist_path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn doctor_does_not_call_scoped_expiring_or_inactive_exceptions_unrestricted() {
+        for extra in [
+            "paths = [\"/reviewed/workspace/**\"]",
+            "paths = [\"**/reviewed/**\"]",
+            "paths = [\"**/*.rs\"]",
+            "paths = [\"*/reviewed\"]",
+            "expires_at = \"2099-12-31T23:59:59Z\"",
+            "expires_at = \"2099-12-31\"",
+            "expires_at = \"2000-01-01T00:00:00Z\"",
+            "ttl = \"1h\"\nadded_at = \"2099-01-01T00:00:00Z\"",
+            "ttl = \"1h\"\nadded_at = \"2000-01-01T00:00:00Z\"",
+            "ttl = \"1h\"",
+            "ttl = \"1h\"\nadded_at = \"invalid-audit-date\"",
+            "session = true\nsession_id = \"doctor-audit-session\"",
+            "session = true\nsession_id = \"different-session\"",
+            "conditions = { AUDIT_REVIEWED = \"yes\" }",
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (_, xdg_config, _) = setup_doctor_env(&temp);
+            let path = xdg_config.join("dcg/allowlist.toml");
+            let original = format!(
+                "[[allow]]\nrule = \"core.git:reset-hard\"\nreason = \"bounded exception\"\n{extra}\n"
+            );
+            write_doctor_allowlist(&path, &original);
+            let output = allowlist_doctor_command(&temp)
+                .args(["doctor", "--format", "json"])
+                .output()
+                .expect("run bounded-exception audit");
+            let report = parse_allowlist_doctor_report(&output);
+            let check = allowlist_doctor_check(&report);
+            assert!(output.status.success(), "{extra:?}: {report}");
+            let message = check["message"].as_str().expect("message");
+            assert!(
+                !message.contains("active globally scoped, indefinite allowlist exception"),
+                "{extra:?} is not an unrestricted indefinite grant: {check}"
+            );
+            if extra.starts_with("paths =") || extra.contains("2099") {
+                assert_eq!(check["status"], "ok", "{extra:?}: {check}");
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn doctor_preserves_working_path_scoped_and_exact_command_exceptions() {
+        for scoped in [true, false] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (_, xdg_config, _) = setup_doctor_env(&temp);
+            let path = xdg_config.join("dcg/allowlist.toml");
+            let approved = temp.path().join("approved");
+            std::fs::create_dir_all(&approved).expect("approved directory");
+            let original = if scoped {
+                let scope = toml::Value::String(approved.to_string_lossy().into_owned());
+                format!(
+                    "[[allow]]\nrule = \"core.git:reset-hard\"\nreason = \"scoped maintenance\"\npaths = [{scope}]\n"
+                )
+            } else {
+                "[[allow]]\nexact_command = \"git reset --hard\"\nreason = \"reviewed exact command\"\n"
+                    .to_string()
+            };
+            write_doctor_allowlist(&path, &original);
+
+            for after_audit in [false, true] {
+                if after_audit {
+                    let output = allowlist_doctor_command(&temp)
+                        .current_dir(&approved)
+                        .args(["doctor", "--format", "json"])
+                        .output()
+                        .expect("audit safe exception");
+                    let report = parse_allowlist_doctor_report(&output);
+                    let check = allowlist_doctor_check(&report);
+                    assert_eq!(check["status"], "ok", "scoped={scoped}: {check}");
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+                }
+                for allowed in [true, false] {
+                    let cwd = if allowed || !scoped {
+                        approved.as_path()
+                    } else {
+                        temp.path()
+                    };
+                    let command = if allowed || scoped {
+                        "git reset --hard"
+                    } else {
+                        "git reset --hard HEAD~1"
+                    };
+                    let output = allowlist_doctor_command(&temp)
+                        .current_dir(cwd)
+                        .args(["test", "--format", "json", command])
+                        .output()
+                        .expect("evaluate scoped allowance without executing it");
+                    let evaluation: serde_json::Value =
+                        serde_json::from_slice(&output.stdout).expect("evaluation JSON");
+                    assert_eq!(
+                        evaluation["decision"],
+                        if allowed { "allow" } else { "deny" },
+                        "scoped={scoped}, after_audit={after_audit}: {evaluation}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_audits_project_user_and_system_allowlists_from_nested_cwd() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_, xdg_config, _) = setup_doctor_env(&temp);
+        let project_config = temp.path().join(".dcg.toml");
+        std::fs::write(&project_config, "").expect("trusted project config");
+        let nested = temp.path().join("src/nested");
+        std::fs::create_dir_all(&nested).expect("nested working directory");
+        let fixtures = [
+            (
+                "project",
+                temp.path().join(".dcg/allowlist.toml"),
+                "core.filesystem:rm-rf-root-home",
+            ),
+            (
+                "user",
+                xdg_config.join("dcg/allowlist.toml"),
+                "core.git:reset-hard",
+            ),
+            (
+                "system",
+                temp.path().join("system-allowlist.toml"),
+                "core.git:stash-clear",
+            ),
+        ];
+        let mut originals = Vec::new();
+        for (layer, path, rule) in &fixtures {
+            let mut contents = format!(
+                "[[allow]]\nrule = \"{rule}\"\nreason = \"{layer} maintenance\"\nadded_by = \"{layer}-reviewer\"\nadded_at = \"2026-08-01T12:00:00Z\"\n"
+            );
+            if *layer == "project" {
+                // A scoped higher-priority exception does not neutralize an
+                // unrestricted user grant for the same rule elsewhere.
+                contents.push_str(
+                    "\n[[allow]]\nrule = \"core.git:reset-hard\"\nreason = \"scoped project override\"\npaths = [\"/reviewed/workspace/**\"]\n",
+                );
+            }
+            write_doctor_allowlist(path, &contents);
+            originals.push(contents);
+        }
+        let output = allowlist_doctor_command(&temp)
+            .env("DCG_CONFIG", &project_config)
+            .current_dir(&nested)
+            .args(["doctor", "--format", "json", "--strict"])
+            .output()
+            .expect("audit all layers");
+        let report = parse_allowlist_doctor_report(&output);
+        assert!(output.status.success(), "{report}");
+        let check = allowlist_doctor_check(&report);
+        assert_eq!(check["status"], "warning", "{check}");
+        let message = check["message"].as_str().expect("message");
+        assert_eq!(
+            message
+                .matches("active globally scoped, indefinite allowlist exception")
+                .count(),
+            3,
+            "each active unrestricted layer must be reported: {check}"
+        );
+        for ((layer, path, rule), original) in fixtures.iter().zip(originals) {
+            for expected in [
+                format!("{layer}:"),
+                path.display().to_string(),
+                (*rule).to_string(),
+            ] {
+                assert!(message.contains(&expected), "missing {expected:?}: {check}");
+            }
+            assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn doctor_warns_for_universal_globs_in_every_layer_without_changing_grants_545() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_, xdg_config, _) = setup_doctor_env(&temp);
+        let project_config = temp.path().join(".dcg.toml");
+        std::fs::write(&project_config, "").expect("trusted project config");
+        let nested = temp.path().join("src/nested");
+        std::fs::create_dir_all(&nested).expect("nested directory");
+        let fixtures = [
+            (
+                "project",
+                temp.path().join(".dcg/allowlist.toml"),
+                "core.git:reset-hard",
+                "**/",
+                "git reset --hard",
+            ),
+            (
+                "user",
+                xdg_config.join("dcg/allowlist.toml"),
+                "core.git:clean-force",
+                "**/*",
+                "git clean -fd",
+            ),
+            (
+                "system",
+                temp.path().join("system-allowlist.toml"),
+                "core.git:stash-clear",
+                "**/**",
+                "git stash clear",
+            ),
+        ];
+        let mut originals = Vec::new();
+        for (layer, path, rule, pattern, _) in &fixtures {
+            let contents = format!(
+                "[[allow]]\nrule = \"{rule}\"\nreason = \"{layer} wildcard maintenance\"\npaths = [\"{pattern}\"]\nadded_by = \"{layer}-reviewer\"\n"
+            );
+            write_doctor_allowlist(path, &contents);
+            originals.push(contents);
+        }
+        for after_audit in [false, true] {
+            if after_audit {
+                let output = allowlist_doctor_command(&temp)
+                    .env("DCG_CONFIG", &project_config)
+                    .current_dir(&nested)
+                    .args(["doctor", "--fix", "--strict", "--format", "json"])
+                    .output()
+                    .expect("audit universal globs across all layers");
+                let report = parse_allowlist_doctor_report(&output);
+                assert!(output.status.success(), "{report}");
+                let check = allowlist_doctor_check(&report);
+                assert_eq!(check["status"], "warning", "{check}");
+                assert_ne!(check["fixed"], true, "doctor must preserve grants: {check}");
+                let message = check["message"].as_str().expect("audit message");
+                assert_eq!(
+                    message
+                        .matches("active globally scoped, indefinite allowlist exception")
+                        .count(),
+                    fixtures.len(),
+                    "universal scope must be diagnosed in every layer: {check}"
+                );
+                for ((layer, path, rule, _, _), original) in fixtures.iter().zip(&originals) {
+                    for expected in [
+                        format!("{layer}:"),
+                        (*rule).to_string(),
+                        format!("{layer}-reviewer"),
+                    ] {
+                        assert!(message.contains(&expected), "missing {expected:?}: {check}");
+                    }
+                    assert_eq!(std::fs::read_to_string(path).unwrap(), *original);
+                }
+            }
+            for (_, _, _, _, command) in &fixtures {
+                for cwd in [temp.path(), nested.as_path()] {
+                    let output = allowlist_doctor_command(&temp)
+                        .env("DCG_CONFIG", &project_config)
+                        .current_dir(cwd)
+                        .args(["test", "--format", "json", command])
+                        .output()
+                        .expect("evaluate granted command as inert data");
+                    let evaluation: serde_json::Value =
+                        serde_json::from_slice(&output.stdout).expect("evaluation JSON");
+                    assert_eq!(
+                        evaluation["decision"], "allow",
+                        "the audit must not change matching: after_audit={after_audit}, {command:?}: {evaluation}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_reports_untrusted_project_allowlist_as_inactive() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        setup_doctor_env(&temp);
+        std::fs::write(temp.path().join(".dcg.toml"), "").expect("untrusted project config");
+        let path = temp.path().join(".dcg/allowlist.toml");
+        let original =
+            "[[allow]]\nrule = \"core.git:reset-hard\"\nreason = \"inactive project rule\"\n";
+        write_doctor_allowlist(&path, original);
+        let output = allowlist_doctor_command(&temp)
+            .args(["doctor", "--format", "json"])
+            .output()
+            .expect("audit untrusted project");
+        let report = parse_allowlist_doctor_report(&output);
+        let check = allowlist_doctor_check(&report);
+        assert_eq!(check["status"], "warning", "{check}");
+        let message = check["message"].as_str().expect("message");
+        assert!(message.contains("inactive"), "{check}");
+        assert!(message.contains("untrusted"), "{check}");
+        assert!(message.contains(&path.display().to_string()), "{check}");
+        assert!(
+            !message.contains("active globally scoped, indefinite allowlist exception"),
+            "untrusted repository policy must not be reported as active: {check}"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn doctor_reports_active_risk_alongside_malformed_allowlist_metadata() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_, xdg_config, _) = setup_doctor_env(&temp);
+        let path = xdg_config.join("dcg/allowlist.toml");
+        let original = r#"
+[[allow]]
+rule = "core.filesystem:rm-rf-general"
+reason = "invalid expiry makes this row inactive"
+expires_at = "not-a-date"
+
+[[allow]]
+rule = "core.git:reset-hard"
+reason = "active despite malformed audit timestamp"
+added_by = "migration-reviewer"
+added_at = "invalid-audit-date"
+"#;
+        write_doctor_allowlist(&path, original);
+        for strict in [false, true] {
+            let mut command = allowlist_doctor_command(&temp);
+            command.args(["doctor", "--format", "json"]);
+            if strict {
+                command.arg("--strict");
+            }
+            let output = command.output().expect("audit malformed metadata");
+            let report = parse_allowlist_doctor_report(&output);
+            let check = allowlist_doctor_check(&report);
+            assert_eq!(check["status"], "error", "{check}");
+            assert_eq!(report["ok"], false, "{report}");
+            assert_eq!(output.status.success(), !strict, "{report}");
+            let message = check["message"].as_str().expect("message");
+            assert!(message.contains("not-a-date"), "{check}");
+            assert!(
+                message.contains("entry 2"),
+                "retain source row numbers: {check}"
+            );
+            assert!(
+                message.contains("active globally scoped, indefinite allowlist exception for rule core.git:reset-hard"),
+                "a parse error must not hide another row's active risk: {check}"
+            );
+            assert!(message.contains("migration-reviewer"), "{check}");
+            assert!(message.contains("invalid-audit-date"), "{check}");
+            assert!(
+                !message.contains("active globally scoped, indefinite allowlist exception for rule core.filesystem:rm-rf-general"),
+                "a rejected expiry row must not be described as active: {check}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn doctor_audits_non_string_expiration_as_runtime_interprets_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_, xdg_config, _) = setup_doctor_env(&temp);
+        let path = xdg_config.join("dcg/allowlist.toml");
+        // The loader ignores values of the wrong type for these optional
+        // fields. Their presence must not make doctor invent an expiration.
+        let original = r#"
+[[allow]]
+rule = "core.git:reset-hard"
+reason = "mistyped optional metadata"
+expires_at = 123
+added_at = false
+added_by = 456
+"#;
+        write_doctor_allowlist(&path, original);
+        let output = allowlist_doctor_command(&temp)
+            .args(["doctor", "--format", "json"])
+            .output()
+            .expect("audit mistyped metadata");
+        let report = parse_allowlist_doctor_report(&output);
+        let check = allowlist_doctor_check(&report);
+        assert_eq!(check["status"], "warning", "{check}");
+        let message = check["message"].as_str().expect("message");
+        assert!(
+            message.contains("active globally scoped, indefinite allowlist exception for rule core.git:reset-hard"),
+            "{check}"
+        );
+        assert!(!message.contains("added_by=456"), "{check}");
+        assert!(!message.contains("added_at=false"), "{check}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
     }
 
     /// Run `dcg doctor --format json` in an isolated HOME and return the

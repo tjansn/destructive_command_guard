@@ -49,7 +49,9 @@ use destructive_command_guard::packs::{DecisionMode, EnabledKeywordIndex, REGIST
 use destructive_command_guard::pending_exceptions::{
     MaintenanceRecheck, PendingExceptionStore, PersistBudget, log_maintenance,
 };
-use destructive_command_guard::perf::{Deadline, HOOK_EVALUATION_BUDGET};
+use destructive_command_guard::perf::{
+    self, Deadline, HOOK_EVALUATION_BUDGET, HookProfile, ProfilePhase, phase,
+};
 use destructive_command_guard::update::{GIT_DESCRIBE, GIT_SHA};
 use destructive_command_guard::{emit_stderr, emit_stdout};
 // Import HookInput for parsing stdin JSON in hook mode
@@ -117,6 +119,25 @@ fn history_db_path(config: &destructive_command_guard::config::HistoryConfig) ->
     ResolvedHistoryPath::resolve(config).path
 }
 
+fn create_history_writer(
+    config: &destructive_command_guard::config::HistoryConfig,
+) -> HistoryWriter {
+    let _phase = phase(ProfilePhase::HistoryInit);
+    HistoryWriter::new(Some(history_db_path(config)), config)
+}
+
+fn record_history(writer: &HistoryWriter, entry: CommandEntry) {
+    let _phase = phase(ProfilePhase::HistoryRecord);
+    writer.log(entry);
+}
+
+fn drop_history_writer(writer: Option<HistoryWriter>) {
+    if let Some(writer) = writer {
+        let _phase = phase(ProfilePhase::HistoryFlush);
+        drop(writer);
+    }
+}
+
 fn build_history_entry(
     agent_type: &str,
     command: &str,
@@ -127,6 +148,7 @@ fn build_history_entry(
     pattern_name: Option<&str>,
     allowlist_layer: Option<&str>,
 ) -> CommandEntry {
+    let _phase = phase(ProfilePhase::HistoryRecord);
     let eval_duration_us = u64::try_from(eval_duration.as_micros()).unwrap_or(u64::MAX);
 
     CommandEntry {
@@ -276,6 +298,7 @@ fn payloadless_hook_protocol(detected_agent: &Agent, prefix: Option<&str>) -> ho
 /// `process::exit`, which skips `Drop`, so callers must have dropped (and
 /// thereby flushed) the history writer first.
 fn finish_hook_mode(exit_code: i32) {
+    perf::finish_hook_profile();
     if exit_code != EXIT_SUCCESS {
         std::process::exit(exit_code);
     }
@@ -318,7 +341,7 @@ fn handle_indeterminate_evaluation(
             Some(INDETERMINATE_HISTORY_PATTERN),
             None,
         );
-        writer.log(entry);
+        record_history(writer, entry);
         writer.detach_worker_on_drop();
     }
     blocking_verdict_exit_code(protocol, delivery)
@@ -386,8 +409,7 @@ fn handle_unparseable_hook_input(
         } else {
             HistoryOutcome::Allow
         };
-        let mut writer =
-            HistoryWriter::new(Some(history_db_path(&config.history)), &config.history);
+        let mut writer = create_history_writer(&config.history);
         writer.limit_drop_wait_to(HOOK_EVALUATION_BUDGET);
         let entry = build_history_entry(
             detected_agent.config_key(),
@@ -399,10 +421,14 @@ fn handle_unparseable_hook_input(
             None,
             Some("parse-error"),
         );
-        writer.log(entry);
+        record_history(&writer, entry);
         // Flush synchronously because this parse-error path returns
         // immediately after publishing its fail-open/fail-closed decision.
-        writer.flush_sync();
+        {
+            let _phase = phase(ProfilePhase::HistoryFlush);
+            writer.flush_sync();
+        }
+        drop_history_writer(Some(writer));
     }
 
     if !block {
@@ -676,8 +702,7 @@ fn try_deny_unparseable_payload(
     for command in &commands {
         if deadline.is_exceeded() {
             let mut history_writer = if config.history.enabled {
-                let mut writer =
-                    HistoryWriter::new(Some(history_db_path(&config.history)), &config.history);
+                let mut writer = create_history_writer(&config.history);
                 writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
                 Some(writer)
             } else {
@@ -693,7 +718,7 @@ fn try_deny_unparseable_payload(
             );
             // Dropped before the caller can `process::exit`, for the same
             // reason the deny arm below drops its writer here.
-            drop(history_writer);
+            drop_history_writer(history_writer);
             return Some(exit_code);
         }
         // Windows made of pure padding carry no enabled keyword; skipping
@@ -712,8 +737,7 @@ fn try_deny_unparseable_payload(
         if let ResolvedCommandOutcome::DenyFamily(resolved) = outcome {
             if matches!(resolved.mode, DecisionMode::Deny | DecisionMode::Ask) {
                 let mut history_writer = if config.history.enabled {
-                    let mut writer =
-                        HistoryWriter::new(Some(history_db_path(&config.history)), &config.history);
+                    let mut writer = create_history_writer(&config.history);
                     writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
                     Some(writer)
                 } else {
@@ -726,7 +750,7 @@ fn try_deny_unparseable_payload(
                 );
                 // Dropped here, before the caller can `process::exit`: the
                 // audit row must be flushed first.
-                drop(history_writer);
+                drop_history_writer(history_writer);
                 return Some(exit_code);
             }
         }
@@ -908,6 +932,9 @@ const fn inject_test_hook_panic() {}
 /// sends the evaluator's tracing events to stderr. Unset, nothing is installed
 /// and the hot path pays nothing.
 fn init_hook_tracing() {
+    if destructive_command_guard::output::is_robot_mode() {
+        return;
+    }
     let Some(filter) = std::env::var_os("DCG_LOG") else {
         return;
     };
@@ -1466,7 +1493,7 @@ fn resolve_hook_command(
                         pattern.as_deref(),
                         Some("rebase-recovery"),
                     );
-                    writer.log(entry);
+                    record_history(writer, entry);
                 }
                 return ResolvedCommandOutcome::Allow(None);
             }
@@ -1521,7 +1548,7 @@ fn resolve_hook_command(
                 pattern,
                 None,
             );
-            writer.log(entry);
+            record_history(writer, entry);
         }
         if let Some(log_file) = &ctx.config.general.log_file {
             let _ = hook::log_blocked_command(log_file, command, &info.reason, pack);
@@ -1612,7 +1639,7 @@ fn publish_decisive_response(
             pattern,
             None,
         );
-        writer.log(entry);
+        record_history(writer, entry);
     }
 
     match mode {
@@ -1953,9 +1980,11 @@ fn main() {
 
     // Initialize output system based on CLI flags.
     // --legacy-output, --no-color, or --robot forces plain output mode.
-    // Robot mode also suppresses all stderr output.
+    // Robot mode also suppresses human diagnostics. A hook protocol that
+    // carries its verdict on stderr still retains that required wire channel.
     let robot_mode = destructive_command_guard::output::robot_mode_enabled(cli.robot);
     let force_plain_output = cli.legacy_output || cli.no_color || robot_mode;
+    destructive_command_guard::output::init_robot_mode(robot_mode);
     destructive_command_guard::output::init(force_plain_output);
     destructive_command_guard::output::init_console(force_plain_output);
     destructive_command_guard::output::init_suggestions(!cli.no_suggestions && !robot_mode);
@@ -1994,6 +2023,11 @@ fn main() {
         return;
     }
 
+    // Opt-in diagnostics run through the real hook path, including early
+    // exits and history shutdown. They only write to stderr; robot mode
+    // retains its explicit stderr-silent contract.
+    let _hook_profile = HookProfile::from_env(!robot_mode);
+
     // Check if bypass is requested (escape hatch). It is an environment check
     // only, so it runs before config loading and agent detection: the escape
     // hatch must not pay for work whose result it discards.
@@ -2001,9 +2035,12 @@ fn main() {
         return;
     }
 
+    let request_setup_phase = phase(ProfilePhase::RequestSetup);
     init_hook_tracing();
+    let _hook_phase = destructive_command_guard::perf::PhaseTimer::start("hook_total");
 
     // Load configuration
+    let config_phase = phase(ProfilePhase::ConfigLoad);
     let config = Config::load();
     destructive_command_guard::output::install_theme_config(&config);
     let detected_agent = detect_agent();
@@ -2013,6 +2050,7 @@ fn main() {
         protocol: payloadless_hook_protocol(&detected_agent, None),
         deny_unverified: config.unverified_denies(),
     }));
+    drop(config_phase);
 
     // Read hook input FIRST, before the deadline starts: how long the client
     // takes to write stdin is outside dcg's control and must not eat the
@@ -2045,6 +2083,7 @@ fn main() {
         .remaining()
         .is_none_or(|remaining| remaining >= SELF_HEAL_MIN_BUDGET);
     if config.general.self_heal_hook && self_heal_budget_ok {
+        let _phase = phase(ProfilePhase::SelfHeal);
         // Grok, Reasonix, and other hosts can identify themselves only in the
         // already-parsed payload. Their compatibility settings must not move
         // with an inherited Claude-only configuration override.
@@ -2263,8 +2302,7 @@ fn main() {
     );
 
     let mut history_writer = if config.history.enabled {
-        let mut writer =
-            HistoryWriter::new(Some(history_db_path(&config.history)), &config.history);
+        let mut writer = create_history_writer(&config.history);
         writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
         Some(writer)
     } else {
@@ -2323,6 +2361,7 @@ fn main() {
         max_command_bytes,
         decision_logger: decision_logger.as_ref(),
     };
+    drop(request_setup_phase);
 
     // Resolve EVERY command in the request before publishing anything (issue
     // #252 batches): each entry is evaluated independently, with its own
@@ -2516,7 +2555,7 @@ fn main() {
         // primary command, matching the single-command flow.
         if let Some(entry) = primary_allow_row {
             if let Some(writer) = history_writer.as_ref() {
-                writer.log(*entry);
+                record_history(writer, *entry);
             }
         }
         EXIT_SUCCESS
@@ -2531,7 +2570,7 @@ fn main() {
 
     // A fail-closed exit goes through `process::exit`, which skips `Drop`:
     // flush the audit row first.
-    drop(history_writer);
+    drop_history_writer(history_writer);
     finish_hook_mode(exit_code);
 }
 

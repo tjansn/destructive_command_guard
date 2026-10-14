@@ -13,6 +13,21 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased — Tom's sandbox-trial fork
 
+- Integrate upstream temporary-root/aliased Python deletion protection,
+  indirect Python/JavaScript execution analysis, executable-variable and sink
+  ownership checks, written-script and nested heredoc/here-string coverage.
+- Reduce routine-work inspection false positives for typed interpreter/browser
+  heredocs, absolute-directory pipelines, exact native metadata queries and
+  read-only SSH system diagnostics. Keep strict fallback, source/version
+  binding, learned approvals, Touch ID and confinement intact.
+- Distinguish deterministic interpreter syntax errors from structural resource
+  limits; only proven source-only bodies use the configured syntax fallback.
+  Protect credential files in canonical macOS temporary homes as well.
+- Add advisory doctor audits for broad permanent exceptions and path globs;
+  integrate upstream opt-in phase profiling, lazy language patterns, shared
+  matching indexes and repeated-stdin-analysis reductions. No local speedup is
+  claimed without a paired incumbent/candidate measurement.
+
 - Add opt-out macOS sandbox trials for eligible unverified-source commands,
   isolated workspace/home/temp directories, localhost-only networking, bounded
   execution and concise observation summaries. Definite destructive matches

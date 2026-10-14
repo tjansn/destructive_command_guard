@@ -51,6 +51,34 @@ Codex home also needs its own native hook entry. Start a fresh agent process
 after changing hook configuration; changing the referenced binary alone takes
 effect on the next invocation of an already loaded hook.
 
+## Routine commands and source ownership
+
+Inspection follows executable inputs, not every string that resembles code.
+Python/JavaScript heredoc bodies are not also searched for Bash script filenames;
+actual shell expansions and interpreter execution sinks still receive their
+independent checks. Documentation strings and literal argv data remain data.
+
+A leading literal absolute `cd … && …` can establish an inspection-only directory
+for a following pipeline. This does not supply a blanket path-scoped allowlist
+exception. Backgrounding, OR/semicolon branches, later directory changes,
+`eval`/sourcing and ambiguous executable sources still require verification.
+When the directory is unknown, an absolute native executable can be recognized
+without inventing an execution directory for a script.
+
+Exact native metadata queries (`bash --version`/`--help`, Node version queries,
+and `env` without an executable operand) have no script-source operands.
+Standard absolute SSH diagnostics using `uptime`, `memory_pressure -Q`, or
+read-only dotted `sysctl` keys also do not refer to local scripts. This is
+argument-role classification, not an allowlist: siblings, substitutions, writes,
+preloads, extra operands and project-local namesakes keep their normal checks.
+
+Grammar errors are separate from resource exhaustion. A proven source-only
+interpreter body uses the configured bounded grammar-error fallback; disabling
+`fallback_on_parse_error` blocks it. An opaque consumer cannot use a different
+language's grammar error to establish its stdin as inert. Time, worker, source
+size, node-count and payload limits remain incomplete analysis, never a clean
+allow. Tom's strict configuration continues to disable grammar-error fallback.
+
 ## One-request desktop approval (macOS)
 
 Set the trusted user hook command to `/absolute/path/dcg --desktop-review`

@@ -20,7 +20,7 @@
 //! exclude `[` and `]` so they cannot re-redact a placeholder a previous
 //! pattern already wrote.
 
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 use regex::{Regex, RegexSet};
 
@@ -107,31 +107,93 @@ const SECRET_PATTERNS: &[(&str, &str)] = &[
     ),
 ];
 
-/// The compiled pattern set.
+struct SecretPattern {
+    source: &'static str,
+    replacement: &'static str,
+    regex: OnceLock<Option<Regex>>,
+}
+
+impl SecretPattern {
+    fn compiled(&self) -> Option<&Regex> {
+        self.regex
+            .get_or_init(|| Regex::new(self.source).ok())
+            .as_ref()
+    }
+}
+
+/// The combined matcher plus lazily compiled capture/replacement matchers.
 ///
-/// `regexes` and `set` are built from the same filtered pattern list, so a
-/// `RegexSet` match index addresses the same entry in `regexes`. A pattern
-/// that fails to compile is dropped from both rather than panicking — a broken
-/// pattern must not take down the hook — and `patterns_all_compile` below
-/// keeps the shipped set honest.
+/// A fresh hook process usually redacts one command with no secrets. Building
+/// the `RegexSet` already performs the full regex analysis needed to establish
+/// that; eagerly compiling every individual `Regex` duplicates cold work.
+/// Only a pattern that actually matches needs its capture/replacement matcher.
+/// The regex library still determines every candidate, including Unicode case
+/// folding and word boundaries; there is no separately maintained text gate.
 struct Compiled {
-    regexes: Vec<(Regex, &'static str)>,
+    patterns: Vec<SecretPattern>,
     /// `None` only if `RegexSet` construction itself fails (e.g. the combined
     /// program exceeds the size limit); callers then run every pattern.
     set: Option<RegexSet>,
 }
 
-static COMPILED: LazyLock<Compiled> = LazyLock::new(|| {
-    let usable: Vec<(Regex, &'static str)> = SECRET_PATTERNS
-        .iter()
-        .filter_map(|(pattern, replacement)| Regex::new(pattern).ok().map(|re| (re, *replacement)))
-        .collect();
-    let set = RegexSet::new(usable.iter().map(|(re, _)| re.as_str())).ok();
-    Compiled {
-        regexes: usable,
-        set,
+impl Compiled {
+    fn new(patterns: &[(&'static str, &'static str)]) -> Self {
+        let mut patterns: Vec<SecretPattern> = patterns
+            .iter()
+            .map(|(source, replacement)| SecretPattern {
+                source,
+                replacement,
+                regex: OnceLock::new(),
+            })
+            .collect();
+        let set = RegexSet::new(patterns.iter().map(|pattern| pattern.source)).ok();
+        let set = set.or_else(|| {
+            // Preserve the existing fallback exactly: discard patterns whose
+            // individual matcher fails, then retry the set over that filtered
+            // list. This keeps set indices aligned and retains original-input
+            // match selection even when one declaration is malformed. Only a
+            // failure of the rebuilt set invokes the ordered per-regex path.
+            patterns.retain(|pattern| pattern.compiled().is_some());
+            RegexSet::new(patterns.iter().map(|pattern| pattern.source)).ok()
+        });
+        Self { patterns, set }
     }
-});
+
+    fn redact(&self, command: &str) -> String {
+        let Some(set) = self.set.as_ref() else {
+            // The set failed to build; fall back to running every pattern.
+            return self
+                .patterns
+                .iter()
+                .filter_map(|pattern| pattern.compiled().map(|regex| (regex, pattern.replacement)))
+                .fold(command.to_string(), |acc, (regex, replacement)| {
+                    regex.replace_all(&acc, replacement).into_owned()
+                });
+        };
+
+        // One regex-library scan identifies all patterns matching the original
+        // input. A non-match compiles no individual capture/replacement regex.
+        let matched = set.matches(command);
+        if !matched.matched_any() {
+            return command.to_string();
+        }
+
+        // Indices are ascending, preserving declaration order. As before,
+        // only original-input matches participate: a replacement must not
+        // introduce a new candidate for a later pattern.
+        let mut result = command.to_string();
+        for index in &matched {
+            if let Some(pattern) = self.patterns.get(index) {
+                if let Some(regex) = pattern.compiled() {
+                    result = regex.replace_all(&result, pattern.replacement).into_owned();
+                }
+            }
+        }
+        result
+    }
+}
+
+static COMPILED: LazyLock<Compiled> = LazyLock::new(|| Compiled::new(SECRET_PATTERNS));
 
 /// Replace recognised credential shapes in `command` with placeholders.
 ///
@@ -140,45 +202,239 @@ static COMPILED: LazyLock<Compiled> = LazyLock::new(|| {
 /// secrets.
 #[must_use]
 pub fn redact_secrets(command: &str) -> String {
-    let compiled = &*COMPILED;
-    let Some(set) = compiled.set.as_ref() else {
-        // The set failed to build; fall back to running every pattern.
-        return compiled
-            .regexes
-            .iter()
-            .fold(command.to_string(), |acc, (re, rep)| {
-                re.replace_all(&acc, *rep).into_owned()
-            });
-    };
-
-    // dcg runs on every `PreToolUse` call, so the overwhelmingly common case —
-    // a command with no credentials in it — must not pay for 20-odd separate
-    // scans and allocations. `RegexSet::matches` answers "which patterns
-    // match" in one pass over the input.
-    let matched = set.matches(command);
-    if !matched.matched_any() {
-        return command.to_string();
-    }
-
-    // `matches.iter()` yields indices in ascending order, so replacement runs
-    // in declaration order and the specific token patterns land before the
-    // generic assignment patterns. Only patterns that matched the original
-    // string are run: every replacement either deletes secret text outright or
-    // (for the URL and Authorization patterns) keeps back only the scheme or
-    // the header name, so a replacement can never expose a credential that was
-    // not already visible.
-    let mut result = command.to_string();
-    for index in &matched {
-        if let Some((regex, replacement)) = compiled.regexes.get(index) {
-            result = regex.replace_all(&result, *replacement).into_owned();
-        }
-    }
-    result
+    COMPILED.redact(command)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SECRET_PATTERNS, redact_secrets};
+    use super::{Compiled, SECRET_PATTERNS, redact_secrets};
+
+    /// Frozen eager implementation used before #555. Keep the reference's
+    /// construction and original-input candidate selection independent of the
+    /// lazy implementation so differential tests detect semantic drift.
+    struct EagerReference {
+        regexes: Vec<(regex::Regex, &'static str)>,
+        set: Option<regex::RegexSet>,
+    }
+
+    impl EagerReference {
+        fn new(patterns: &[(&str, &'static str)]) -> Self {
+            let regexes: Vec<_> = patterns
+                .iter()
+                .filter_map(|(source, replacement)| {
+                    regex::Regex::new(source)
+                        .ok()
+                        .map(|regex| (regex, *replacement))
+                })
+                .collect();
+            let set = regex::RegexSet::new(regexes.iter().map(|(regex, _)| regex.as_str())).ok();
+            Self { regexes, set }
+        }
+
+        fn redact(&self, command: &str) -> String {
+            let Some(set) = self.set.as_ref() else {
+                return self.regexes.iter().fold(
+                    command.to_string(),
+                    |result, (regex, replacement)| {
+                        regex.replace_all(&result, *replacement).into_owned()
+                    },
+                );
+            };
+            let matched = set.matches(command);
+            let mut result = command.to_string();
+            for index in &matched {
+                if let Some((regex, replacement)) = self.regexes.get(index) {
+                    result = regex.replace_all(&result, *replacement).into_owned();
+                }
+            }
+            result
+        }
+    }
+
+    #[test]
+    fn ordinary_commands_do_not_compile_capture_regexes() {
+        let compiled = Compiled::new(SECRET_PATTERNS);
+        assert!(compiled.set.is_some());
+        for command in [
+            "",
+            "ls -la",
+            "git status",
+            "python3 <<'PY'\nprint('hello')\nPY",
+        ] {
+            assert_eq!(compiled.redact(command), command);
+        }
+        assert!(
+            compiled
+                .patterns
+                .iter()
+                .all(|pattern| pattern.regex.get().is_none())
+        );
+
+        assert_eq!(compiled.redact("PASSWORD='synthetic'"), "[PASSWORD]");
+        let initialized: Vec<_> = compiled
+            .patterns
+            .iter()
+            .filter_map(|pattern| pattern.regex.get().map(|_| pattern.replacement))
+            .collect();
+        assert_eq!(
+            initialized,
+            vec!["[PASSWORD]"],
+            "only the matching password pattern compiles"
+        );
+    }
+
+    #[test]
+    fn lazy_redaction_matches_eager_reference_for_all_secret_families() {
+        let compiled = Compiled::new(SECRET_PATTERNS);
+        let reference = EagerReference::new(SECRET_PATTERNS);
+        // One synthetic witness per declaration, including capture-preserving
+        // replacements and overlaps between provider tokens and assignments.
+        let examples = [
+            format!("sk-ant-api{}", "A".repeat(48)),
+            format!("sk-proj-{}", "aZ09_-".repeat(10)),
+            format!("AIza{}", "A".repeat(35)),
+            format!("sk_test_{}", "A".repeat(16)),
+            format!("SG.{}.{}", "A".repeat(20), "B".repeat(20)),
+            format!("AKIA{}", "A".repeat(16)),
+            "aws_secret_access_key='synthetic'".to_string(),
+            "azure-storage-key='synthetic'".to_string(),
+            format!("ghp_{}", "A".repeat(36)),
+            format!("github_pat_{}", "A".repeat(22)),
+            format!("glpat-{}", "A".repeat(20)),
+            format!("npm_{}", "A".repeat(36)),
+            "pypi-AgEIcHlwaS5vcmc_SYNTHETIC".to_string(),
+            format!("dop_v1_{}", "a".repeat(64)),
+            "xoxb-0123456789".to_string(),
+            "https://hooks.slack.com/services/SYNTHETIC/EXAMPLE".to_string(),
+            "-----BEGIN OPENSSH PRIVATE KEY-----".to_string(),
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----".to_string(),
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl".to_string(),
+            "Authorization: Basic dGVzdDp0ZXN0".to_string(),
+            "postgres://user:synthetic@db.example/app".to_string(),
+            "PASSWORD=correcthorsebattery".to_string(),
+            "api_key=abcdefghijklmnop".to_string(),
+        ];
+        assert_eq!(examples.len(), SECRET_PATTERNS.len());
+        let multiline = "print('ordinary data')\n".repeat(300);
+        for (index, example) in examples.iter().enumerate() {
+            assert!(
+                reference.regexes[index].0.is_match(example),
+                "missing witness for pattern {index}"
+            );
+            for command in [
+                example.clone(),
+                format!("run '{example}' trailing"),
+                format!("password=\"{example}\" api_key='{example}'"),
+                format!("python3 <<'PY'\n{multiline}print({example:?})\nPY"),
+            ] {
+                assert_eq!(
+                    compiled.redact(&command),
+                    reference.redact(&command),
+                    "{command}"
+                );
+            }
+        }
+        let combined = examples.join("\n");
+        assert_eq!(compiled.redact(&combined), reference.redact(&combined));
+    }
+
+    #[test]
+    fn lazy_redaction_preserves_unicode_folding_boundaries_and_thresholds() {
+        let compiled = Compiled::new(SECRET_PATTERNS);
+        let reference = EagerReference::new(SECRET_PATTERNS);
+        for (command, expected) in [
+            ("aws_ſecret_acceſs_\u{212a}ey=synthetic", "[AWS_SECRET]"),
+            ("azure_ſtorage_\u{212a}ey='synthetic'", "[AZURE_KEY]"),
+            ("paſſword='x'", "[PASSWORD]"),
+            ("api_\u{212a}ey=abcdefghijklmnop", "[SECRET]"),
+            (
+                "\u{212a}://user:synthetic@host",
+                "\u{212a}://[URL_CREDENTIALS]@host",
+            ),
+            ("PASSWORD\u{2003}=\u{2028}'synthetic'", "[PASSWORD]"),
+            (
+                "AUTHORIZATION\u{2003}:\u{2003}BEARER\u{2003}abc123",
+                "AUTHORIZATION\u{2003}:\u{2003}[AUTH_HEADER]",
+            ),
+        ] {
+            assert_eq!(
+                reference.redact(command),
+                expected,
+                "Unicode fixture: {command}"
+            );
+            assert_eq!(compiled.redact(command), expected, "{command}");
+        }
+
+        for length in [
+            0, 1, 7, 8, 15, 16, 19, 20, 21, 22, 34, 35, 36, 39, 40, 64, 65,
+        ] {
+            let value = "a".repeat(length);
+            for prefix in ["sk-", "glpat-", "npm_", "api_key=", "password=", "xoxb-"] {
+                let command = format!("run {prefix}{value} next");
+                assert_eq!(
+                    compiled.redact(&command),
+                    reference.redact(&command),
+                    "{command}"
+                );
+            }
+        }
+        for command in [
+            "secret=[SECRET] password=[PASSWORD]",
+            "PASSWORD='first\nsecond'",
+            "PASSWORD='unterminated",
+            "💬postgres://user:synthetic@host",
+            "λpostgres://user:synthetic@host",
+            "[AUTH_HEADER] https://[URL_CREDENTIALS]@host",
+        ] {
+            assert_eq!(
+                compiled.redact(command),
+                reference.redact(command),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_patterns_keep_filtered_indices_and_original_input_selection() {
+        const PATTERNS: &[(&str, &str)] = &[
+            ("(", "[BROKEN]"),
+            ("alpha", "beta"),
+            ("beta", "[BETA]"),
+            ("[", "[ALSO_BROKEN]"),
+        ];
+        let compiled = Compiled::new(PATTERNS);
+        let reference = EagerReference::new(PATTERNS);
+        assert_eq!(compiled.patterns.len(), 2);
+        assert!(compiled.set.is_some());
+        assert_eq!(compiled.redact("alpha"), "beta");
+        for command in ["alpha", "alpha beta", "beta alpha", "ordinary"] {
+            assert_eq!(
+                compiled.redact(command),
+                reference.redact(command),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_regex_set_preserves_ordered_fallback() {
+        let patterns = [("(", "broken"), ("alpha", "beta"), ("beta", "[BETA]")];
+        let mut compiled = Compiled::new(&patterns);
+        let mut reference = EagerReference::new(&patterns);
+        // Model a combined-program build failure without allocating a huge
+        // regex. Both implementations must then run all valid patterns in
+        // order, including a later match introduced by a replacement.
+        compiled.set = None;
+        reference.set = None;
+        assert_eq!(compiled.redact("alpha"), "[BETA]");
+        for command in ["alpha", "alpha beta", "beta alpha", "ordinary"] {
+            assert_eq!(
+                compiled.redact(command),
+                reference.redact(command),
+                "{command}"
+            );
+        }
+    }
 
     /// Every shipped pattern must compile; `redact_secrets` silently drops the
     /// ones that do not, which would be a silent loss of coverage.

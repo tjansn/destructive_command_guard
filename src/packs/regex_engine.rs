@@ -102,6 +102,7 @@ impl CompiledRegex {
     /// # Errors
     /// Returns an error if the pattern fails to compile.
     pub fn new_with_backtrack_limit(pattern: &str, limit: usize) -> Result<Self, String> {
+        let _phase = crate::perf::phase(crate::perf::ProfilePhase::RegexCompile);
         let pattern = canonical_pattern(pattern);
         if needs_backtracking_engine(pattern) {
             fancy_regex::RegexBuilder::new(pattern)
@@ -135,6 +136,7 @@ impl CompiledRegex {
     /// Returns an error if the pattern uses features not supported by the
     /// linear-time engine (lookahead, lookbehind, backreferences).
     pub fn new_linear(pattern: &str) -> Result<Self, String> {
+        let _phase = crate::perf::phase(crate::perf::ProfilePhase::RegexCompile);
         regex::Regex::new(pattern)
             .map(Self::Linear)
             .map_err(|e| format!("regex compile error: {e}"))
@@ -145,6 +147,7 @@ impl CompiledRegex {
     /// # Errors
     /// Returns an error if the pattern fails to compile.
     pub fn new_backtracking(pattern: &str) -> Result<Self, String> {
+        let _phase = crate::perf::phase(crate::perf::ProfilePhase::RegexCompile);
         fancy_regex::RegexBuilder::new(pattern)
             .backtrack_limit(BACKTRACK_LIMIT)
             .build()
@@ -157,6 +160,7 @@ impl CompiledRegex {
     /// For backtracking engine, returns `false` on regex execution errors.
     #[must_use]
     pub fn is_match(&self, text: &str) -> bool {
+        let _phase = crate::perf::phase(crate::perf::ProfilePhase::RegexMatch);
         match self {
             Self::Linear(re) => re.is_match(text),
             Self::Backtracking(re) => re.is_match(text).unwrap_or(false),
@@ -168,6 +172,7 @@ impl CompiledRegex {
     /// Returns the start and end byte offsets of the match.
     #[must_use]
     pub fn find(&self, text: &str) -> Option<(usize, usize)> {
+        let _phase = crate::perf::phase(crate::perf::ProfilePhase::RegexMatch);
         match self {
             Self::Linear(re) => re.find(text).map(|m| (m.start(), m.end())),
             Self::Backtracking(re) => re.find(text).ok().flatten().map(|m| (m.start(), m.end())),
@@ -184,6 +189,7 @@ impl CompiledRegex {
         if start > text.len() || !text.is_char_boundary(start) {
             return None;
         }
+        let _phase = crate::perf::phase(crate::perf::ProfilePhase::RegexMatch);
         match self {
             Self::Linear(re) => re.find_at(text, start).map(|m| (m.start(), m.end())),
             Self::Backtracking(re) => re
@@ -215,6 +221,7 @@ impl CompiledRegex {
     /// For backtracking engine, falls back to original text on execution errors.
     #[must_use]
     pub fn replacen<'t>(&self, text: &'t str, limit: usize, rep: &str) -> Cow<'t, str> {
+        let _phase = crate::perf::phase(crate::perf::ProfilePhase::RegexMatch);
         match self {
             Self::Linear(re) => re.replacen(text, limit, rep),
             // Use try_replacen to handle errors gracefully (returns Result)
@@ -317,9 +324,92 @@ pub fn needs_backtracking_engine(pattern: &str) -> bool {
 pub struct LazyCompiledRegex {
     pattern: PatternText,
     compiled: OnceLock<Result<CompiledRegex, String>>,
+    // Opted-in static safe patterns can prove a miss before paying for their
+    // backtracking VM. An unknown proof always retains the ordinary engine.
+    anchored_prefix: Option<OnceLock<Option<Box<str>>>>,
     // Only rules needing a whole-command preview proof allocate this state.
     // Ordinary pack patterns retain their allocation-free constructors.
     exclusion: Option<Box<LinearFullMatchExclusion>>,
+}
+
+/// Derive only a mandatory literal at the absolute beginning of the input.
+/// This is regex syntax analysis, independent of shell quoting or command
+/// names. The complete original regex still decides every possible match.
+fn required_anchored_prefix(pattern: &str) -> Option<Box<str>> {
+    const MAX_PATTERN_BYTES: usize = 8 * 1024;
+    const MAX_NODES: usize = 4096;
+    if pattern.len() > MAX_PATTERN_BYTES {
+        return None;
+    }
+
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::RegexCompile);
+    let tree = fancy_regex::Expr::parse_tree(pattern).ok()?;
+    let mut remaining = MAX_NODES;
+    if !supports_anchored_prefix_proof(&tree.expr, &mut remaining, 0) {
+        return None;
+    }
+    let fancy_regex::Expr::Concat(parts) = &tree.expr else {
+        return None;
+    };
+    let (fancy_regex::Expr::Assertion(fancy_regex::Assertion::StartText), tail) =
+        parts.split_first()?
+    else {
+        return None;
+    };
+
+    let mut prefix = String::new();
+    for part in tail {
+        match part {
+            fancy_regex::Expr::Literal { val, casei: false } => prefix.push_str(val),
+            // Supported lookaheads restore the input position. Their nested
+            // syntax was checked above, including every alternative, so a
+            // control verb or other unusual construct cannot bypass a later
+            // literal. Assertions and empty expressions consume no input.
+            fancy_regex::Expr::LookAround(_, _)
+            | fancy_regex::Expr::Assertion(_)
+            | fancy_regex::Expr::Empty => {}
+            _ => break,
+        }
+    }
+    (!prefix.is_empty()).then(|| prefix.into_boxed_str())
+}
+
+/// Stay within ordinary regex syntax whose successful concatenation must
+/// execute every term in order. This deliberately excludes control verbs,
+/// keep-out, lookbehind, backreferences, subroutines, conditional expressions,
+/// and unfamiliar nodes instead of attempting a proof of their semantics.
+fn supports_anchored_prefix_proof(
+    expression: &fancy_regex::Expr,
+    remaining: &mut usize,
+    depth: usize,
+) -> bool {
+    use fancy_regex::{Assertion, Expr, LookAround};
+
+    if depth > 64 || *remaining == 0 {
+        return false;
+    }
+    *remaining -= 1;
+    match expression {
+        Expr::Empty
+        | Expr::Any { .. }
+        | Expr::Literal { casei: false, .. }
+        | Expr::Delegate { casei: false, .. }
+        | Expr::Assertion(
+            Assertion::StartText
+            | Assertion::EndText
+            | Assertion::WordBoundary
+            | Assertion::NotWordBoundary,
+        ) => true,
+        Expr::Concat(children) | Expr::Alt(children) => children
+            .iter()
+            .all(|child| supports_anchored_prefix_proof(child, remaining, depth + 1)),
+        Expr::Group(child) => supports_anchored_prefix_proof(child, remaining, depth + 1),
+        Expr::Repeat { child, .. }
+        | Expr::LookAround(child, LookAround::LookAhead | LookAround::LookAheadNeg) => {
+            supports_anchored_prefix_proof(child, remaining, depth + 1)
+        }
+        _ => false,
+    }
 }
 
 /// A positive, full-input proof that a destructive candidate is exempt.
@@ -333,8 +423,12 @@ struct LinearFullMatchExclusion {
 
 impl LinearFullMatchExclusion {
     fn is_match(&self, haystack: &str) -> bool {
-        self.compiled
-            .get_or_init(|| regex::Regex::new(&format!(r"\A(?:{})\z", self.pattern)))
+        let compiled = self.compiled.get_or_init(|| {
+            let _phase = crate::perf::phase(crate::perf::ProfilePhase::RegexCompile);
+            regex::Regex::new(&format!(r"\A(?:{})\z", self.pattern))
+        });
+        let _phase = crate::perf::phase(crate::perf::ProfilePhase::RegexMatch);
+        compiled
             .as_ref()
             .is_ok_and(|regex| regex.is_match(haystack))
     }
@@ -365,6 +459,7 @@ impl LazyCompiledRegex {
         Self {
             pattern: PatternText::Static(canonical_static_pattern(pattern)),
             compiled: OnceLock::new(),
+            anchored_prefix: None,
             exclusion: None,
         }
     }
@@ -381,8 +476,31 @@ impl LazyCompiledRegex {
         Self {
             pattern,
             compiled: OnceLock::new(),
+            anchored_prefix: None,
             exclusion: None,
         }
+    }
+
+    /// Opt a statically authored safe pattern into a necessary-prefix proof.
+    /// Dynamic patterns and the public constructors keep their existing lazy
+    /// compile/error behavior. Only a successful, narrowly supported AST
+    /// proof may avoid compilation; uncertainty uses the original regex.
+    pub(crate) fn enable_anchored_prefix_filter(&mut self) {
+        if matches!(&self.pattern, PatternText::Static(_))
+            && self.as_str().starts_with('^')
+            && needs_backtracking_engine(self.as_str())
+        {
+            self.anchored_prefix = Some(OnceLock::new());
+        }
+    }
+
+    fn prefix_may_match(&self, haystack: &str) -> bool {
+        self.anchored_prefix.as_ref().is_none_or(|prefix| {
+            prefix
+                .get_or_init(|| required_anchored_prefix(self.as_str()))
+                .as_deref()
+                .is_none_or(|required| haystack.starts_with(required))
+        })
     }
 
     /// Attach a positive exemption proof to a destructive pattern (#435).
@@ -438,8 +556,10 @@ impl LazyCompiledRegex {
     /// Returns `false` on candidate regex execution or compile errors.
     #[must_use]
     pub fn is_match(&self, haystack: &str) -> bool {
-        self.get_compiled()
-            .is_some_and(|compiled| compiled.is_match(haystack))
+        self.prefix_may_match(haystack)
+            && self
+                .get_compiled()
+                .is_some_and(|compiled| compiled.is_match(haystack))
             && !self.is_excluded(haystack)
     }
 
@@ -448,6 +568,9 @@ impl LazyCompiledRegex {
     /// Returns `None` if no match or on candidate execution/compile error.
     #[must_use]
     pub fn find(&self, haystack: &str) -> Option<(usize, usize)> {
+        if !self.prefix_may_match(haystack) {
+            return None;
+        }
         let span = self.get_compiled()?.find(haystack)?;
         (!self.is_excluded(haystack)).then_some(span)
     }
@@ -458,6 +581,9 @@ impl LazyCompiledRegex {
     /// Returns `None` if no match exists or on candidate execution/compile error.
     #[must_use]
     pub fn find_from(&self, haystack: &str, start: usize) -> Option<(usize, usize)> {
+        if !self.prefix_may_match(haystack) {
+            return None;
+        }
         let span = self.get_compiled()?.find_from(haystack, start)?;
         (!self.is_excluded(haystack)).then_some(span)
     }
@@ -486,6 +612,341 @@ impl std::fmt::Display for LazyCompiledRegex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_same_regex_results(
+        candidate: &LazyCompiledRegex,
+        reference: &CompiledRegex,
+        text: &str,
+    ) {
+        assert_eq!(
+            candidate.is_match(text),
+            reference.is_match(text),
+            "{text:?}"
+        );
+        assert_eq!(candidate.find(text), reference.find(text), "{text:?}");
+        for start in (0..=text.len() + 1).chain(std::iter::once(usize::MAX)) {
+            assert_eq!(
+                candidate.find_from(text, start),
+                reference.find_from(text, start),
+                "pattern={:?}, text={text:?}, start={start}",
+                candidate.as_str(),
+            );
+        }
+    }
+
+    #[test]
+    fn anchored_prefix_proof_accepts_only_supported_absolute_prefixes_issue_555() {
+        for (pattern, prefix) in [
+            (r"^rm(?=\s)\s+.+$", "rm"),
+            (r"^(?!bad)(?=(?:rm|mv))rm\s+.+$", "rm"),
+            (r"^r(?:m|f)(?!bad)", "r"),
+            (r"^rm\.(?!x)\[tmp\]", "rm.[tmp]"),
+            (r"^\x72m(?=\s)", "rm"),
+            (r"^雪λ(?=\s)\s+.+$", "雪λ"),
+            (r"^rm(?:(?!x).)*$", "rm"),
+        ] {
+            assert_eq!(required_anchored_prefix(pattern).as_deref(), Some(prefix));
+        }
+
+        for pattern in [
+            r"^rm|find(?!bad)",
+            r"^(?:rm|find)(?!bad)",
+            r"^(rm)?find(?!bad)",
+            r"^r{0,2}m(?!bad)",
+            r"(?i)^rm(?!bad)",
+            r"^(?i)rm(?!bad)",
+            r"(?m)^rm(?!bad)",
+            r"^(?m:rm$)(?!bad)",
+            r"^(?=a\Kb)rm",
+            r"^rm\K(?=x)x",
+            r"^(?=(*ACCEPT))rm",
+            r"^(?!(*SKIP))rm",
+            r"^rm(*FAIL)",
+            r"^(?<=x)rm(?!bad)",
+            r"^(?<!(?:x|yy))rm(?!bad)",
+            r"^rm\G(?!bad)",
+            r"^(?(?=rm)rm|find)(?!bad)",
+            r"^(rm)\1(?!bad)",
+            r"^(?<head>rm)(?&head)(?!bad)",
+            r"^rm(?~bad)(?!x)",
+            r"^rm(?>x)(?!bad)",
+            r"^rm(?=unclosed",
+            r"^rm(?=x)\2",
+            r"rm(?!bad)",
+            r"^(?!bad)",
+        ] {
+            assert_eq!(required_anchored_prefix(pattern), None, "{pattern}");
+        }
+    }
+
+    #[test]
+    fn anchored_prefix_filter_preserves_regex_language_and_spans_issue_555() {
+        let texts = [
+            "",
+            "ordinary Python data",
+            "rm",
+            "rm /etc",
+            "rm bad",
+            "rm x",
+            "rm.[tmp]",
+            "rmaaa",
+            "rmrm",
+            "rmx",
+            "RM /etc",
+            "find /etc",
+            " rm /etc",
+            "echo rm /etc",
+            "echo\nrm /etc",
+            "rm\n/etc",
+            "rm\r\n/etc",
+            "rm\u{a0}/tmp/雪",
+            "雪λ /etc",
+            "雪λ\n/tmp",
+            "rλ雪m",
+        ];
+        for pattern in [
+            r"^rm(?=\s)\s+.+$",
+            r"^(?!bad)(?=(?:rm|find))rm\s+.+$",
+            r"^r(?:m|f)(?!bad)",
+            r"^rm\.(?!x)\[tmp\]",
+            r"^\x72m(?=\s)",
+            r"^雪λ(?=\s)\s+.+$",
+            r"^rm(?:(?!x).)*$",
+            r"^(?x) r m (?=\s) \s+ .+ $",
+            r"^rm|find(?!bad)",
+            r"^(?:rm|find)(?!bad)",
+            r"^(rm)?find(?!bad)",
+            r"^r{0,2}m(?!bad)",
+            r"(?i)^rm(?!bad)",
+            r"^(?i)rm(?!bad)",
+            r"(?m)^rm(?!bad)",
+            r"^(?m:rm$)(?!bad)",
+            r"^rm\K(?=x)x",
+            r"^(?=rm\K)rm",
+            r"^rm\G(?!bad)",
+            r"^rm(*FAIL)",
+            r"^(?(?=rm)rm|find)(?!bad)",
+            r"^(rm)\1(?!bad)",
+            r"^(?<head>rm)(?&head)(?!bad)",
+            r"^(?<!(?:x|yy))rm(?!bad)",
+            r"^rm(?>x)(?!bad)",
+            r"^(?!bad)",
+        ] {
+            let reference = CompiledRegex::new(pattern);
+            let mut candidate = LazyCompiledRegex::new(pattern);
+            candidate.enable_anchored_prefix_filter();
+            match reference {
+                Ok(reference) => {
+                    for text in texts {
+                        assert_same_regex_results(&candidate, &reference, text);
+                    }
+                }
+                Err(error) => {
+                    // Some advanced constructs are rejected by the pinned
+                    // engine. Preserve its exact compiler error as well as
+                    // the public matching result, rather than assuming every
+                    // possible fallback fixture is a supported regex.
+                    assert_eq!(required_anchored_prefix(pattern), None, "{pattern}");
+                    for text in texts {
+                        assert!(!candidate.is_match(text), "{pattern}: {text:?}");
+                        assert_eq!(candidate.find(text), None);
+                        assert_eq!(candidate.find_from(text, 1), None);
+                    }
+                    assert_eq!(
+                        candidate
+                            .compiled
+                            .get()
+                            .and_then(|value| value.as_ref().err()),
+                        Some(&error),
+                        "{pattern}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn anchored_prefix_filter_keeps_generic_and_unknown_compilation_issue_555() {
+        const PATTERN: &str = r"^rm(?!bad)\s+.+$";
+        let generic = LazyCompiledRegex::new(PATTERN);
+        assert!(!generic.is_match("ordinary data"));
+        assert!(
+            generic.is_compiled(),
+            "the default constructor is unchanged"
+        );
+
+        let mut dynamic = LazyCompiledRegex::new_owned(PATTERN.to_string());
+        dynamic.enable_anchored_prefix_filter();
+        assert!(dynamic.anchored_prefix.is_none());
+        assert!(!dynamic.is_match("ordinary data"));
+        assert!(
+            dynamic.is_compiled(),
+            "owned patterns keep the original engine"
+        );
+
+        for pattern in [r"^rm(?=unclosed", r"^(?=(*ACCEPT))rm", r"^rm(?=x)\2"] {
+            let error = CompiledRegex::new(pattern).expect_err("invalid or unsupported fixture");
+            let mut candidate = LazyCompiledRegex::new(pattern);
+            candidate.enable_anchored_prefix_filter();
+            assert!(!candidate.is_match("ordinary data"));
+            assert_eq!(candidate.find("ordinary data"), None);
+            assert_eq!(candidate.find_from("ordinary data", 1), None);
+            assert_eq!(
+                candidate
+                    .compiled
+                    .get()
+                    .and_then(|result| result.as_ref().err()),
+                Some(&error),
+                "unknown analysis must retain the original compiler error: {pattern}",
+            );
+        }
+    }
+
+    #[test]
+    fn filesystem_safe_prefixes_preserve_all_rules_and_remain_lazy_issue_555() {
+        let pack = crate::packs::core::filesystem::create_pack();
+        let backtracking: Vec<_> = pack
+            .safe_patterns
+            .iter()
+            .filter(|pattern| needs_backtracking_engine(pattern.regex.as_str()))
+            .collect();
+        assert_eq!(
+            backtracking.len(),
+            32,
+            "audited anchored safe-pattern corpus"
+        );
+        for pattern in &backtracking {
+            assert!(!pattern.regex.is_match("value_0 = 'ordinary data'"));
+            assert!(
+                !pattern.regex.is_compiled(),
+                "impossible prefix must avoid VM compilation: {}",
+                pattern.name,
+            );
+        }
+
+        let mut commands = vec![
+            "ordinary Python data".to_string(),
+            "rm -rf /etc".to_string(),
+            "rm -rf /tmp/build/..".to_string(),
+            "rm -rf /tmp/build; rm -rf /etc".to_string(),
+            "echo 'rm -rf /tmp/build'".to_string(),
+            "RM -rf /tmp/build".to_string(),
+            "mv ~/Documents/a ~/Desktop/b".to_string(),
+            "mv 'a file' '/home/u/project/file'".to_string(),
+            "mv ~/Documents/a ~/.Trash/".to_string(),
+        ];
+        for root in ["/tmp", "/var/tmp"] {
+            for flags in [
+                "-rf",
+                "-fr",
+                "-r -f",
+                "-f -r",
+                "--recursive --force",
+                "--force --recursive",
+            ] {
+                commands.push(format!("rm {flags} {root}/build"));
+            }
+            for command in [
+                format!("find {root}/build -delete"),
+                format!("find {root}/build -exec rm -rf {{}} \\;"),
+                format!("unlink {root}/file"),
+                format!("truncate -s 0 {root}/file"),
+                format!("shred {root}/file"),
+                format!("tar --remove-files -cf backup.tar {root}/file"),
+                format!("dd if=/dev/zero of={root}/file"),
+                format!("mv {root}/a {root}/b"),
+            ] {
+                commands.push(command);
+            }
+        }
+        for pattern in backtracking {
+            let reference = CompiledRegex::new(pattern.regex.as_str()).unwrap();
+            for command in &commands {
+                assert_same_regex_results(&pattern.regex, &reference, command);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "paired safe-regex timing; run in release mode with --nocapture"]
+    fn paired_safe_regex_prefix_benchmark_issue_555() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        for lines in [40, 300] {
+            let source: Vec<_> = (0..lines)
+                .map(|line| format!("value_{line} = 'ordinary Python data'"))
+                .collect();
+            for cold in [true, false] {
+                let run = |reference: bool| {
+                    let cold_start = Instant::now();
+                    let pack = crate::packs::core::filesystem::create_pack();
+                    let patterns: Vec<_> = pack
+                        .safe_patterns
+                        .iter()
+                        .filter(|pattern| needs_backtracking_engine(pattern.regex.as_str()))
+                        .collect();
+                    let raw: Vec<_> = if reference {
+                        patterns
+                            .iter()
+                            .map(|pattern| CompiledRegex::new(pattern.regex.as_str()).unwrap())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    if !cold && !reference {
+                        for pattern in &patterns {
+                            assert!(!pattern.regex.is_match(&source[0]));
+                        }
+                    }
+                    let mut results = Vec::with_capacity(source.len());
+                    let start = if cold { cold_start } else { Instant::now() };
+                    for line in &source {
+                        results.push(if reference {
+                            raw.iter().any(|pattern| pattern.is_match(black_box(line)))
+                        } else {
+                            patterns
+                                .iter()
+                                .any(|pattern| pattern.regex.is_match(black_box(line)))
+                        });
+                    }
+                    let elapsed = start.elapsed();
+                    let compiled = if reference {
+                        raw.len()
+                    } else {
+                        patterns
+                            .iter()
+                            .filter(|pattern| pattern.regex.is_compiled())
+                            .count()
+                    };
+                    (elapsed, results, compiled)
+                };
+                let mut reference_times = Vec::new();
+                let mut candidate_times = Vec::new();
+                for sample in 0..7 {
+                    for reference in [sample % 2 == 0, sample % 2 != 0] {
+                        let (elapsed, results, compiled) = run(reference);
+                        assert_eq!(results, vec![false; lines]);
+                        assert_eq!(compiled, if reference { 32 } else { 0 });
+                        if reference {
+                            reference_times.push(elapsed);
+                        } else {
+                            candidate_times.push(elapsed);
+                        }
+                    }
+                }
+                reference_times.sort_unstable();
+                candidate_times.sort_unstable();
+                eprintln!(
+                    "safe_regex_prefix/{}/{lines}: raw_p50_ms={:.3} candidate_p50_ms={:.3} speedup={:.2}x raw_compiled=32 candidate_compiled=0",
+                    if cold { "cold" } else { "warm" },
+                    reference_times[3].as_secs_f64() * 1_000.0,
+                    candidate_times[3].as_secs_f64() * 1_000.0,
+                    reference_times[3].as_secs_f64() / candidate_times[3].as_secs_f64(),
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_linear_engine_selection() {

@@ -21,8 +21,8 @@ use std::fmt::Write as _;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use destructive_command_guard::packs::{REGISTRY, pack_aware_quick_reject};
 use destructive_command_guard::{
-    Config, ExtractionLimits, ScriptLanguage, check_triggers, evaluate_command_with_pack_order,
-    extract_content, extract_shell_commands, matched_triggers,
+    AstMatcher, Config, ExtractionLimits, ExtractionResult, ScriptLanguage, check_triggers,
+    evaluate_command_with_pack_order, extract_content, extract_shell_commands, matched_triggers,
 };
 use std::hint::black_box;
 
@@ -519,6 +519,160 @@ fn bench_full_pipeline(c: &mut Criterion) {
 }
 
 // =============================================================================
+// #555: Size-scaled executable heredocs, AST traversal, and literal data
+// =============================================================================
+
+fn python_lines(lines: usize, calls: bool) -> String {
+    let mut body = String::new();
+    for index in 0..lines {
+        if calls {
+            writeln!(body, "print({index})").expect("write benchmark fixture");
+        } else {
+            writeln!(body, "value_{index} = {index}").expect("write benchmark fixture");
+        }
+    }
+    body
+}
+
+fn bench_issue_555_ast(c: &mut Criterion) {
+    let mut group = c.benchmark_group("issue_555_ast");
+    let matcher = AstMatcher::new();
+    for lines in [40, 300] {
+        let cases = [
+            ("assignments", python_lines(lines, false), false),
+            ("benign_calls", python_lines(lines, true), false),
+            (
+                "late_nested_delete",
+                format!(
+                    "{}import shutil\ndef clean():\n    shutil.rmtree('/home/user/project')\nclean()\n",
+                    python_lines(lines, true)
+                ),
+                true,
+            ),
+        ];
+        for (shape, source, denied) in cases {
+            group.bench_with_input(
+                BenchmarkId::new(format!("warm_{shape}"), lines),
+                &source,
+                |b, source| {
+                    b.iter(|| {
+                        let matches = matcher
+                            .find_matches(black_box(source), ScriptLanguage::Python)
+                            .expect("AST benchmark must complete its security analysis");
+                        assert_eq!(
+                            matches.iter().any(|hit| hit.severity.blocks_by_default()),
+                            denied
+                        );
+                        black_box(matches)
+                    });
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new(format!("cold_{shape}"), lines),
+                &source,
+                |b, source| {
+                    b.iter(|| {
+                        // A fresh matcher includes the corpus construction
+                        // paid by a new hook process, without process startup.
+                        let matches = AstMatcher::new()
+                            .find_matches(black_box(source), ScriptLanguage::Python)
+                            .expect("cold AST benchmark must complete its security analysis");
+                        assert_eq!(
+                            matches.iter().any(|hit| hit.severity.blocks_by_default()),
+                            denied
+                        );
+                        black_box(matches)
+                    });
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+fn bench_issue_555_pipeline(c: &mut Criterion) {
+    let mut group = c.benchmark_group("issue_555_pipeline");
+    let config = Config::default();
+    let inputs = build_hook_inputs(&config);
+    let allowlists = destructive_command_guard::LayeredAllowlist::default();
+    let limits = ExtractionLimits::default();
+    let mut cases = vec![
+        ("short_ls".to_string(), "ls -la".to_string(), false),
+        (
+            "compound_pipeline".to_string(),
+            "pwd && git status --short; printf '%s\\n' ready | head -n 1".to_string(),
+            false,
+        ),
+    ];
+    for lines in [40, 300] {
+        let body = python_lines(lines, true);
+        let danger = "import shutil\nshutil.rmtree('/home/user/project')\n";
+        for (shape, content, denied) in [
+            ("safe", body.clone(), false),
+            ("deny_start", format!("{danger}{body}"), true),
+            ("deny_end", format!("{body}{danger}"), true),
+        ] {
+            cases.push((
+                format!("python_{lines}_{shape}"),
+                format!("python3 - <<'PY'\n{content}PY"),
+                denied,
+            ));
+        }
+        let data = "Document `git reset --hard` and $(rm -rf /); an odd \" quote\n".repeat(lines);
+        cases.push((
+            format!("quoted_data_{lines}"),
+            format!("cat <<'TEXT'\n{data}TEXT"),
+            false,
+        ));
+        cases.push((
+            format!("commit_message_{lines}"),
+            format!("git commit -m \"$(cat <<'TEXT'\n{data}TEXT\n)\""),
+            false,
+        ));
+    }
+    for (name, command, denied) in cases {
+        group.bench_with_input(
+            BenchmarkId::new("evaluate", &name),
+            &command,
+            |b, command| {
+                b.iter(|| {
+                    let result = evaluate_command_with_pack_order(
+                        black_box(command),
+                        &inputs.enabled_keywords,
+                        &inputs.ordered_packs,
+                        inputs.keyword_index.as_ref(),
+                        &inputs.compiled_overrides,
+                        &allowlists,
+                        &inputs.heredoc_settings,
+                    );
+                    assert_eq!(result.is_denied(), denied);
+                    assert_eq!(result.is_allowed(), !denied);
+                    black_box(result)
+                });
+            },
+        );
+        if name.starts_with("python_") {
+            group.bench_with_input(
+                BenchmarkId::new("extract", &name),
+                &command,
+                |b, command| {
+                    b.iter(|| {
+                        let ExtractionResult::Extracted(contents) =
+                            extract_content(black_box(command), &limits)
+                        else {
+                            panic!("heredoc extraction must complete");
+                        };
+                        assert!(!contents.is_empty());
+                        black_box(contents)
+                    });
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+// =============================================================================
 // Criterion Setup
 // =============================================================================
 
@@ -531,6 +685,8 @@ criterion_group!(
     bench_shell_extraction,
     bench_language_detection,
     bench_full_pipeline,
+    bench_issue_555_ast,
+    bench_issue_555_pipeline,
 );
 
 criterion_main!(benches);

@@ -31,7 +31,423 @@
 //! it never turns incomplete analysis into a silent allow.
 //! This ensures dcg never blocks a user's workflow indefinitely.
 
+use std::cell::RefCell;
+use std::io::Write;
+use std::marker::PhantomData;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
+
+// =============================================================================
+// Opt-in hook phase profiling
+// =============================================================================
+
+/// A measured hook operation. Timings are diagnostic wall time, never budgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum ProfilePhase {
+    /// Waiting for and reading the hook envelope from stdin.
+    InputRead,
+    /// Decoding and parsing the hook envelope, including fallback parsing.
+    RequestParse,
+    /// Loading configuration and detecting the invoking agent.
+    ConfigLoad,
+    /// Per-request setup, including allowlists and enabled-pack indexes.
+    RequestSetup,
+    /// Verifying or repairing hook registration.
+    SelfHeal,
+    /// Complete safety evaluation, including recursive command evaluation.
+    Evaluation,
+    /// Shell normalization and data masking before pattern evaluation.
+    Normalization,
+    /// Detecting constructs that require embedded-code analysis.
+    HeredocDetect,
+    /// Extracting embedded executable or data content.
+    HeredocExtract,
+    /// Evaluating enabled pack patterns and their semantic checks.
+    PatternEvaluation,
+    /// Selecting candidate packs with the existing keyword and semantic gates.
+    PatternSelection,
+    /// Preparing source views and segment ranges for selected packs.
+    PatternPreparation,
+    /// Compiling and evaluating a selected pack's rules.
+    PatternRules,
+    /// Tokenizing raw shell syntax for normalization and semantic checks.
+    ShellTokenization,
+    /// Splitting shell execution domains and nested substitutions.
+    ShellSegmentation,
+    /// Proving and masking non-executable heredoc data.
+    HeredocMasking,
+    /// Compiling a shell pack regex on first use.
+    RegexCompile,
+    /// Matching a compiled shell pack regex.
+    RegexMatch,
+    /// Parsing source into a tree-sitter AST.
+    AstParse,
+    /// Compiling ast-grep structural patterns.
+    AstPatternCompile,
+    /// Matching AST patterns, or awaiting that work on the hook thread.
+    AstMatch,
+    /// Resolving and opening the history store and starting its worker.
+    HistoryInit,
+    /// Constructing and queueing history entries.
+    HistoryRecord,
+    /// Explicit history flushes and the bounded wait during writer drop.
+    HistoryFlush,
+}
+
+const PROFILE_PHASES: [(ProfilePhase, &str); 24] = [
+    (ProfilePhase::InputRead, "input_read"),
+    (ProfilePhase::RequestParse, "request_parse"),
+    (ProfilePhase::ConfigLoad, "config_load"),
+    (ProfilePhase::RequestSetup, "request_setup"),
+    (ProfilePhase::SelfHeal, "self_heal"),
+    (ProfilePhase::Evaluation, "evaluation"),
+    (ProfilePhase::Normalization, "normalization"),
+    (ProfilePhase::HeredocDetect, "heredoc_detect"),
+    (ProfilePhase::HeredocExtract, "heredoc_extract"),
+    (ProfilePhase::PatternEvaluation, "pattern_evaluation"),
+    (ProfilePhase::PatternSelection, "pattern_selection"),
+    (ProfilePhase::PatternPreparation, "pattern_preparation"),
+    (ProfilePhase::PatternRules, "pattern_rules"),
+    (ProfilePhase::ShellTokenization, "shell_tokenization"),
+    (ProfilePhase::ShellSegmentation, "shell_segmentation"),
+    (ProfilePhase::HeredocMasking, "heredoc_masking"),
+    (ProfilePhase::RegexCompile, "regex_compile"),
+    (ProfilePhase::RegexMatch, "regex_match"),
+    (ProfilePhase::AstParse, "ast_parse"),
+    (ProfilePhase::AstPatternCompile, "ast_pattern_compile"),
+    (ProfilePhase::AstMatch, "ast_match"),
+    (ProfilePhase::HistoryInit, "history_init"),
+    (ProfilePhase::HistoryRecord, "history_record"),
+    (ProfilePhase::HistoryFlush, "history_flush"),
+];
+
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+struct PhaseMeasurement {
+    calls: u64,
+    completed_calls: u64,
+    elapsed_ns: u64,
+    exclusive_ns: u64,
+}
+
+#[derive(Default)]
+struct ProfileMeasurements {
+    main: [PhaseMeasurement; PROFILE_PHASES.len()],
+    workers: [PhaseMeasurement; PROFILE_PHASES.len()],
+}
+
+struct PhaseFrame {
+    phase: ProfilePhase,
+    started: Instant,
+    children: Duration,
+}
+
+struct ThreadProfile {
+    shared: Arc<Mutex<ProfileMeasurements>>,
+    started: Instant,
+    worker: bool,
+    stack: Vec<PhaseFrame>,
+}
+
+impl ThreadProfile {
+    fn begin(&mut self, phase: ProfilePhase, now: Instant) -> usize {
+        let mut measurements = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        let rows = if self.worker {
+            &mut measurements.workers
+        } else {
+            &mut measurements.main
+        };
+        rows[phase as usize].calls += 1;
+        let depth = self.stack.len();
+        self.stack.push(PhaseFrame {
+            phase,
+            started: now,
+            children: Duration::ZERO,
+        });
+        depth
+    }
+
+    fn end(&mut self, now: Instant) {
+        let Some(frame) = self.stack.pop() else {
+            return;
+        };
+        let elapsed = now.saturating_duration_since(frame.started);
+        if let Some(parent) = self.stack.last_mut() {
+            parent.children = parent.children.saturating_add(elapsed);
+        }
+        let mut measurements = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        let rows = if self.worker {
+            &mut measurements.workers
+        } else {
+            &mut measurements.main
+        };
+        let row = &mut rows[frame.phase as usize];
+        row.completed_calls += 1;
+        row.elapsed_ns = row.elapsed_ns.saturating_add(duration_ns(elapsed));
+        row.exclusive_ns = row
+            .exclusive_ns
+            .saturating_add(duration_ns(elapsed.saturating_sub(frame.children)));
+    }
+
+    fn end_open_phases(&mut self, now: Instant) {
+        while !self.stack.is_empty() {
+            self.end(now);
+        }
+    }
+}
+
+thread_local! {
+    // An absent collector is the whole disabled path: no clock, environment
+    // lookup, lock, or allocation is performed at an instrumented call site.
+    static THREAD_PROFILE: RefCell<Option<ThreadProfile>> = const { RefCell::new(None) };
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// RAII phase measurement. Keep guards lexically nested on their origin thread.
+#[must_use = "dropping the guard ends the measurement"]
+pub struct PhaseGuard {
+    active: Option<(Arc<Mutex<ProfileMeasurements>>, usize)>,
+    // A span must end on the thread whose stack it entered.
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+/// Measure a phase only when hook profiling is active on this thread.
+#[inline]
+pub fn phase(phase: ProfilePhase) -> PhaseGuard {
+    let active = THREAD_PROFILE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let profile = slot.as_mut()?;
+        let depth = profile.begin(phase, Instant::now());
+        Some((Arc::clone(&profile.shared), depth))
+    });
+    PhaseGuard {
+        active,
+        _thread_bound: PhantomData,
+    }
+}
+
+impl Drop for PhaseGuard {
+    fn drop(&mut self) {
+        let Some((shared, depth)) = self.active.as_ref() else {
+            return;
+        };
+        THREAD_PROFILE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if let Some(profile) = slot.as_mut() {
+                if Arc::ptr_eq(shared, &profile.shared) && profile.stack.len() == depth + 1 {
+                    profile.end(Instant::now());
+                }
+            }
+        });
+    }
+}
+
+/// Captured profiling context for a bounded AST worker.
+///
+/// Worker wall times are reported separately because they overlap the hook
+/// thread's wait. They are not CPU measurements or additions to hook wall time.
+pub struct ProfileContext {
+    shared: Option<Arc<Mutex<ProfileMeasurements>>>,
+}
+
+/// Capture the current optional collector before spawning a worker thread.
+#[must_use]
+pub fn capture_profile() -> ProfileContext {
+    ProfileContext {
+        shared: THREAD_PROFILE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|profile| Arc::clone(&profile.shared))
+        }),
+    }
+}
+
+impl ProfileContext {
+    /// Attach this collector for the worker's lifetime.
+    pub fn enter(self) -> WorkerProfileGuard {
+        let previous =
+            self.shared.map_or(PreviousProfile::Inactive, |shared| {
+                match THREAD_PROFILE.with(|slot| {
+                    slot.replace(Some(ThreadProfile {
+                        shared,
+                        started: Instant::now(),
+                        worker: true,
+                        stack: Vec::new(),
+                    }))
+                }) {
+                    Some(profile) => PreviousProfile::Context(profile),
+                    None => PreviousProfile::NoContext,
+                }
+            });
+        WorkerProfileGuard {
+            previous,
+            _thread_bound: PhantomData,
+        }
+    }
+}
+
+enum PreviousProfile {
+    /// No collector was attached, so dropping the guard changes nothing.
+    Inactive,
+    /// A collector was attached to a previously unprofiled thread.
+    NoContext,
+    /// A collector temporarily replaced this thread's previous context.
+    Context(ThreadProfile),
+}
+
+/// Restores the worker thread's previous optional profiling context on drop.
+#[must_use = "keep the guard alive while the worker is running"]
+pub struct WorkerProfileGuard {
+    previous: PreviousProfile,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+impl Drop for WorkerProfileGuard {
+    fn drop(&mut self) {
+        let previous = match std::mem::replace(&mut self.previous, PreviousProfile::Inactive) {
+            PreviousProfile::Inactive => return,
+            PreviousProfile::NoContext => None,
+            PreviousProfile::Context(profile) => Some(profile),
+        };
+        if let Some(mut profile) = THREAD_PROFILE.with(|slot| slot.replace(previous)) {
+            profile.end_open_phases(Instant::now());
+        }
+    }
+}
+
+/// Opt-in, one-invocation hook diagnostics (`DCG_PROFILE=1`).
+///
+/// Start after CLI dispatch. On return, emit one `DCG_PROFILE `-prefixed JSON
+/// line to stderr. The interval excludes process startup and CLI setup, but
+/// includes stdin waiting (`input_read`) and the history writer's bounded
+/// shutdown wait. It never includes command text or paths. Robot mode keeps
+/// its stderr-silent contract by passing `false` to [`Self::from_env`].
+#[must_use = "keep the profiler alive until hook shutdown"]
+pub struct HookProfile {
+    active: bool,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+impl HookProfile {
+    /// Start profiling when stderr is allowed and `DCG_PROFILE` is exactly `1`.
+    pub fn from_env(stderr_allowed: bool) -> Self {
+        Self::start(stderr_allowed && std::env::var_os("DCG_PROFILE").is_some_and(|v| v == "1"))
+    }
+
+    fn start(enabled: bool) -> Self {
+        let active = enabled
+            && THREAD_PROFILE.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.is_some() {
+                    return false;
+                }
+                *slot = Some(ThreadProfile {
+                    shared: Arc::new(Mutex::new(ProfileMeasurements::default())),
+                    started: Instant::now(),
+                    worker: false,
+                    stack: Vec::new(),
+                });
+                true
+            });
+        Self {
+            active,
+            _thread_bound: PhantomData,
+        }
+    }
+}
+
+impl Drop for HookProfile {
+    fn drop(&mut self) {
+        if self.active {
+            finish_hook_profile();
+        }
+    }
+}
+
+fn profile_json(profile: &ThreadProfile, now: Instant) -> serde_json::Value {
+    let measurements = profile
+        .shared
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let rows_json = |rows: &[PhaseMeasurement; PROFILE_PHASES.len()]| {
+        PROFILE_PHASES
+            .iter()
+            .map(|(phase, name)| {
+                (
+                    (*name).to_string(),
+                    serde_json::json!(rows[*phase as usize]),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>()
+    };
+    let total_ns = duration_ns(now.saturating_duration_since(profile.started));
+    let measured_ns = measurements
+        .main
+        .iter()
+        .fold(0_u64, |sum, row| sum.saturating_add(row.exclusive_ns));
+    serde_json::json!({
+        "schema_version": 1,
+        "clock": "monotonic_wall",
+        "scope": "hook",
+        "total_ns": total_ns,
+        "uninstrumented_ns": total_ns.saturating_sub(measured_ns),
+        "phases": rows_json(&measurements.main),
+        "worker_phases": rows_json(&measurements.workers),
+    })
+}
+
+/// Flush hook diagnostics before `process::exit`, which skips RAII drops.
+///
+/// Calling this twice is harmless. Open main-thread phases end at this point;
+/// a detached worker may still have `calls > completed_calls`. Worker elapsed
+/// times include only completed calls, so an unfinished analysis is visible
+/// instead of being represented as a completed zero-cost phase.
+pub fn finish_hook_profile() {
+    let Some(mut profile) = THREAD_PROFILE.with(|slot| slot.borrow_mut().take()) else {
+        return;
+    };
+    let now = Instant::now();
+    profile.end_open_phases(now);
+    let report = profile_json(&profile, now);
+    // A broken diagnostics pipe must never panic or change the wire decision.
+    let _ = writeln!(std::io::stderr().lock(), "DCG_PROFILE {report}");
+}
+
+/// Opt-in, command-free phase measurements for `DCG_LOG=dcg_perf=debug`.
+///
+/// Durations are inclusive wall time, so nested phases must not be summed.
+/// Disabled measurements do not read the clock. Storage runs on a separate
+/// thread; its timings can overlap evaluation and the shutdown wait. These
+/// tracing events are independent of the optional [`HookProfile`] report.
+pub struct PhaseTimer {
+    phase: &'static str,
+    started: Option<Instant>,
+}
+
+impl PhaseTimer {
+    /// Start a measurement only when the dedicated tracing target is enabled.
+    #[must_use]
+    pub fn start(phase: &'static str) -> Self {
+        Self {
+            phase,
+            started: tracing::enabled!(target: "dcg_perf", tracing::Level::DEBUG)
+                .then(Instant::now),
+        }
+    }
+}
+
+impl Drop for PhaseTimer {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            tracing::debug!(target: "dcg_perf", phase = self.phase,
+                elapsed_us = started.elapsed().as_micros(), "hook phase");
+        }
+    }
+}
 
 /// Performance budget for a single operation tier.
 #[derive(Debug, Clone, Copy)]
@@ -341,6 +757,152 @@ pub const MIN_HOOK_TIMEOUT_MS: u64 = 10;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_thread_profile(shared: Arc<Mutex<ProfileMeasurements>>, worker: bool) -> ThreadProfile {
+        ThreadProfile {
+            shared,
+            started: Instant::now(),
+            worker,
+            stack: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn disabled_profile_has_no_collector_or_worker_context() {
+        let _profile = HookProfile::start(false);
+        let guard = phase(ProfilePhase::Evaluation);
+        assert!(guard.active.is_none());
+        let context = capture_profile();
+        assert!(context.shared.is_none());
+        let worker = context.enter();
+        assert!(matches!(worker.previous, PreviousProfile::Inactive));
+        assert!(THREAD_PROFILE.with(|slot| slot.borrow().is_none()));
+    }
+
+    #[test]
+    fn profile_exclusive_time_counts_nested_and_recursive_work_once() {
+        let shared = Arc::new(Mutex::new(ProfileMeasurements::default()));
+        let mut profile = test_thread_profile(shared, false);
+        let start = profile.started;
+        profile.begin(ProfilePhase::Evaluation, start);
+        profile.begin(
+            ProfilePhase::HeredocExtract,
+            start + Duration::from_micros(2),
+        );
+        profile.end(start + Duration::from_micros(7));
+        profile.begin(ProfilePhase::Evaluation, start + Duration::from_micros(8));
+        profile.end(start + Duration::from_micros(10));
+        profile.end(start + Duration::from_micros(20));
+
+        let report = profile_json(&profile, start + Duration::from_micros(25));
+        assert_eq!(report["total_ns"], 25_000);
+        assert_eq!(report["uninstrumented_ns"], 5_000);
+        let evaluation = &report["phases"]["evaluation"];
+        assert_eq!(evaluation["calls"], 2);
+        assert_eq!(evaluation["completed_calls"], 2);
+        assert_eq!(evaluation["elapsed_ns"], 22_000);
+        assert_eq!(evaluation["exclusive_ns"], 15_000);
+        assert_eq!(report["phases"]["heredoc_extract"]["exclusive_ns"], 5_000);
+        assert_eq!(report["phases"]["history_flush"]["calls"], 0);
+    }
+
+    #[test]
+    fn profile_explicit_exit_finishes_open_main_phases() {
+        let mut profile =
+            test_thread_profile(Arc::new(Mutex::new(ProfileMeasurements::default())), false);
+        let start = profile.started;
+        profile.begin(ProfilePhase::RequestSetup, start);
+        profile.begin(ProfilePhase::RequestParse, start + Duration::from_micros(3));
+        profile.end_open_phases(start + Duration::from_micros(10));
+        let report = profile_json(&profile, start + Duration::from_micros(10));
+        assert!(profile.stack.is_empty());
+        assert_eq!(report["phases"]["request_setup"]["exclusive_ns"], 3_000);
+        assert_eq!(report["phases"]["request_parse"]["exclusive_ns"], 7_000);
+        assert_eq!(report["phases"]["request_parse"]["completed_calls"], 1);
+        assert_eq!(report["uninstrumented_ns"], 0);
+    }
+
+    #[test]
+    fn profile_worker_time_is_separate_and_incomplete_work_is_visible() {
+        let shared = Arc::new(Mutex::new(ProfileMeasurements::default()));
+        let mut profile = test_thread_profile(Arc::clone(&shared), false);
+        let mut worker = test_thread_profile(shared, true);
+        let start = profile.started;
+        profile.begin(ProfilePhase::AstMatch, start);
+        worker.begin(ProfilePhase::AstParse, start + Duration::from_micros(2));
+        profile.end(start + Duration::from_micros(10));
+
+        let incomplete = profile_json(&profile, start + Duration::from_micros(10));
+        assert_eq!(incomplete["worker_phases"]["ast_parse"]["calls"], 1);
+        assert_eq!(
+            incomplete["worker_phases"]["ast_parse"]["completed_calls"],
+            0
+        );
+        assert_eq!(incomplete["worker_phases"]["ast_parse"]["elapsed_ns"], 0);
+        worker.end(start + Duration::from_micros(12));
+
+        let complete = profile_json(&profile, start + Duration::from_micros(15));
+        assert_eq!(complete["phases"]["ast_match"]["exclusive_ns"], 10_000);
+        assert_eq!(complete["worker_phases"]["ast_parse"]["elapsed_ns"], 10_000);
+        assert_eq!(complete["uninstrumented_ns"], 5_000);
+    }
+
+    #[test]
+    fn captured_profile_collects_on_worker_without_contaminating_main() {
+        let _profile = HookProfile::start(true);
+        let main_phase = phase(ProfilePhase::Evaluation);
+        let context = capture_profile();
+        std::thread::spawn(move || {
+            let worker = context.enter();
+            assert!(matches!(worker.previous, PreviousProfile::NoContext));
+            let _phase = phase(ProfilePhase::AstParse);
+        })
+        .join()
+        .expect("profiled worker completes");
+        drop(main_phase);
+        let profile = THREAD_PROFILE.with(|slot| slot.borrow_mut().take().unwrap());
+        let report = profile_json(&profile, Instant::now());
+        assert_eq!(report["phases"]["evaluation"]["completed_calls"], 1);
+        assert_eq!(report["phases"]["ast_parse"]["calls"], 0);
+        assert_eq!(report["worker_phases"]["ast_parse"]["completed_calls"], 1);
+        assert!(THREAD_PROFILE.with(|slot| slot.borrow().is_none()));
+    }
+
+    #[test]
+    fn nested_worker_context_restores_main_and_inactive_context_does_not_replace_it() {
+        let inactive = capture_profile();
+        let _profile = HookProfile::start(true);
+        let main_phase = phase(ProfilePhase::Evaluation);
+        {
+            let worker = inactive.enter();
+            assert!(matches!(worker.previous, PreviousProfile::Inactive));
+            assert!(THREAD_PROFILE.with(|slot| !slot.borrow().as_ref().unwrap().worker));
+        }
+        {
+            let worker = capture_profile().enter();
+            assert!(matches!(worker.previous, PreviousProfile::Context(_)));
+            let _phase = phase(ProfilePhase::AstParse);
+        }
+        assert!(THREAD_PROFILE.with(|slot| !slot.borrow().as_ref().unwrap().worker));
+        drop(main_phase);
+        let profile = THREAD_PROFILE.with(|slot| slot.borrow_mut().take().unwrap());
+        let report = profile_json(&profile, Instant::now());
+        assert_eq!(report["phases"]["evaluation"]["completed_calls"], 1);
+        assert_eq!(report["phases"]["ast_parse"]["calls"], 0);
+        assert_eq!(report["worker_phases"]["ast_parse"]["completed_calls"], 1);
+    }
+
+    #[test]
+    fn profile_accounts_for_failed_request_parsing() {
+        let _profile = HookProfile::start(true);
+        assert!(crate::hook::parse_hook_input("{").is_err());
+        let profile = THREAD_PROFILE.with(|slot| slot.borrow_mut().take().unwrap());
+        let report = profile_json(&profile, Instant::now());
+        assert_eq!(report["phases"]["request_parse"]["completed_calls"], 1);
+        assert_eq!(report["phases"]["evaluation"]["calls"], 0);
+        assert_eq!(report["schema_version"], 1);
+        assert_eq!(report["clock"], "monotonic_wall");
+    }
 
     #[test]
     fn budget_status_classification() {

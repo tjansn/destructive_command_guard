@@ -2666,6 +2666,7 @@ pub(crate) fn tokenize_for_shell_dialect(command: &str, dialect: ShellDialect) -
 }
 
 fn tokenize_powershell_raw(command: &str) -> NormalizeTokens {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellTokenization);
     let bytes = command.as_bytes();
     let len = bytes.len();
     let mut tokens = NormalizeTokens::new();
@@ -2763,6 +2764,7 @@ fn cmd_line_continuation_end(bytes: &[u8], i: usize, len: usize) -> Option<usize
 }
 
 fn tokenize_cmd_raw(command: &str) -> NormalizeTokens {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellTokenization);
     let bytes = command.as_bytes();
     let len = bytes.len();
     let mut tokens = NormalizeTokens::new();
@@ -3128,6 +3130,7 @@ fn cmd_byte_is_caret_escaped(bytes: &[u8], index: usize) -> bool {
 
 #[must_use]
 pub fn tokenize_for_normalization(command: &str) -> NormalizeTokens {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellTokenization);
     let bytes = command.as_bytes();
     let len = bytes.len();
 
@@ -4085,6 +4088,7 @@ fn normalize_decoded_command(command: &str, dialect: ShellDialect) -> Cow<'_, st
 #[inline]
 #[must_use]
 pub fn normalize_command_in_dialect(cmd: &str, dialect: ShellDialect) -> Cow<'_, str> {
+    let _phase = crate::perf::PhaseTimer::start("normalization");
     match dialect {
         ShellDialect::Posix | ShellDialect::Unknown => {
             let stripped = strip_wrapper_prefixes(cmd);

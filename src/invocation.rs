@@ -61,6 +61,18 @@ pub(crate) fn classify(
         return Err("unsupported interpreter invocation".to_owned());
     }
     let mut result = Invocation::default();
+    if args.len() == 1
+        && ((matches!(program, "bash" | "/bin/bash" | "/usr/bin/bash")
+            && matches!(args[0], "--version" | "--help"))
+            || (matches!(
+                program,
+                "node" | "nodejs" | "/usr/bin/node" | "/usr/bin/nodejs"
+            ) && matches!(args[0], "--version" | "-v")))
+    {
+        // These exact native metadata forms exit before reading a program.
+        // Extra operands, preloads and project-local namesakes are not covered.
+        return Ok(result);
+    }
     let mut syntax = false;
     let mut tests = false;
     let mut inline = false;

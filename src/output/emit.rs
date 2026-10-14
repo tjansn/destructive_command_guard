@@ -53,6 +53,9 @@ pub fn stdout_line(args: fmt::Arguments<'_>) {
 /// not a reason to abandon the evaluation — least of all in hook mode, where
 /// the decision on stdout may still have a reader.
 pub fn stderr_line(args: fmt::Arguments<'_>) {
+    if super::is_robot_mode() {
+        return;
+    }
     let stderr = io::stderr();
     let mut handle = stderr.lock();
     let _ = writeln!(handle, "{args}");

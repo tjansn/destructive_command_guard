@@ -2448,7 +2448,7 @@ const NON_HOME_TOP_LEVEL: &[&str] = &[
 /// relative, climbs with `..`, or is not usable as an additional root.
 ///
 /// Rejected besides: a system directory ([`NON_HOME_TOP_LEVEL`]), anything
-/// under `/etc` or `/private` (the `Root::Etc` spellings), and a `$HOME`
+/// under `/etc` or `/private/etc` (the `Root::Etc` spellings), and a `$HOME`
 /// with a component that is itself protected material
 /// ([`is_protected_home_component`]). Those last rules are what let
 /// [`rooted_prefixes`] prefer a longer `$HOME` without ever losing a
@@ -2468,9 +2468,11 @@ fn home_components(home: &str) -> Option<Vec<String>> {
         }
     }
     let first = comps.first()?;
-    if ["etc", "private"]
-        .iter()
-        .any(|system| first.eq_ignore_ascii_case(system))
+    if first.eq_ignore_ascii_case("etc")
+        || (first.eq_ignore_ascii_case("private")
+            && comps
+                .get(1)
+                .is_some_and(|part| part.eq_ignore_ascii_case("etc")))
         || comps.iter().any(|comp| is_protected_home_component(comp))
     {
         return None;
@@ -4475,6 +4477,38 @@ mod tests {
                 );
             }
         });
+        // macOS canonicalizes temporary homes under /private. They are not
+        // /private/etc, and adopting that exact home adds protection only.
+        for home in [
+            "/private/tmp/isolated-home",
+            "/private/var/folders/test/home",
+        ] {
+            with_runtime_home(Some(home), || {
+                for suffix in [".netrc", ".npmrc", ".zshrc", ".ssh/authorized_keys"] {
+                    assert!(
+                        classify_credential_file_write(
+                            &format!("echo x >> {home}/{suffix}"),
+                            ShellDialect::Posix,
+                        )
+                        .is_some()
+                    );
+                }
+                assert!(
+                    classify_credential_file_write(
+                        &format!("echo x >> {home}/notes.txt"),
+                        ShellDialect::Posix,
+                    )
+                    .is_none()
+                );
+                assert!(
+                    classify_credential_file_write(
+                        "echo x >> /private/tmp/outside/.netrc",
+                        ShellDialect::Posix,
+                    )
+                    .is_none()
+                );
+            });
+        }
         // Rejected outright, so the fixed reading stands: a dot-named
         // component (would shadow `/home/luna/.config/gh/hosts.yml`) and the
         // `/etc` trees.

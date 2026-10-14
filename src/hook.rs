@@ -1055,6 +1055,7 @@ pub const MAX_OVERSIZED_SCAN_BYTES: usize = 4 * 1024 * 1024;
 pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
     let mut buf: Vec<u8> = Vec::with_capacity(256);
     {
+        let _phase = crate::perf::phase(crate::perf::ProfilePhase::InputRead);
         let stdin = io::stdin();
         // Read up to limit + 1 to detect overflow
         let mut handle = stdin.lock().take(max_bytes as u64 + 1);
@@ -1067,6 +1068,7 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
         // Best-effort: a read error here just shortens the scan buffer, it
         // never changes the (already decided) oversized verdict.
         if buf.len() < MAX_OVERSIZED_SCAN_BYTES {
+            let _phase = crate::perf::phase(crate::perf::ProfilePhase::InputRead);
             let remaining = (MAX_OVERSIZED_SCAN_BYTES - buf.len()) as u64;
             let stdin = io::stdin();
             let mut handle = stdin.lock().take(remaining);
@@ -1081,10 +1083,13 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
         });
     }
 
-    let input = String::from_utf8(buf).map_err(|e| HookReadError::InvalidUtf8 {
-        error: e.utf8_error(),
-        lossy: String::from_utf8_lossy(e.as_bytes()).into_owned(),
-    })?;
+    let input = {
+        let _phase = crate::perf::phase(crate::perf::ProfilePhase::RequestParse);
+        String::from_utf8(buf).map_err(|e| HookReadError::InvalidUtf8 {
+            error: e.utf8_error(),
+            lossy: String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        })?
+    };
 
     // Strip a leading UTF-8 BOM (U+FEFF) before parsing. Some text tools prepend
     // a BOM; without this, BOM-prefixed but otherwise-valid hook input would
@@ -1157,6 +1162,8 @@ const HOOK_INPUT_ALIAS_GROUPS: &[(&str, &[&str])] = &[
 /// carries no reconcilable alias conflict, or still does not fit [`HookInput`]
 /// after canonicalization. Behaviour for those inputs is unchanged.
 pub fn parse_hook_input(json: &str) -> Result<HookInput, serde_json::Error> {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::RequestParse);
+    let _phase_timer = crate::perf::PhaseTimer::start("request_parse");
     let neutralized = neutralize_lone_surrogate_escapes(json);
     let json = neutralized.as_ref();
     let first_error = match serde_json::from_str::<HookInput>(json) {
@@ -3331,6 +3338,9 @@ pub fn print_colorful_warning(
     pattern_suggestions: &[PatternSuggestion],
     severity: Option<crate::packs::Severity>,
 ) {
+    if crate::output::is_robot_mode() {
+        return;
+    }
     let stderr = io::stderr();
     let mut handle = stderr.lock();
     print_colorful_warning_to(
@@ -3752,6 +3762,28 @@ pub fn write_review_request_to(
     }
 }
 
+/// Process stderr for a hook response. Robot mode suppresses diagnostics,
+/// while exit-status protocols retain their required stderr verdict reason.
+/// The writer-based formatting APIs remain independent of process settings.
+struct HookStderr(Option<io::StderrLock<'static>>);
+
+impl Write for HookStderr {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0
+            .as_mut()
+            .map_or_else(|| Ok(bytes.len()), |writer| writer.write(bytes))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.as_mut().map_or_else(|| Ok(()), Write::flush)
+    }
+}
+
+fn hook_stderr(protocol: HookProtocol) -> HookStderr {
+    let enabled = !crate::output::is_robot_mode() || protocol.blocks_by_exit_status();
+    HookStderr(enabled.then(|| io::stderr().lock()))
+}
+
 /// Output a denial response to stdout (JSON for hook protocol).
 #[cold]
 #[inline(never)]
@@ -3771,8 +3803,7 @@ pub fn output_denial_for_protocol(
     branch_context: Option<&crate::evaluator::BranchContext>,
 ) -> io::Result<()> {
     let mut verdict = Vec::new();
-    let err = io::stderr();
-    let mut err_handle = err.lock();
+    let mut err_handle = hook_stderr(protocol);
     write_denial_to(
         &mut verdict,
         &mut err_handle,
@@ -3811,8 +3842,7 @@ pub fn output_review_request_for_protocol(
     branch_context: Option<&crate::evaluator::BranchContext>,
 ) -> io::Result<()> {
     let mut verdict = Vec::new();
-    let err = io::stderr();
-    let mut err_handle = err.lock();
+    let mut err_handle = hook_stderr(protocol);
     write_review_request_to(
         &mut verdict,
         &mut err_handle,
@@ -4074,7 +4104,13 @@ pub fn output_indeterminate_from_panic(
         return None;
     }
     let mut verdict = Vec::new();
-    write_indeterminate_to(&mut verdict, &mut io::stderr(), protocol, reason, deny);
+    write_indeterminate_to(
+        &mut verdict,
+        &mut hook_stderr(protocol),
+        protocol,
+        reason,
+        deny,
+    );
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     Some(handle.write_all(&verdict).and_then(|()| handle.flush()))
@@ -4089,8 +4125,7 @@ pub fn output_indeterminate_for_protocol(
     deny: bool,
 ) -> io::Result<()> {
     let mut verdict = Vec::new();
-    let err = io::stderr();
-    let mut err_handle = err.lock();
+    let mut err_handle = hook_stderr(protocol);
     write_indeterminate_to(&mut verdict, &mut err_handle, protocol, reason, deny);
     deliver_verdict(&verdict)
 }
@@ -4266,8 +4301,7 @@ pub fn output_warning_for_protocol(
     explanation: Option<&str>,
 ) -> io::Result<()> {
     let mut verdict = Vec::new();
-    let err = io::stderr();
-    let mut err_handle = err.lock();
+    let mut err_handle = hook_stderr(protocol);
     write_warning_to(
         &mut verdict,
         &mut err_handle,

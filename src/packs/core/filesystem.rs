@@ -929,6 +929,7 @@ fn parse_rm_interactive_mode(value: &str) -> Option<RmInteractiveMode> {
 pub(crate) fn parse_rm_command(command: &str) -> RmParseDecision {
     let segments = crate::packs::split_command_segments(command);
     if segments.len() > 1 {
+        let stdin_context = RmStdinContext::new(command);
         let mut saw_allow = false;
         for segment in segments {
             let command_start = command.as_ptr() as usize;
@@ -936,7 +937,7 @@ pub(crate) fn parse_rm_command(command: &str) -> RmParseDecision {
             let automated_stdin = segment_start
                 .checked_sub(command_start)
                 .is_some_and(|offset| {
-                    rm_segment_receives_automated_stdin(command, offset, ShellDialect::Posix)
+                    stdin_context.segment_receives_automated_stdin(offset, ShellDialect::Posix)
                 });
             match parse_rm_command_segment(segment, automated_stdin) {
                 RmParseDecision::Deny(hit) => return RmParseDecision::Deny(hit),
@@ -970,20 +971,59 @@ pub(crate) fn rm_segment_receives_automated_stdin(
     segment_start: usize,
     dialect: ShellDialect,
 ) -> bool {
-    let Some(prefix) = command.get(..segment_start) else {
-        return false;
-    };
-    let prefix = prefix.trim_end();
-    if prefix.ends_with("|&") || (prefix.ends_with('|') && !prefix.ends_with("||")) {
-        return true;
+    RmStdinContext::new(command).segment_receives_automated_stdin(segment_start, dialect)
+}
+
+/// Source-wide prerequisites for the existing stdin provenance parsers.
+///
+/// A multiline command can contribute hundreds of segment queries. Re-splitting
+/// and tokenizing every preceding segment for each query is quadratic even when
+/// the command cannot contain a pipeline or an `exec` redirect. These facts are
+/// computed once from the exact source and shared by all of its segment queries;
+/// they do not classify a command, choose packs, or change either parser.
+pub(crate) struct RmStdinContext<'a> {
+    command: &'a str,
+    has_pipe: bool,
+    has_exec_stdin_redirect: bool,
+}
+
+impl<'a> RmStdinContext<'a> {
+    pub(crate) fn new(command: &'a str) -> Self {
+        Self {
+            command,
+            has_pipe: command.contains('|'),
+            has_exec_stdin_redirect: command.contains("exec") && command.contains('<'),
+        }
     }
 
-    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
-        return false;
-    }
+    pub(crate) fn segment_receives_automated_stdin(
+        &self,
+        segment_start: usize,
+        dialect: ShellDialect,
+    ) -> bool {
+        let Some(prefix) = self.command.get(..segment_start) else {
+            return false;
+        };
+        let prefix = prefix.trim_end();
+        if prefix.ends_with("|&") || (prefix.ends_with('|') && !prefix.ends_with("||")) {
+            return true;
+        }
 
-    posix_pipeline_group_is_active(command, segment_start)
-        || prior_posix_exec_redirects_stdin(command, segment_start)
+        if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+            return false;
+        }
+
+        // A group can acquire automated stdin only from a literal `|` byte.
+        // The exec parser recognizes an exact raw token basename after outer
+        // quote removal, so every token it accepts contains contiguous `exec`.
+        // Its stdin redirect grammar also requires a literal `<` byte.
+        // Quoted data and escapes may make either fact a false positive; the
+        // complete existing parser still resolves those cases. Neither fact
+        // can exclude a positive result from its respective parser.
+        (self.has_pipe && posix_pipeline_group_is_active(self.command, segment_start))
+            || (self.has_exec_stdin_redirect
+                && prior_posix_exec_redirects_stdin(self.command, segment_start))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4468,7 +4508,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
     // `--no-preserve-root` and every other long option still fall through to the
     // destructive rules, and a second `--` would have to satisfy the
     // temp-operand group (it cannot), so `rm -rf -- -- /tmp/x` keeps denying.
-    vec![
+    let mut patterns = vec![
         // The baseline Format-Volume / Clear-Disk rules (#451) mirror
         // windows.system's regexes, so they take its preview carve-out too:
         // a bare `-WhatIf` is a preview, `-WhatIf:$false` is not.
@@ -4884,7 +4924,14 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "mv-relative-into-home",
             r#"^(?![^|;&]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:\./)?(?![-~.])[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:\./)?(?![-~.])[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)*/?"|'(?:\./)?(?![-~.])[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)*/?'))+[ \t]+(?:(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)*/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)*/?')[ \t]*$"#
         ),
-    ]
+    ];
+    // Every possible safe match still runs its complete authored regex. The
+    // opt-in proof only avoids compiling/running an anchored backtracking
+    // pattern when its required literal prefix cannot match (#555).
+    for pattern in &mut patterns {
+        pattern.regex.enable_anchored_prefix_filter();
+    }
+    patterns
 }
 
 /// The destructive patterns for `core.filesystem`.
@@ -9265,6 +9312,228 @@ mod tests {
         }
     }
 
+    // The unfiltered implementation before #555. Keep this independent of the
+    // context facts so the differential tests catch an over-eager exclusion.
+    fn reference_rm_segment_receives_automated_stdin(
+        command: &str,
+        segment_start: usize,
+        dialect: ShellDialect,
+    ) -> bool {
+        let Some(prefix) = command.get(..segment_start) else {
+            return false;
+        };
+        let prefix = prefix.trim_end();
+        if prefix.ends_with("|&") || (prefix.ends_with('|') && !prefix.ends_with("||")) {
+            return true;
+        }
+        if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+            return false;
+        }
+        posix_pipeline_group_is_active(command, segment_start)
+            || prior_posix_exec_redirects_stdin(command, segment_start)
+    }
+
+    #[test]
+    fn stdin_context_matches_legacy_at_every_source_boundary_issue_555() {
+        for command in [
+            "",
+            "ls -la",
+            "rm -ri ./tree",
+            "yes | rm -ri ./tree",
+            "printf y |& rm -rI ./tree",
+            "true || rm -ri ./tree",
+            "printf '%s' '|'; rm -ri ./tree",
+            r"printf \|; rm -ri ./tree",
+            "yes | { echo ready; rm -ri ./tree; }",
+            "yes | ( echo ready; rm -ri ./tree )",
+            "yes | while true; do rm -ri ./tree; break; done",
+            "yes | if true; then rm -ri ./tree; else true; fi",
+            "yes | { # }\n rm -ri ./tree; }",
+            "yes | { cat <<'EOF'\n}\nEOF\nrm -ri ./tree; }",
+            "yes | { cat <<-'EOF'\n\t}\n\tEOF\nrm -ri ./tree; }",
+            "printf y | { cat; }; rm -ri ./tree",
+            "printf '%s' \"$(yes | { rm -ri ./tree; })\"",
+            "printf '%s' `yes | rm -ri ./tree`",
+            "exec < answers.txt; rm -ri ./tree",
+            "exec 0<answers.txt; rm -rI ./tree",
+            "'exec' 0<answers.txt; rm -ri ./tree",
+            "\"/bin/exec\" 0<answers.txt; rm -ri ./tree",
+            r"\exec 0<answers.txt; rm -ri ./tree",
+            "e''xec 0<answers.txt; rm -ri ./tree",
+            "FOO=bar exec <answers.txt; rm -ri ./tree",
+            "exec 0<&3; rm -ri ./tree",
+            "exec 0<&-; rm -ri ./tree",
+            "exec 3<answers.txt; rm -ri ./tree",
+            "exec <>answers.txt; rm -ri ./tree",
+            "(exec < answers.txt; true); rm -ri ./tree",
+            "(exec < answers.txt; rm -ri ./tree); true",
+            "echo 'exec <answers.txt'; rm -ri ./tree",
+            "cat <<'EOF'\nexec <answers.txt\nEOF\nrm -ri ./tree",
+            "python3 - <<'PY'\nvalue = 'λ雪'\nprint(value)\nPY\nrm -ri ./tree",
+            "printf '%s' '雪'\r\nexec <answers.txt\r\nrm -ri ./tree",
+            "yes | { cat <<'EOF'\nunterminated body\nrm -ri ./tree",
+            "printf '%s' \"$(exec <answers; rm -ri ./tree",
+            "Get-Content answers.txt | Remove-Item -Recurse ./tree",
+            "type answers.txt | del tree",
+            "echo ^| literal & del tree",
+        ] {
+            let context = RmStdinContext::new(command);
+            for dialect in [
+                ShellDialect::Posix,
+                ShellDialect::PowerShell,
+                ShellDialect::Cmd,
+                ShellDialect::Unknown,
+            ] {
+                // Walk backwards as well as querying offsets outside the
+                // source: callers do not promise monotonic segment order.
+                for offset in (0..=command.len() + 1).rev() {
+                    if offset < command.len() && !command.is_char_boundary(offset) {
+                        continue;
+                    }
+                    let expected =
+                        reference_rm_segment_receives_automated_stdin(command, offset, dialect);
+                    assert_eq!(
+                        context.segment_receives_automated_stdin(offset, dialect),
+                        expected,
+                        "context: dialect={dialect:?}, offset={offset}, source={command:?}",
+                    );
+                    assert_eq!(
+                        rm_segment_receives_automated_stdin(command, offset, dialect),
+                        expected,
+                        "standalone: dialect={dialect:?}, offset={offset}, source={command:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stdin_context_preserves_multiline_interactive_verdicts_issue_555() {
+        use std::fmt::Write as _;
+
+        for lines in [1, 40, 300] {
+            let mut body = String::from("python3 - <<'PY'\n");
+            for index in 0..lines {
+                writeln!(body, "value_{index} = {index}").expect("write fixture line");
+            }
+            body.push_str("PY\n");
+            for (prefix, suffix, automated) in [
+                ("", "rm -ri ./tree", false),
+                ("yes | { ", "rm -ri ./tree; }", true),
+                ("exec 0<answers; ", "rm -ri ./tree", true),
+            ] {
+                let command = format!("{prefix}{body}{suffix}");
+                let context = RmStdinContext::new(&command);
+                for segment in crate::packs::split_command_segments(&command) {
+                    let start = segment.as_ptr() as usize - command.as_ptr() as usize;
+                    assert_eq!(
+                        context.segment_receives_automated_stdin(start, ShellDialect::Posix),
+                        reference_rm_segment_receives_automated_stdin(
+                            &command,
+                            start,
+                            ShellDialect::Posix,
+                        ),
+                        "lines={lines}, prefix={prefix:?}, start={start}",
+                    );
+                }
+                let rm_start = command.rfind("rm -ri").expect("explicit final rm");
+                assert_eq!(
+                    context.segment_receives_automated_stdin(rm_start, ShellDialect::Posix),
+                    automated,
+                );
+                match parse_rm_command(&command) {
+                    RmParseDecision::Allow if !automated => {}
+                    RmParseDecision::Deny(hit) if automated => {
+                        assert_eq!(hit.pattern_name, RM_RECURSIVE_GENERAL_NAME);
+                        assert_eq!(hit.severity, Severity::High);
+                    }
+                    decision => panic!(
+                        "interactive verdict changed: lines={lines}, automated={automated}, \
+                         decision={decision:?}"
+                    ),
+                }
+            }
+            let destructive = format!("{body}rm -rf /");
+            assert!(matches!(
+                parse_rm_command(&destructive),
+                RmParseDecision::Deny(hit) if hit.pattern_name == RM_RF_ROOT_HOME_NAME
+            ));
+        }
+    }
+
+    #[test]
+    #[ignore = "paired in-process legacy/context timing; run in release mode with --nocapture"]
+    fn paired_stdin_provenance_benchmark_issue_555() {
+        use std::fmt::Write as _;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        for lines in [40, 300, 1_000] {
+            let mut command = String::from("python3 - <<'PY'\n");
+            for index in 0..lines {
+                writeln!(command, "value_{index} = {index}").expect("write fixture line");
+            }
+            command.push_str("print('ready')\nPY");
+            let offsets: Vec<_> = crate::packs::split_command_segments(&command)
+                .iter()
+                .map(|segment| segment.as_ptr() as usize - command.as_ptr() as usize)
+                .collect();
+            let reference = || {
+                offsets
+                    .iter()
+                    .filter(|&&offset| {
+                        reference_rm_segment_receives_automated_stdin(
+                            black_box(&command),
+                            offset,
+                            ShellDialect::Posix,
+                        )
+                    })
+                    .count()
+            };
+            let candidate = || {
+                let context = RmStdinContext::new(black_box(&command));
+                offsets
+                    .iter()
+                    .filter(|&&offset| {
+                        context.segment_receives_automated_stdin(offset, ShellDialect::Posix)
+                    })
+                    .count()
+            };
+            assert_eq!(reference(), candidate());
+            let mut reference_ns = Vec::new();
+            let mut candidate_ns = Vec::new();
+            for iteration in 0..7 {
+                for use_reference in [iteration % 2 == 0, iteration % 2 != 0] {
+                    let start = Instant::now();
+                    let result = if use_reference {
+                        black_box(reference())
+                    } else {
+                        black_box(candidate())
+                    };
+                    let elapsed = start.elapsed().as_nanos();
+                    assert_eq!(result, 0);
+                    if use_reference {
+                        reference_ns.push(elapsed);
+                    } else {
+                        candidate_ns.push(elapsed);
+                    }
+                }
+            }
+            reference_ns.sort_unstable();
+            candidate_ns.sort_unstable();
+            let reference_ns = reference_ns[reference_ns.len() / 2];
+            let candidate_ns = candidate_ns[candidate_ns.len() / 2];
+            eprintln!(
+                "stdin_provenance lines={lines} segments={} legacy_p50_us={:.3} \
+                 context_p50_us={:.3} speedup={:.2}x",
+                offsets.len(),
+                reference_ns as f64 / 1_000.0,
+                candidate_ns as f64 / 1_000.0,
+                reference_ns as f64 / candidate_ns.max(1) as f64,
+            );
+        }
+    }
+
     #[test]
     fn test_rm_parser_normalizes_segment_local_wrappers_and_executables() {
         for command in [
@@ -9290,6 +9559,56 @@ mod tests {
             "busybox nice rm -r ./tree",
         ] {
             assert_rm_parser_denies(command, RM_RECURSIVE_GENERAL_NAME, Severity::High);
+        }
+    }
+
+    #[test]
+    fn automated_stdin_candidates_preserve_full_reader_results() {
+        let large = format!(
+            "python3 - <<'EOF'\n{}EOF\nrm -ri ./tree",
+            "print('ordinary data')\n".repeat(300)
+        );
+        let cases = [
+            large.as_str(),
+            "yes | { echo x; rm -ri ./tree; }",
+            "yes | (echo x; rm -ri ./tree)",
+            "yes | if true; then rm -ri ./tree; fi",
+            "yes | { cat <<'EOF'\n}\nEOF\nrm -ri ./tree; }",
+            "exec 0<answers.txt; rm -ri ./tree",
+            "'exec' <answers.txt; rm -ri ./tree",
+            "exec <<<yes; rm -ri ./tree",
+            "exec 3<answers.txt; rm -ri ./tree",
+            "(exec <answers.txt; true); rm -ri ./tree",
+            "printf '| exec <'\nrm -ri ./tree",
+            "cat <<'EOF'\nexec <answers.txt\nEOF\nrm -ri ./tree",
+            "echo café && rm -ri ./tree",
+        ];
+        // Compare to the incumbent readers at every extracted segment,
+        // including heredoc lines and nested segments. This catches a
+        // candidate gate hiding a shape those readers already recognized.
+        for command in cases {
+            for segment in crate::packs::split_command_segments(command) {
+                let start = segment.as_ptr() as usize - command.as_ptr() as usize;
+                let prefix = command[..start].trim_end();
+                let direct =
+                    prefix.ends_with("|&") || (prefix.ends_with('|') && !prefix.ends_with("||"));
+                for dialect in [
+                    ShellDialect::Posix,
+                    ShellDialect::Unknown,
+                    ShellDialect::Cmd,
+                    ShellDialect::PowerShell,
+                ] {
+                    let incumbent = direct
+                        || (matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
+                            && (posix_pipeline_group_is_active(command, start)
+                                || prior_posix_exec_redirects_stdin(command, start)));
+                    assert_eq!(
+                        rm_segment_receives_automated_stdin(command, start, dialect),
+                        incumbent,
+                        "{dialect:?} at {start}: {command}"
+                    );
+                }
+            }
         }
     }
 

@@ -144,6 +144,41 @@ fn bench_long_command(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_issue_555(c: &mut Criterion) {
+    let mut ctx = EvalContext::new();
+    ctx.heredoc_settings = Config::default().heredoc_settings();
+    let mut group = c.benchmark_group("issue_555");
+    for lines in [1, 40, 300] {
+        let body = "print('ordinary data')\n".repeat(lines);
+        for (name, command, expected) in [
+            (
+                "python",
+                format!("python3 - <<'EOF'\n{body}EOF"),
+                EvaluationDecision::Allow,
+            ),
+            (
+                "quoted_data",
+                format!("cat <<'EOF'\n{body}rm -rf /\nEOF"),
+                EvaluationDecision::Allow,
+            ),
+            (
+                "python_deny",
+                format!("python3 - <<'EOF'\n{body}import shutil\nshutil.rmtree('/tmp')\nEOF"),
+                EvaluationDecision::Deny,
+            ),
+        ] {
+            assert_eq!(ctx.evaluate(&command).decision, expected, "{name}/{lines}");
+            group.bench_with_input(BenchmarkId::new(name, lines), &command, |b, cmd| {
+                b.iter(|| ctx.evaluate(black_box(cmd)));
+            });
+        }
+    }
+    let compound = "cd project && git status --short | head && grep -rn foo src | wc -l";
+    assert_eq!(ctx.evaluate(compound).decision, EvaluationDecision::Allow);
+    group.bench_function("compound", |b| b.iter(|| ctx.evaluate(black_box(compound))));
+    group.finish();
+}
+
 fn bench_keyword_rejection(c: &mut Criterion) {
     let ctx = EvalContext::new();
 
@@ -203,6 +238,7 @@ criterion_group!(
     benches,
     bench_evaluate_command,
     bench_long_command,
+    bench_issue_555,
     bench_keyword_rejection,
     bench_throughput
 );

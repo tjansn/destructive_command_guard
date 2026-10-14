@@ -127,6 +127,118 @@ impl Fixture {
 }
 
 #[test]
+fn routine_pipelines_bind_sources_without_guessing_allowlist_scope() {
+    let fixture = Fixture::new();
+    fixture.write("safe.sh", "printf ready\n");
+    fixture.write("danger.sh", "git reset --hard\n");
+    let root = shell_words::quote(fixture.root.to_str().unwrap());
+    fixture.allowed(&format!("cd {root} && bash safe.sh | cat"));
+    fixture.allowed(&format!("cd -- {root} && bash safe.sh 2>&1 | tail -1"));
+    fixture.destructive(&format!("cd {root} && bash danger.sh | cat"), "danger.sh");
+    fixture.unverified(&format!("cd {root} | bash safe.sh"));
+    fixture.unverified(&format!("cd {root} && eval 'cd /' && bash safe.sh | cat"));
+    fixture.unverified(&format!("cd {root} && 'eval' 'cd /' && bash safe.sh | cat"));
+    fixture.unverified(&format!("cd {root} && bash safe.sh | cat; cd /"));
+    fixture.unverified(&format!("cd {root} && ./safe.sh | cat; cd /"));
+    #[cfg(unix)]
+    {
+        // /bin is a distro-owned symlink on many Linux systems. This probe
+        // is about a concrete native executable, not relaxing symlink checks.
+        let native = std::fs::canonicalize("/bin/ls").unwrap();
+        fixture.allowed(&format!("cd {root} && {} | head -1", native.display()));
+        // A native executable may be read without a cwd; a script at an
+        // absolute path must not receive a fabricated '/' execution context.
+        fixture.unverified(&format!(
+            "cd {root} | {}",
+            fixture.root.join("safe.sh").display()
+        ));
+    }
+}
+
+#[test]
+fn exact_remote_system_queries_do_not_read_local_script_namesakes() {
+    let fixture = Fixture::new();
+    for query in [
+        "/usr/sbin/sysctl hw.model hw.memsize hw.ncpu machdep.cpu.brand_string",
+        "/usr/sbin/sysctl -n vm.swapusage",
+        "/sbin/sysctl kern.osrelease",
+        "/usr/bin/uptime",
+        "/usr/bin/memory_pressure -Q",
+    ] {
+        fixture.allowed(&format!("ssh -o BatchMode=yes mini {query}"));
+    }
+    for query in [
+        "/usr/sbin/sysctl -w kern.hostname=changed",
+        "/usr/sbin/sysctl kern.hostname=changed",
+        "/usr/bin/memory_pressure -l critical",
+        "/tmp/sysctl hw.model",
+    ] {
+        fixture.unverified(&format!("ssh mini {query}"));
+    }
+    fixture.denied("ssh mini '/usr/bin/uptime; git reset --hard'");
+    fixture.denied("ssh mini '/usr/sbin/sysctl hw.model $(git reset --hard)'");
+    fixture.write("remote.sh", "printf ready\n");
+    fixture.unverified("ssh mini bash remote.sh");
+}
+
+#[test]
+fn routine_interpreter_and_browser_data_keeps_its_language_boundary() {
+    let fixture = Fixture::new();
+    for command in [
+        "env | cut -d= -f1 | sort",
+        "/usr/bin/env -0 | head -c 1",
+        "bash --version | head -1",
+        "/bin/bash --help",
+        "node --version",
+        "python3 --version",
+        "python3 -c 's = \"run $(git reset --hard) later\"; print(s)'",
+        "node -e 'const s = \"run $(git reset --hard) later\"; console.log(s)'",
+        "python3 - <<'PY'\nfrom pathlib import Path\nprint(Path('README.md').read_text())\nPY",
+        "agent-browser --session research eval --stdin <<'JS'\n(() => { const text = document.body.innerText; return {text, tables:[...document.querySelectorAll('table')].map(t=>t.outerHTML)}; })()\nJS",
+    ] {
+        fixture.allowed(command);
+    }
+    for command in [
+        "node -e 'const cp = require(\"child_process\"); const s = \"echo $(git reset --hard)\"; cp.execSync(s)'",
+        "python3 -c 'from shutil import rmtree as wipe; wipe(\"/tmp\")'",
+        "python3 -c 'import shutil; shutil.rmtree(\"/tmp\")'",
+    ] {
+        fixture.denied(command);
+    }
+    fixture.write(
+        "alias.py",
+        "from shutil import rmtree as wipe\nwipe('/tmp')\n",
+    );
+    fixture.destructive("python3 alias.py", "alias.py");
+    fixture.write("env", "git reset --hard\n");
+    fixture.unverified("./env");
+    fixture.write(
+        "read_only.py",
+        "s = 'run $(git reset --hard) later'\nprint(s)\n",
+    );
+    fixture.write(
+        "read_only.js",
+        "const s = 'run $(git reset --hard) later'; console.log(s);\n",
+    );
+    fixture.allowed("python3 read_only.py");
+    fixture.allowed("node read_only.js");
+    fixture.write(
+        "indirect.py",
+        "import os\ns = 'echo $(git reset --hard)'\nos.system(s)\n",
+    );
+    fixture.write(
+        "indirect.js",
+        "const cp = require('child_process');\nconst s = 'echo $(git reset --hard)';\ncp.execSync(s);\n",
+    );
+    fixture.denied("python3 indirect.py");
+    fixture.destructive("node indirect.js", "indirect.js");
+    fixture.unverified("./bash --version");
+    fixture.unverified("bash --version safe.sh");
+    fixture.denied("bash --version; git reset --hard");
+    fixture.denied("node --version; git reset --hard");
+}
+
+#[test]
 fn literal_and_wrapped_shell_launchers_inspect_the_file() {
     let fixture = Fixture::new();
     fixture.write("danger.sh", "#!/bin/sh\ngit reset --hard\n");

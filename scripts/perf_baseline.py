@@ -6,6 +6,11 @@ and records p50/p95/p99/mean/throughput with basic build metadata.
 
 Usage:
   ./scripts/perf_baseline.py --bin ./target/release/dcg --output perf/baselines/latest.json
+
+Paired issue #555 investigation (separate from the absolute latency gate):
+  ./scripts/perf_baseline.py --bin ./target/release/dcg --compare-bin /path/to/incumbent \\
+      --runs 30 --warmup 3 --history-profiles disabled,enabled,seeded,locked \\
+      --output /tmp/dcg-heredoc-comparison.json
 """
 
 from __future__ import annotations
@@ -19,12 +24,18 @@ import os
 import platform
 import re
 import shutil
+import sqlite3
 import statistics
 import subprocess
 import sys
 import tempfile
 import time
 from typing import Any, Callable, Dict, List, Optional, TextIO, Tuple
+
+try:
+    import resource
+except ImportError:  # Windows: wall timing and phase diagnostics still work.
+    resource = None  # type: ignore[assignment]
 
 
 PROCESS_BACKSTOP_SECONDS = 30.0
@@ -160,6 +171,7 @@ def inspect_hook_result(
         )
 
     observed_decision: str
+    rule_id = None
     if not result.stdout:
         observed_decision = "allow"
         if result.stderr:
@@ -171,6 +183,7 @@ def inspect_hook_result(
         try:
             parsed = json.loads(result.stdout)
             observed_decision = parsed["hookSpecificOutput"]["permissionDecision"]
+            rule_id = parsed["hookSpecificOutput"].get("ruleId")
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise RuntimeError(
                 f"{context} emitted non-hook stdout; refusing to credit it: "
@@ -192,6 +205,7 @@ def inspect_hook_result(
     return {
         "expected_decision": expected_decision,
         "observed_decision": observed_decision,
+        "rule_id": rule_id,
         "returncode": result.returncode,
         "stdout_bytes": len(result.stdout),
         "stderr_bytes": len(result.stderr),
@@ -852,6 +866,28 @@ def build_cases() -> List[Dict[str, Any]]:
             "env": {},
             "expected_decision": "allow",
         },
+        *[
+            {
+                "id": f"issue_555_{shape}_{lines}",
+                "description": "Fresh-process heredoc scaling (#555)",
+                "command": prefix + "print('ordinary data')\n" * lines + suffix,
+                "env": {},
+                "expected_decision": decision,
+            }
+            for lines in (1, 40, 300)
+            for shape, prefix, suffix, decision in (
+                ("python", "python3 - <<'EOF'\n", "EOF", "allow"),
+                ("data", "cat <<'EOF'\n", "rm -rf /\nEOF", "allow"),
+                ("deny", "python3 - <<'EOF'\n", "import shutil\nshutil.rmtree('/tmp')\nEOF", "deny"),
+            )
+        ],
+        {
+            "id": "issue_555_compound",
+            "description": "Compound shell shape from #555",
+            "command": "cd project && git status --short | head && grep -rn foo src | wc -l",
+            "env": {},
+            "expected_decision": "allow",
+        },
         {
             "id": "destructive_keyword",
             "description": "Keyword present, destructive match",
@@ -919,6 +955,464 @@ def build_cases() -> List[Dict[str, Any]]:
             "expected_decision": "allow",
         },
     ]
+
+
+def build_heredoc_comparison_cases() -> List[Dict[str, Any]]:
+    """Representative #555 shapes; strings go only to dcg, never a shell."""
+    cases = [
+        {
+            "id": "short_ls",
+            "command": "ls -la",
+            "expected_decision": "allow",
+        },
+        {
+            "id": "compound_pipeline",
+            "command": "pwd && git status --short; printf '%s\\n' ready | head -n 1",
+            "expected_decision": "allow",
+        },
+    ]
+    for lines in (40, 300):
+        body = "".join(f"value_{index} = {index}\n" for index in range(lines - 1))
+        body += "print('ready')\n"
+        danger = "import shutil\nshutil.rmtree('/home/user/project')\n"
+        for suffix, content, decision in (
+            ("safe", body, "allow"),
+            ("deny_start", danger + body, "deny"),
+            ("deny_end", body + danger, "deny"),
+        ):
+            cases.append(
+                {
+                    "id": f"python_{lines}_{suffix}",
+                    "command": f"python3 - <<'PY'\n{content}PY",
+                    "expected_decision": decision,
+                }
+            )
+        data = "Document `git reset --hard` and $(rm -rf /); an odd \" quote\n" * lines
+        cases.extend(
+            [
+                {
+                    "id": f"quoted_data_{lines}",
+                    "command": f"cat <<'TEXT'\n{data}TEXT",
+                    "expected_decision": "allow",
+                },
+                {
+                    "id": f"commit_message_{lines}",
+                    "command": f'git commit -m "$(cat <<\'TEXT\'\n{data}TEXT\n)"',
+                    "expected_decision": "allow",
+                },
+            ]
+        )
+    cases.extend(
+        [
+            {
+                "id": "nested_inline_interpreter",
+                "command": (
+                    "bash <<'SH'\npython3 -c \"import shutil; "
+                    "shutil.rmtree('/home/user/project')\"\nSH"
+                ),
+                "expected_decision": "deny",
+            },
+            {
+                "id": "expanding_data_substitution",
+                "command": "cat <<TEXT\n$(git reset --hard)\nTEXT",
+                "expected_decision": "deny",
+            },
+            {
+                "id": "data_pipe_to_shell",
+                "command": "cat <<'TEXT' | bash\nrm -rf /home/user/project\nTEXT",
+                "expected_decision": "deny",
+            },
+            {
+                "id": "unterminated_executable_heredoc",
+                "command": (
+                    "python3 - <<'PY'\nimport shutil\n"
+                    "shutil.rmtree('/home/user/project')\n"
+                ),
+                "expected_decision": "deny",
+            },
+        ]
+    )
+    return cases
+
+
+def build_heredoc_security_controls() -> List[Dict[str, Any]]:
+    # This previously untested nested form is a demonstrated incumbent gap.
+    # Record the incumbent's actual verdict, require a safe candidate verdict,
+    # and never treat its faster incomplete analysis as performance evidence.
+    return [
+        {
+            "id": "nested_interpreter_heredoc",
+            "command": (
+                "bash <<'SH'\npython3 - <<'PY'\nimport shutil\n"
+                "shutil.rmtree('/home/user/project')\nPY\nSH"
+            ),
+            "expected_decision": "deny",
+        }
+    ]
+
+
+def observe_security_control(
+    bin_path: str, case: Dict[str, Any], env: Dict[str, str], working_directory: str
+) -> Dict[str, Any]:
+    result = subprocess.run(
+        [bin_path, "--agent", PERF_HOOK_AGENT],
+        input=json.dumps(
+            {"tool_name": "Bash", "tool_input": {"command": case["command"]}}
+        ).encode(),
+        capture_output=True,
+        check=False,
+        env=env,
+        cwd=working_directory,
+        timeout=PROCESS_BACKSTOP_SECONDS,
+    )
+    # Validate the protocol independently of this baseline's known safety gap.
+    # Candidate compliance is checked explicitly by the comparison runner.
+    observed = "allow" if not result.stdout else "deny"
+    wire = inspect_hook_result(result, observed, f"security control {case['id']}")
+    wire["expected_decision"] = case["expected_decision"]
+    wire["satisfies_requirement"] = observed == case["expected_decision"]
+    return wire
+
+
+def child_cpu_seconds() -> Optional[float]:
+    """CPU consumed by this harness's completed children, including threads."""
+    if resource is None:
+        return None
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return usage.ru_utime + usage.ru_stime
+
+
+def run_comparison_sample(
+    bin_path: str,
+    case: Dict[str, Any],
+    env: Dict[str, str],
+    working_directory: str,
+    bypass: bool = False,
+) -> Dict[str, Any]:
+    payload = json.dumps(
+        {"tool_name": "Bash", "tool_input": {"command": case["command"]}}
+    ).encode()
+    invocation_env = env.copy()
+    if bypass:
+        invocation_env["DCG_BYPASS"] = "1"
+    cpu_start = child_cpu_seconds()
+    start = time.perf_counter_ns()
+    result = subprocess.run(
+        [bin_path, "--agent", PERF_HOOK_AGENT],
+        input=payload,
+        capture_output=True,
+        check=False,
+        env=invocation_env,
+        cwd=working_directory,
+        timeout=PROCESS_BACKSTOP_SECONDS,
+    )
+    end = time.perf_counter_ns()
+    cpu_end = child_cpu_seconds()
+    # Stop both clocks before inspecting bytes. Even one wrong timed verdict
+    # fails the comparison; an early allow never counts as a speed improvement.
+    sample: Dict[str, Any] = {
+        "wall_ms": (end - start) / 1_000_000.0,
+        "cpu_ms": (
+            None if cpu_start is None or cpu_end is None
+            else (cpu_end - cpu_start) * 1000.0
+        ),
+    }
+    try:
+        sample["wire"] = inspect_hook_result(
+            result,
+            "allow" if bypass else case["expected_decision"],
+            f"comparison {case['id']} ({'bypass' if bypass else 'full'})",
+        )
+    except RuntimeError as exc:
+        # Keep the failed invocation's evidence without admitting it into a
+        # successful timing summary. The runner aborts immediately below.
+        sample["error"] = str(exc)
+        sample["process"] = {
+            "returncode": result.returncode,
+            "stdout": result.stdout.decode(errors="replace"),
+            "stderr": result.stderr.decode(errors="replace"),
+        }
+    return sample
+
+
+def capture_phase_profile(
+    bin_path: str,
+    case: Dict[str, Any],
+    env: Dict[str, str],
+    working_directory: str,
+) -> Dict[str, Any]:
+    """Instrument a separate process, preserving the ordinary wire checks."""
+    profiled_env = {**env, "DCG_PROFILE": "1"}
+    result = subprocess.run(
+        [bin_path, "--agent", PERF_HOOK_AGENT],
+        input=json.dumps(
+            {"tool_name": "Bash", "tool_input": {"command": case["command"]}}
+        ).encode(),
+        capture_output=True,
+        check=False,
+        env=profiled_env,
+        cwd=working_directory,
+        timeout=PROCESS_BACKSTOP_SECONDS,
+    )
+    prefix = b"DCG_PROFILE "
+    lines = result.stderr.splitlines(keepends=True)
+    profiles = [json.loads(line[len(prefix):]) for line in lines if line.startswith(prefix)]
+    if len(profiles) > 1:
+        raise RuntimeError("profiled process emitted more than one DCG_PROFILE record")
+    result.stderr = b"".join(line for line in lines if not line.startswith(prefix))
+    wire = inspect_hook_result(result, case["expected_decision"], "phase profile control")
+    return {
+        "status": "available" if profiles else "unsupported",
+        "measurement": profiles[0] if profiles else None,
+        "wire": wire,
+    }
+
+
+def summarize_comparison_samples(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "wall": summarize_timings([sample["wall_ms"] for sample in samples]),
+        "cpu": (
+            None if samples[0]["cpu_ms"] is None
+            else summarize_timings([sample["cpu_ms"] for sample in samples])
+        ),
+        "samples": samples,
+    }
+
+
+def paired_comparison_delta(
+    left: List[Dict[str, Any]], right: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    output = {}
+    for clock in ("wall", "cpu"):
+        key = f"{clock}_ms"
+        if left[0][key] is None or right[0][key] is None:
+            output[clock] = None
+            continue
+        values = [before[key] - after[key] for before, after in zip(left, right)]
+        output[clock] = {**summarize_paired_deltas(values), "samples_ms": values}
+    return output
+
+
+def prepare_comparison_history(
+    bin_path: str,
+    env: Dict[str, str],
+    isolation: Dict[str, Any],
+    profile: str,
+    seed_rows: int,
+) -> Tuple[Dict[str, Any], Optional[sqlite3.Connection]]:
+    if profile == "disabled":
+        return {"enabled": False}, None
+    env.pop("DCG_HISTORY_DISABLED", None)
+    env["DCG_HISTORY_ENABLED"] = "1"
+    database = os.path.join(isolation["root"], "history.db")
+    env["DCG_HISTORY_DB"] = database
+    validate_hook_case(bin_path, "ls -la", env, isolation["working_directory"], "allow")
+    connection = sqlite3.connect(database, timeout=5)
+    try:
+        if profile == "seeded":
+            # Exercise the real schema, indexes and FTS triggers. These are
+            # synthetic benign rows in a fresh DB, never the operator's history.
+            statement = (
+                "INSERT INTO commands(timestamp, agent_type, working_dir, command, "
+                "command_hash, outcome, eval_duration_us) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            )
+            timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            command = "ls -la"
+            row = (
+                timestamp, PERF_HOOK_AGENT, isolation["working_directory"], command,
+                hashlib.sha256(command.encode()).hexdigest(), "allow", 84_000,
+            )
+            connection.executemany(statement, (row for _ in range(seed_rows)))
+            connection.commit()
+        evidence = {
+            "enabled": True,
+            "database_path": database,
+            "synthetic_seed_rows": seed_rows if profile == "seeded" else 0,
+            "rows_before": connection.execute("SELECT COUNT(*) FROM commands").fetchone()[0],
+            "journal_mode": connection.execute("PRAGMA journal_mode").fetchone()[0],
+            "database_bytes_before": os.path.getsize(database),
+            "held_writer_lock": profile == "locked",
+        }
+        if profile == "locked":
+            # Hold a real competing SQLite writer for the whole profile. dcg
+            # must retain its verdict while best-effort telemetry times out.
+            connection.execute("BEGIN IMMEDIATE")
+            return evidence, connection
+        connection.close()
+        return evidence, None
+    except BaseException:
+        connection.close()
+        raise
+
+
+def run_heredoc_comparison(args: argparse.Namespace, repo_root: str) -> int:
+    """Paired investigation, deliberately not an absolute-gate certificate."""
+    candidate = os.path.realpath(os.path.abspath(args.bin))
+    incumbent = os.path.realpath(os.path.abspath(args.compare_bin))
+    for binary in (candidate, incumbent):
+        if not os.path.isfile(binary) or not os.access(binary, os.X_OK):
+            raise RuntimeError(f"comparison binary is not executable: {binary}")
+    if args.warmup < 0 or args.runs <= 0 or args.history_seed_rows < 0:
+        raise RuntimeError("comparison requires warmup >= 0, runs > 0, seed rows >= 0")
+    profiles = args.history_profiles.split(",")
+    if not profiles or len(profiles) != len(set(profiles)) or any(
+        profile not in ("disabled", "enabled", "seeded", "locked") for profile in profiles
+    ):
+        raise RuntimeError("--history-profiles needs unique disabled,enabled,seeded,locked values")
+    cases = build_heredoc_comparison_cases()
+    requested = set(args.compare_case or [])
+    unknown = requested - {case["id"] for case in cases}
+    if unknown:
+        raise RuntimeError(f"unknown comparison cases: {sorted(unknown)}")
+    if requested:
+        cases = [case for case in cases if case["id"] in requested]
+    payload: Dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "paired_heredoc_investigation",
+        "probe_complete": False,
+        "host_before": capture_host_context(),
+        "warmup": args.warmup,
+        "runs": args.runs,
+        "expected_case_ids": [case["id"] for case in cases],
+        "expected_history_profiles": profiles,
+        "expected_security_control_ids": [case["id"] for case in build_heredoc_security_controls()],
+        "candidate_security_violations": [],
+        "incumbent_security_gaps": [],
+        "measurement_notes": [
+            "Fresh processes; adjacent incumbent/candidate and full/bypass orders alternate.",
+            "Every timed invocation's exit status, stdout decision and stderr are checked.",
+            "DCG_BYPASS is a matched startup/protocol floor, not a pure OS spawn measurement.",
+            "CPU is child user+system time including all dcg threads; unavailable on Windows.",
+            "Wall minus CPU includes scheduling and I/O; history profiles isolate a storage lever.",
+            "Phase diagnostics use separate untimed processes; timings have DCG_PROFILE unset.",
+            "No shell command in a fixture is executed; only dcg receives the JSON payload.",
+            "Known incumbent safety gaps are untimed controls; candidate compliance is mandatory.",
+            "This investigation does not replace the source-bound absolute latency gate.",
+        ],
+        "binaries": {},
+        "profiles": [],
+    }
+    metadata_env, metadata_isolation = create_isolated_environment()
+    for label, binary in (("incumbent", incumbent), ("candidate", candidate)):
+        version = capture_version_output(binary, metadata_env, metadata_isolation["working_directory"])
+        payload["binaries"][label] = {
+            "path": binary,
+            "sha256": sha256_file(binary),
+            "bytes": os.path.getsize(binary),
+            "version_output": version,
+            "embedded_git_sha": extract_embedded_git_sha(version),
+            "embedded_git_describe": extract_embedded_git_describe(version),
+            "embedded_toolchain": extract_embedded_rustc_toolchain(version),
+        }
+    payload["repository_git_sha"] = capture_git_sha(repo_root, metadata_env)
+    payload["repository_git_state"] = capture_git_state(repo_root, metadata_env)
+    payload["same_toolchain"] = (
+        payload["binaries"]["incumbent"]["embedded_toolchain"]
+        == payload["binaries"]["candidate"]["embedded_toolchain"]
+        and not invalid_rustc_identity_fields(payload["binaries"]["candidate"]["embedded_toolchain"])
+    )
+    locks: List[sqlite3.Connection] = []
+    try:
+        for profile in profiles:
+            prepared = {}
+            profile_result: Dict[str, Any] = {
+                "id": profile, "environments": {}, "cases": [], "security_controls": [],
+            }
+            payload["profiles"].append(profile_result)
+            for label, binary in (("incumbent", incumbent), ("candidate", candidate)):
+                env, isolation = create_isolated_environment()
+                history, lock = prepare_comparison_history(
+                    binary, env, isolation, profile, args.history_seed_rows
+                )
+                if lock is not None:
+                    locks.append(lock)
+                prepared[label] = (binary, env, isolation["working_directory"])
+                profile_result["environments"][label] = {
+                    "isolation": isolation,
+                    "effective_environment": {
+                        key: value for key, value in env.items() if key.startswith("DCG_")
+                    },
+                    "history": history,
+                }
+            for case in cases:
+                print(f"comparison {profile}: {case['id']}", file=sys.stderr, flush=True)
+                samples: Dict[str, List[Dict[str, Any]]] = {
+                    key: [] for key in ("incumbent", "candidate", "incumbent_bypass", "candidate_bypass")
+                }
+                result: Dict[str, Any] = {
+                    **case,
+                    "command_bytes": len(case["command"].encode()),
+                    "measurement_complete": False,
+                    "profile_complete": False,
+                    "partial_samples": samples,
+                    "phase_profiles": {},
+                }
+                profile_result["cases"].append(result)
+                for index in range(args.warmup + args.runs):
+                    labels = ("incumbent", "candidate") if index % 2 == 0 else ("candidate", "incumbent")
+                    modes = (False, True) if (index // 2) % 2 == 0 else (True, False)
+                    for bypass in modes:
+                        for label in labels:
+                            binary, env, working_directory = prepared[label]
+                            sample = run_comparison_sample(binary, case, env, working_directory, bypass)
+                            if "error" in sample:
+                                result["failed_invocation"] = {
+                                    "binary": label,
+                                    "mode": "bypass" if bypass else "full",
+                                    "iteration": index,
+                                    "warmup": index < args.warmup,
+                                    "sample": sample,
+                                }
+                                raise RuntimeError(f"{label}: {sample['error']}")
+                            if index >= args.warmup:
+                                samples[label + ("_bypass" if bypass else "")].append(sample)
+                result.update({
+                    "measurement_complete": True,
+                    "measurements": {label: summarize_comparison_samples(values) for label, values in samples.items()},
+                    "incumbent_minus_candidate": paired_comparison_delta(samples["incumbent"], samples["candidate"]),
+                    "evaluator_delta": {
+                        label: paired_comparison_delta(samples[label], samples[label + "_bypass"])
+                        for label in ("incumbent", "candidate")
+                    },
+                })
+                del result["partial_samples"]
+                for label, (binary, env, working_directory) in prepared.items():
+                    result["phase_profiles"][label] = capture_phase_profile(binary, case, env, working_directory)
+                result["profile_complete"] = True
+            for case in build_heredoc_security_controls():
+                control = {**case, "observations": {}}
+                for label, (binary, env, working_directory) in prepared.items():
+                    wire = observe_security_control(binary, case, env, working_directory)
+                    control["observations"][label] = wire
+                    if not wire["satisfies_requirement"]:
+                        key = "candidate_security_violations" if label == "candidate" else "incumbent_security_gaps"
+                        payload[key].append({"profile": profile, "case_id": case["id"], "wire": wire})
+                profile_result["security_controls"].append(control)
+            for lock in locks:
+                lock.rollback()
+                lock.close()
+            locks.clear()
+            for label in ("incumbent", "candidate"):
+                history = profile_result["environments"][label]["history"]
+                if history["enabled"]:
+                    with sqlite3.connect(history["database_path"]) as db:
+                        history["rows_after"] = db.execute("SELECT COUNT(*) FROM commands").fetchone()[0]
+        for label, binary in (("incumbent", incumbent), ("candidate", candidate)):
+            if sha256_file(binary) != payload["binaries"][label]["sha256"]:
+                raise RuntimeError(f"{label} binary changed during the comparison")
+        payload["probe_complete"] = True
+        payload["result"] = "FAIL" if payload["candidate_security_violations"] else "PASS"
+    except Exception as exc:
+        payload["result"] = "ERROR"
+        payload["error"] = str(exc)
+        print(f"comparison failed: {exc}", file=sys.stderr)
+    finally:
+        for lock in locks:
+            lock.rollback()
+            lock.close()
+        payload["host_after"] = capture_host_context()
+        write_json_payload(payload, args.output)
+    return 0 if payload.get("result") == "PASS" else 1
 
 
 def create_isolated_environment() -> Tuple[Dict[str, str], Dict[str, Any]]:
@@ -1192,6 +1686,38 @@ def run_internal_self_tests() -> None:
         0 <= large_allowance < 15_000,
         "large-sample binomial tolerance calculation underflowed",
     )
+
+    comparison_cases = {case["id"]: case for case in build_heredoc_comparison_cases()}
+    for lines in (40, 300):
+        source = comparison_cases[f"python_{lines}_safe"]["command"].splitlines()
+        require(
+            len(source) == lines + 2 and source[0] == "python3 - <<'PY'" and source[-1] == "PY",
+            "#555 safe Python fixtures must preserve their advertised body line counts",
+        )
+        for position in ("start", "end"):
+            require(
+                comparison_cases[f"python_{lines}_deny_{position}"]["expected_decision"] == "deny",
+                "#555 destructive body positions must never be benchmarked as allow",
+            )
+    signed = paired_comparison_delta(
+        [{"wall_ms": 1.0, "cpu_ms": 0.2}],
+        [{"wall_ms": 2.0, "cpu_ms": 0.3}],
+    )
+    require(
+        signed["wall"]["samples_ms"] == [-1.0]
+        and signed["cpu"]["samples_ms"][0] < 0,
+        "paired comparison must retain negative wall and CPU deltas as loss evidence",
+    )
+    try:
+        inspect_hook_result(
+            subprocess.CompletedProcess(["dcg"], 0, stdout=b"", stderr=b""),
+            "deny",
+            "synthetic timed fail-open",
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("a timed silent allow must fail an expected-deny measurement")
 
     empty_gate = build_latency_gate(True, 1_000, 1_000, 1_000, 50, [], [], [])
     require(
@@ -1510,6 +2036,26 @@ def main() -> int:
     parser.add_argument("--runs", type=int, default=300, help="Measured iterations per case")
     parser.add_argument("--skip-trace", action="store_true", help="Skip explain trace capture")
     parser.add_argument(
+        "--compare-bin",
+        help="Run a paired #555 investigation against this incumbent binary (not the absolute gate)",
+    )
+    parser.add_argument(
+        "--history-profiles",
+        default="disabled,enabled",
+        help="Comparison profiles: comma-separated disabled,enabled,seeded,locked",
+    )
+    parser.add_argument(
+        "--history-seed-rows",
+        type=int,
+        default=247_625,
+        help="Synthetic rows in each isolated seeded history database (default: 247625)",
+    )
+    parser.add_argument(
+        "--compare-case",
+        action="append",
+        help="Run only this #555 case; repeat to select several (default: all)",
+    )
+    parser.add_argument(
         "--assert-budget-ms",
         type=int,
         default=None,
@@ -1649,6 +2195,17 @@ def main() -> int:
             return 1
     elif args.assert_margin_pct <= 0:
         print("error: --assert-margin-pct must be > 0", file=sys.stderr)
+        return 1
+
+    if args.compare_bin:
+        if gate_enabled:
+            reason = "--compare-bin investigation cannot be combined with the absolute latency gate"
+            emit_gate_abort(args.output, reason, args.assert_budget_ms, args.assert_margin_pct)
+            print(f"error: {reason}", file=sys.stderr)
+            return 1
+        return run_heredoc_comparison(args, repo_root)
+    if args.compare_case:
+        print("error: --compare-case requires --compare-bin", file=sys.stderr)
         return 1
 
     try:

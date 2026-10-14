@@ -1261,6 +1261,7 @@ impl PackEntry {
 
                 // Only build RegexSet if we have linear patterns
                 if !patterns.is_empty() {
+                    let _phase = crate::perf::phase(crate::perf::ProfilePhase::RegexCompile);
                     pack.safe_regex_set = regex::RegexSet::new(patterns).ok();
                 }
             }
@@ -3485,10 +3486,31 @@ fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8], offset: usize) ->
     if needle.is_empty() || offset > haystack.len() || needle.len() > haystack.len() - offset {
         return None;
     }
-    haystack[offset..]
-        .windows(needle.len())
-        .position(|window| window.eq_ignore_ascii_case(needle))
-        .map(|position| offset + position)
+
+    // Every complete match must start with the needle's first byte, allowing
+    // only the same ASCII case fold as the full comparison below. Search those
+    // candidate positions with memchr instead of comparing a window at every
+    // byte for every keyword. This matters especially after a large data
+    // heredoc has been masked to spaces: the unchanged keyword rules still
+    // inspect its complete source view, but almost no position is a candidate.
+    let first = needle[0];
+    let last_start = haystack.len() - needle.len();
+    let starts = &haystack[offset..=last_start];
+    let matches_at = |&position: &usize| {
+        let start = offset + position;
+        haystack[start..start + needle.len()].eq_ignore_ascii_case(needle)
+    };
+    let position = if first.is_ascii_alphabetic() {
+        memchr::memchr2_iter(
+            first.to_ascii_lowercase(),
+            first.to_ascii_uppercase(),
+            starts,
+        )
+        .find(matches_at)
+    } else {
+        memchr::memchr_iter(first, starts).find(matches_at)
+    };
+    position.map(|position| offset + position)
 }
 
 fn split_keyword_parts(keyword: &str) -> SmallVec<[&str; 4]> {
@@ -3852,6 +3874,7 @@ pub fn pack_aware_quick_reject(cmd: &str, enabled_keywords: &[&str]) -> bool {
 /// inner commands cannot be hidden behind a safe outer command.
 #[must_use]
 pub fn split_command_segments(cmd: &str) -> Vec<&str> {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellSegmentation);
     let mut segments: Vec<&str> = Vec::new();
     collect_command_segments(cmd, 0, cmd.len(), 0, true, &mut segments);
 
@@ -3876,6 +3899,7 @@ pub(crate) fn split_command_segments_in_dialect(
     cmd: &str,
     dialect: crate::normalize::ShellDialect,
 ) -> Vec<&str> {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellSegmentation);
     if matches!(
         dialect,
         crate::normalize::ShellDialect::Posix | crate::normalize::ShellDialect::Unknown
@@ -4428,6 +4452,191 @@ fn pack_aware_quick_reject_from_normalized_spans(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reference_find_ascii_case_insensitive(
+        haystack: &[u8],
+        needle: &[u8],
+        offset: usize,
+    ) -> Option<usize> {
+        if needle.is_empty() || offset > haystack.len() || needle.len() > haystack.len() - offset {
+            return None;
+        }
+        haystack[offset..]
+            .windows(needle.len())
+            .position(|window| window.eq_ignore_ascii_case(needle))
+            .map(|position| offset + position)
+    }
+
+    #[test]
+    fn keyword_candidate_search_matches_every_byte_and_offset_issue_555() {
+        for byte in 0..=u8::MAX {
+            let haystack = [
+                byte ^ 0x20,
+                byte,
+                0,
+                u8::MAX,
+                byte.to_ascii_uppercase(),
+                byte.to_ascii_lowercase(),
+                0x80,
+                byte,
+                byte,
+                0,
+            ];
+            let needles: &[&[u8]] = &[
+                &[],
+                &[byte],
+                &[byte, 0],
+                &[byte, u8::MAX],
+                &[byte, 0x80],
+                &[byte, byte],
+                &[0x80, byte],
+                &[byte; 11],
+            ];
+            for needle in needles {
+                for offset in (0..=haystack.len() + 1).chain(std::iter::once(usize::MAX)) {
+                    assert_eq!(
+                        find_ascii_case_insensitive(&haystack, needle, offset),
+                        reference_find_ascii_case_insensitive(&haystack, needle, offset),
+                        "byte={byte}, needle={needle:?}, offset={offset}",
+                    );
+                }
+            }
+        }
+
+        for haystack in [
+            &b""[..],
+            &b"Git gIT giT GIT gitgit gix git"[..],
+            &b"aaAaAAAaAAaAAaAaab"[..],
+            &[0xff, 0x80, b'G', b'i', b't', 0, 0xc3, 0xa9, 0xc3, 0x89][..],
+        ] {
+            for needle in [
+                &b""[..],
+                &b"gIt"[..],
+                &b"GITGIT"[..],
+                &b"aAaB"[..],
+                &b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"[..],
+                &[0xff, 0x80][..],
+                &[0xc3, 0x89][..],
+                &[0][..],
+            ] {
+                for offset in 0..=haystack.len() + 1 {
+                    assert_eq!(
+                        find_ascii_case_insensitive(haystack, needle, offset),
+                        reference_find_ascii_case_insensitive(haystack, needle, offset),
+                        "haystack={haystack:?}, needle={needle:?}, offset={offset}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keyword_candidate_search_preserves_large_masked_sources_issue_555() {
+        for lines in [40, 300] {
+            let line = " ".repeat(55) + "\n";
+            let command = format!("cat <<'TEXT'\n{}TEXT\ngIT status", line.repeat(lines));
+            let offsets = std::iter::once(0)
+                .chain(command.match_indices('\n').map(|(at, _)| at + 1))
+                .chain([
+                    command.len().saturating_sub(1),
+                    command.len(),
+                    command.len() + 1,
+                ]);
+            for offset in offsets {
+                for needle in [&b"rm"[..], &b"GIT"[..], &b"TEXT"[..], &b" "[..]] {
+                    assert_eq!(
+                        find_ascii_case_insensitive(command.as_bytes(), needle, offset),
+                        reference_find_ascii_case_insensitive(command.as_bytes(), needle, offset),
+                        "lines={lines}, needle={needle:?}, offset={offset}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "paired keyword-search timing; run in release mode with --nocapture"]
+    fn paired_keyword_search_benchmark_issue_555() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const REPEATS: usize = 32;
+        let needles: &[&[u8]] = &[
+            b"git",
+            b"rm",
+            b"truncate",
+            b".git",
+            b"> /",
+            b"aaab",
+            b"aaaa",
+            b"A",
+            &[0x80],
+        ];
+        for lines in [40, 300] {
+            for (shape, line) in [
+                (
+                    "masked",
+                    "                                                       \n",
+                ),
+                (
+                    "frequent",
+                    "aaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaa\n",
+                ),
+            ] {
+                let source = format!("cat <<'TEXT'\n{}TEXT", line.repeat(lines));
+                let expected: Vec<_> = needles
+                    .iter()
+                    .map(|needle| {
+                        reference_find_ascii_case_insensitive(source.as_bytes(), needle, 0)
+                    })
+                    .collect();
+                let expected = expected.repeat(REPEATS);
+                let run = |reference: bool| {
+                    let mut found = Vec::with_capacity(REPEATS * needles.len());
+                    let start = Instant::now();
+                    for _ in 0..REPEATS {
+                        for needle in needles {
+                            found.push(if reference {
+                                reference_find_ascii_case_insensitive(
+                                    black_box(source.as_bytes()),
+                                    black_box(needle),
+                                    0,
+                                )
+                            } else {
+                                find_ascii_case_insensitive(
+                                    black_box(source.as_bytes()),
+                                    black_box(needle),
+                                    0,
+                                )
+                            });
+                        }
+                    }
+                    (start.elapsed(), found)
+                };
+                let mut reference_times = Vec::new();
+                let mut candidate_times = Vec::new();
+                for sample in 0..11 {
+                    for reference in [sample % 2 == 0, sample % 2 != 0] {
+                        let (elapsed, found) = run(reference);
+                        assert_eq!(found, expected, "{shape}/{lines}/{sample}");
+                        if reference {
+                            reference_times.push(elapsed);
+                        } else {
+                            candidate_times.push(elapsed);
+                        }
+                    }
+                }
+                reference_times.sort_unstable();
+                candidate_times.sort_unstable();
+                eprintln!(
+                    "keyword_search/{shape}/{lines}: legacy_p50_us={:.3} candidate_p50_us={:.3} speedup={:.2}x",
+                    reference_times[5].as_secs_f64() * 1_000_000.0,
+                    candidate_times[5].as_secs_f64() * 1_000_000.0,
+                    reference_times[5].as_secs_f64() / candidate_times[5].as_secs_f64(),
+                );
+            }
+        }
+    }
 
     /// Pack-authored denial text (#416): a rule's text wins, the pack's is
     /// the fallback, an unknown pack has none, and invalid text is refused at

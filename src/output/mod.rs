@@ -66,6 +66,9 @@ static FORCE_PLAIN: OnceLock<bool> = OnceLock::new();
 /// Global flag for suggestions display (set by --no-suggestions).
 static SUGGESTIONS_ENABLED: OnceLock<bool> = OnceLock::new();
 
+/// Resolved CLI/environment robot setting, installed before hook diagnostics.
+static ROBOT_MODE: OnceLock<bool> = OnceLock::new();
+
 /// Initialize the output system with explicit settings.
 ///
 /// Call this early in `main()` if you want to override TTY detection.
@@ -78,6 +81,17 @@ pub fn init(force_plain: bool) {
 /// Call this early in `main()` to control whether suggestions are shown.
 pub fn init_suggestions(enabled: bool) {
     let _ = SUGGESTIONS_ENABLED.set(enabled);
+}
+
+/// Install the resolved robot setting without changing process environment.
+pub fn init_robot_mode(enabled: bool) {
+    let _ = ROBOT_MODE.set(enabled);
+}
+
+/// Whether process diagnostics should remain quiet for machine consumption.
+#[must_use]
+pub fn is_robot_mode() -> bool {
+    ROBOT_MODE.get().copied().unwrap_or(false)
 }
 
 /// Determines whether rich terminal output should be used.

@@ -82,6 +82,102 @@ description = "make is safe"
 command = "make all"
 expected = "allow"
 
+# Issue #549: protecting shared temporary roots must preserve ordinary cleanup.
+[[case]]
+description = "python rmtree can clean an actual tmp child"
+command = "python3 -c \"import shutil; shutil.rmtree('/tmp/build')\""
+expected = "allow"
+
+[[case]]
+description = "python rmtree can clean an actual var tmp child"
+command = "python3 -c \"import shutil; shutil.rmtree('/var/tmp/build')\""
+expected = "allow"
+
+[[case]]
+description = "python rmtree can clean an actual private tmp child"
+command = "python3 -c \"import shutil; shutil.rmtree('/private/tmp/build')\""
+expected = "allow"
+
+[[case]]
+description = "python rmtree can clean an actual private var tmp child"
+command = "python3 -c \"import shutil; shutil.rmtree('/private/var/tmp/build')\""
+expected = "allow"
+
+[[case]]
+description = "python rmtree allows dot and repeated separator spelling of a tmp child"
+command = "python3 -c \"import shutil; shutil.rmtree('/tmp//./build//.')\""
+expected = "allow"
+
+[[case]]
+description = "python rmtree allows normalized components inside a temp root alias"
+command = "python3 -c \"import shutil; shutil.rmtree('/private/./var//tmp/build')\""
+expected = "allow"
+
+[[case]]
+description = "python rmtree permits dots within a child basename"
+command = "python3 -c \"import shutil; shutil.rmtree('/tmp/build..cache')\""
+expected = "allow"
+
+[[case]]
+description = "python rmtree module alias can clean a child from stdin heredoc"
+command = "python3 - <<'PY'\nimport shutil as sh\nsh.rmtree('/private/tmp/build')\nPY"
+expected = "allow"
+
+[[case]]
+description = "isolated Python heredoc can clean a real temp descendant"
+command = "python3 -I - <<'PY'\nimport shutil\nshutil.rmtree('/var/tmp/./build/')\nPY"
+expected = "allow"
+
+[[case]]
+description = "python rmtree preserves fresh tempfile directory cleanup"
+command = "python3 -c \"import shutil, tempfile; shutil.rmtree(tempfile.mkdtemp())\""
+expected = "allow"
+
+[[case]]
+description = "python heredoc preserves cleanup of imported mkdtemp output"
+command = "python3 - <<'PY'\nimport shutil\nfrom tempfile import mkdtemp\nshutil.rmtree(mkdtemp())\nPY"
+expected = "allow"
+
+[[case]]
+description = "directly imported python rmtree preserves temporary child cleanup"
+command = "python3 -c \"from shutil import rmtree; rmtree('/tmp/build')\""
+expected = "allow"
+
+[[case]]
+description = "renamed python rmtree preserves normalized temporary child cleanup"
+command = "python3 -c \"from shutil import rmtree as wipe; wipe('/private/./var//tmp/build')\""
+expected = "allow"
+
+[[case]]
+description = "parenthesized python import preserves child cleanup in a heredoc"
+command = "python3 - <<'PY'\nfrom shutil import (\n    rmtree as wipe,\n)\nwipe('/var/tmp/./build/')\nPY"
+expected = "allow"
+
+[[case]]
+description = "renamed python rmtree preserves fresh directory producer cleanup"
+command = "python3 -c \"from shutil import rmtree as wipe; import tempfile; wipe(tempfile.mkdtemp())\""
+expected = "allow"
+
+[[case]]
+description = "importing python rmtree without calling it is harmless"
+command = "python3 -c \"from shutil import rmtree as wipe; print('ready')\""
+expected = "allow"
+
+[[case]]
+description = "an unrelated python module can export its own rmtree helper"
+command = "python3 -c \"from project_helpers import rmtree; rmtree('/tmp')\""
+expected = "allow"
+
+[[case]]
+description = "definite python reassignment clears an imported rmtree binding"
+command = "python3 -c \"from shutil import rmtree as wipe; wipe = print; wipe('/tmp')\""
+expected = "allow"
+
+[[case]]
+description = "a python parameter shadows an imported rmtree binding"
+command = "python3 - <<'PY'\nfrom shutil import rmtree as wipe\ndef report(wipe):\n    wipe('/tmp')\nreport(print)\nPY"
+expected = "allow"
+
 # ============================================================================
 # Ordinary file organisation inside one home subtree
 #

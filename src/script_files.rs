@@ -156,6 +156,13 @@ pub(crate) fn evaluate(
         Ok(references) => references,
         Err(reason) => return (!resolve_unverified).then(|| unverified(&reason)),
     };
+    // A piped command has no single cwd suitable for an allowlist grant, but
+    // a leading absolute `cd ... &&` can still bind its script inputs. Keep
+    // this inspection-only proof separate from the caller's grant scope.
+    let inspection_cwd = cwd
+        .filter(|path| path.is_absolute() && path.is_dir())
+        .map(Path::to_path_buf)
+        .or_else(|| guarded_absolute_cwd(command));
     let mut first_warning = None;
     let mut first_denial = None;
     let mut incomplete = None;
@@ -168,10 +175,22 @@ pub(crate) fn evaluate(
                 "a remote/namespace script cannot be verified from local files",
             ));
         }
-        let Some(cwd) = cwd.filter(|path| path.is_absolute() && path.is_dir()) else {
+        let result = if let Some(cwd) = inspection_cwd.as_deref() {
+            inspect_reference(&reference, cwd, &mut evaluate_source)
+        } else if reference.language.is_none()
+            && !reference.sourced
+            && matches!(reference.format, FileFormat::Script)
+            && Path::new(&reference.path).is_absolute()
+        {
+            // Absolute native executables need no working directory. Reuse
+            // the normal no-symlink/regular-file/magic checks, but never let
+            // a script at that path borrow '/' as its execution directory.
+            inspect_reference(&reference, Path::new("/"), &mut |_, _, _| {
+                unverified("the command's execution directory is unknown")
+            })
+        } else {
             return Some(unverified("the command's execution directory is unknown"));
         };
-        let result = inspect_reference(&reference, cwd, &mut evaluate_source);
         match result {
             Ok(Some(ref result))
                 if resolve_unverified
@@ -214,6 +233,52 @@ fn definite(result: &EvaluationResult) -> bool {
         })
 }
 
+/// Bind only a leading absolute change whose successful branch contains all
+/// inspected commands. Semicolons, OR, backgrounding, groups, subsequent
+/// directory changes and expansions cannot supply this proof.
+fn guarded_absolute_cwd(command: &str) -> Option<PathBuf> {
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::Posix);
+    let first_separator = tokens
+        .iter()
+        .position(|token| token.kind == crate::normalize::NormalizeTokenKind::Separator)?;
+    let separator = &tokens[first_separator];
+    if separator.text(command) != Some("&&") {
+        return None;
+    }
+    let prefix = &command[..separator.byte_range.start];
+    let words = shell_words::split(prefix).ok()?;
+    let target = match words.as_slice() {
+        [cd, target] if cd == "cd" => target,
+        [cd, option, target] if cd == "cd" && option == "--" => target,
+        _ => return None,
+    };
+    if !Path::new(target).is_absolute() || crate::heredoc::shell_name_overridden(command, "cd") {
+        return None;
+    }
+    for token in &tokens[first_separator + 1..] {
+        let text = token.text(command)?;
+        let fd_redirect =
+            text == "&"
+                && token.byte_range.start.checked_sub(1).is_some_and(|before| {
+                    matches!(command.as_bytes().get(before), Some(b'<' | b'>'))
+                });
+        if token.kind == crate::normalize::NormalizeTokenKind::Separator
+            && !matches!(text, "&&" | "|" | "|&")
+            && !fd_redirect
+        {
+            return None;
+        }
+        let decoded = crate::normalize::decode_posix_syntax_token(text);
+        if matches!(
+            decoded.as_ref(),
+            "cd" | "pushd" | "popd" | "eval" | "source" | "." | "(" | ")" | "{" | "}"
+        ) {
+            return None;
+        }
+    }
+    crate::rebase_recovery::resolve_effective_cwd(Path::new("/"), prefix, ShellDialect::Posix)
+}
+
 fn references(command: &str, deadline: &Deadline) -> Result<Vec<Reference>, String> {
     if command.len() as u64 > MAX_TOTAL_BYTES {
         return Err("command exceeds script inspection's input bound".to_string());
@@ -227,6 +292,13 @@ fn references(command: &str, deadline: &Deadline) -> Result<Vec<Reference>, Stri
     while let Some(node) = pending.pop() {
         if deadline.is_exceeded() {
             return Err("script inspection deadline exceeded".to_string());
+        }
+        if node.kind().as_ref() == "heredoc_body" {
+            // The receiver-language pass owns these bytes. Shell expansion
+            // inside an unquoted body is independently evaluated as well.
+            // Reinterpreting Python/JS literals as Bash filenames here causes
+            // false unresolved-source denials before that analysis can run.
+            continue;
         }
         if node.kind().as_ref() == "command" {
             let text = node.text();
@@ -326,6 +398,15 @@ fn command_references(source: &str) -> Result<Vec<Reference>, String> {
     let is_env = words
         .first()
         .is_some_and(|word| word.rsplit('/').next() == Some("env"));
+    if words
+        .first()
+        .is_some_and(|word| matches!(word.as_str(), "env" | "/usr/bin/env" | "/bin/env"))
+        && (words.len() == 1 || words.len() == 2 && matches!(words[1].as_str(), "-0" | "--null"))
+    {
+        // With no executable operand these exact forms only print data. Do
+        // not extend this proof to a project-local executable named env.
+        return Ok(Vec::new());
+    }
     if is_env
         && words.iter().any(|word| {
             word.split_once('=').is_some_and(|(name, _)| {
@@ -480,6 +561,9 @@ fn executable_references(source: &str) -> Result<Vec<Reference>, String> {
     if language != ScriptLanguage::Unknown && name != "go" {
         return interpreter_references(&program, &args, language);
     }
+    if system_query_has_no_script_source(&program, &args) {
+        return Ok(Vec::new());
+    }
     if program.contains('/') || script_extension(&program).is_some() {
         return Ok(vec![Reference {
             sourced: !program.contains('/'),
@@ -489,6 +573,36 @@ fn executable_references(source: &str) -> Result<Vec<Reference>, String> {
         }]);
     }
     Ok(Vec::new())
+}
+
+/// These exact standard query invocations take data, not executable files.
+/// This is argument-role classification, not an allow: the command, live
+/// substitutions and every sibling still pass through the ordinary evaluator.
+/// In particular a remote query must not inspect an unrelated local namesake.
+fn system_query_has_no_script_source(program: &str, args: &[&str]) -> bool {
+    let words = args
+        .iter()
+        .map(|raw| static_word(raw))
+        .collect::<Result<Vec<_>, _>>();
+    let Ok(words) = words else {
+        return false;
+    };
+    match program {
+        "/usr/bin/uptime" => words.is_empty(),
+        "/usr/bin/memory_pressure" => words == ["-Q"],
+        "/usr/sbin/sysctl" | "/sbin/sysctl" => {
+            !words.is_empty()
+                && words.len() <= 32
+                && words.iter().all(|word| {
+                    word == "-n"
+                        || (word.contains('.')
+                            && word.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_')
+                            }))
+                })
+        }
+        _ => false,
+    }
 }
 
 fn interpreter_references(

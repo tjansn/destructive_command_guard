@@ -151,6 +151,124 @@ fn test_hook_output_contains_hook_event_name() {
 }
 
 #[test]
+fn issue_555_multiline_security_verdicts() {
+    for lines in [1, 40, 300] {
+        let body = "print('ordinary data')\n".repeat(lines);
+        for (command, deny) in [
+            (format!("python3 - <<'EOF'\n{body}EOF"), false),
+            (format!("cat <<'EOF'\n{body}rm -rf /\nEOF"), false),
+            (
+                format!("python3 - <<'EOF'\n{body}import shutil\nshutil.rmtree('/tmp')\nEOF"),
+                true,
+            ),
+            (
+                format!(
+                    "python3 - <<'EOF'\n{body}import os\nos.system(\"bash -c 'rm -rf /'\")\nEOF"
+                ),
+                true,
+            ),
+            (format!("cat <<EOF\n{body}$(rm -rf /)\nEOF"), true),
+            (format!("cat <<'EOF'\n{body}$(rm -rf /)\nEOF"), false),
+        ] {
+            let payload = serde_json::json!({"tool_name": "Bash",
+                "tool_input": {"command": command}})
+            .to_string();
+            let (stdout, stderr, code) = run_hook_mode_raw(&payload);
+            assert_eq!(code, 0, "{stderr}");
+            if deny {
+                let result: serde_json::Value = serde_json::from_str(&stdout)
+                    .unwrap_or_else(|_| panic!("missing denial for {command}: {stderr}"));
+                assert_eq!(
+                    result["hookSpecificOutput"]["permissionDecision"], "deny",
+                    "{command}: {stderr}"
+                );
+            } else {
+                assert!(
+                    stdout.is_empty() && stderr.is_empty(),
+                    "{command}: {stdout} {stderr}"
+                );
+            }
+        }
+    }
+    for command in [
+        "yes | { echo ok; rm -ri ./tree; }",
+        "exec 0<answers.txt; rm -ri ./tree",
+        "echo $(bash -c 'rm -rf /')",
+        "cat <<'EOF'\nordinary data\nEOF\nrm -rf /",
+    ] {
+        let payload = serde_json::json!({"tool_name": "Bash",
+            "tool_input": {"command": command}})
+        .to_string();
+        let (stdout, stderr, code) = run_hook_mode_raw(&payload);
+        assert_eq!(code, 0, "{stderr}");
+        let result: serde_json::Value = serde_json::from_str(&stdout).expect("must deny");
+        assert_eq!(
+            result["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn issue_555_phase_diagnostics_preserve_silent_allow() {
+    let _guard = HOOK_PROCESS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let marker = "phase-probe-private-body";
+    let payload = serde_json::json!({"tool_name": "Bash", "tool_input": {
+        "command": format!("python3 - <<'EOF'\nprint('{marker}')\nEOF")}})
+    .to_string();
+    let mut command = Command::new(dcg_binary());
+    configure_isolated_hook_child(&mut command);
+    let mut child = command
+        .args(["--agent", "claude-code"])
+        .env("DCG_LOG", "dcg_perf=debug")
+        .env_remove("DCG_HISTORY_DISABLED")
+        .env("DCG_HISTORY_ENABLED", "1")
+        .env("DCG_HISTORY_DB", test_state_path("-phase-history.db"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn phase probe");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(payload.as_bytes())
+        .expect("payload");
+    let output = child.wait_with_output().expect("phase probe");
+    assert!(output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "diagnostics must not change hook stdout"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("diagnostic UTF-8");
+    assert!(
+        !stderr.contains(marker),
+        "phase events must not expose command bodies"
+    );
+    for phase in [
+        "request_parse",
+        "normalization",
+        "heredoc_detection",
+        "heredoc_extraction",
+        "pattern_evaluation",
+        "history_setup",
+        "history_enqueue_redact",
+        "history_storage_open",
+        "history_storage_insert",
+        "history_shutdown_wait",
+        "hook_total",
+    ] {
+        assert!(
+            stderr.contains(&format!("phase=\"{phase}\"")),
+            "missing {phase}: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn test_hook_output_contains_permission_decision() {
     let (stdout, _stderr, _) = run_hook_mode("git reset --hard");
 

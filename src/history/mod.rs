@@ -394,6 +394,7 @@ impl HistoryWriter {
     /// The writer is disabled when `config.enabled` is false.
     #[must_use]
     pub fn new(db_path: Option<std::path::PathBuf>, config: &HistoryConfig) -> Self {
+        let _phase = crate::perf::PhaseTimer::start("history_setup");
         if !config.enabled {
             return Self::disabled();
         }
@@ -472,6 +473,7 @@ impl HistoryWriter {
 
     /// Log a command entry asynchronously.
     pub fn log(&self, mut entry: CommandEntry) {
+        let _phase = crate::perf::PhaseTimer::start("history_enqueue_redact");
         entry.command = redact_for_history(&entry.command, self.redaction_mode);
         // Set session ID if not already set
         if entry.session_id.is_none() && !self.session_id.is_empty() {
@@ -541,6 +543,7 @@ impl HistoryWriter {
 
 impl Drop for HistoryWriter {
     fn drop(&mut self) {
+        let _phase = crate::perf::PhaseTimer::start("history_shutdown_wait");
         if let Some(sender) = self.sender.take() {
             let (ack_tx, ack_rx) = mpsc::channel();
             if sender.send(HistoryMessage::Shutdown(ack_tx)).is_ok() && self.wait_for_worker_on_drop
@@ -951,6 +954,7 @@ fn is_contention_error(error: &HistoryError) -> bool {
 
 /// Flush the batch to the database.
 fn flush_batch(db: &HistoryDb, batch: &mut Vec<CommandEntry>) -> FlushOutcome {
+    let _phase = crate::perf::PhaseTimer::start("history_storage_insert");
     if batch.is_empty() {
         return FlushOutcome::Success;
     }

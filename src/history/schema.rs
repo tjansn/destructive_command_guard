@@ -793,6 +793,7 @@ impl HistoryDb {
     ///
     /// Returns an error if the database cannot be opened or initialized.
     pub fn open(path: Option<PathBuf>) -> Result<Self, HistoryError> {
+        let _phase = crate::perf::PhaseTimer::start("history_storage_open");
         if super::history_disabled_by_env() {
             return Err(HistoryError::Disabled);
         }

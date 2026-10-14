@@ -39,6 +39,161 @@ description = "python -c with subprocess git reset"
 command = "python -c \"import subprocess; subprocess.run(['git', 'reset', '--hard'])\""
 expected = "deny"
 
+# Issue #549: the temp cleanup exemption requires an actual descendant.
+# These are verdict-only fixtures: AST and bounded fallback attribution may
+# differ, but deleting a shared temp root must never become an allow.
+[[case]]
+description = "python rmtree cannot delete the tmp root"
+command = "python3 -c \"import shutil; shutil.rmtree('/tmp')\""
+expected = "deny"
+
+[[case]]
+description = "python rmtree cannot delete tmp with a trailing slash"
+command = "python3 -c \"import shutil; shutil.rmtree('/tmp/')\""
+expected = "deny"
+
+[[case]]
+description = "python rmtree cannot delete tmp with a dot suffix"
+command = "python3 -c \"import shutil; shutil.rmtree('/tmp/.')\""
+expected = "deny"
+
+[[case]]
+description = "python rmtree cannot delete the private tmp root alias"
+command = "python3 -c \"import shutil; shutil.rmtree('/private/tmp')\""
+expected = "deny"
+
+[[case]]
+description = "python rmtree cannot delete the var tmp root"
+command = "python3 -c \"import shutil; shutil.rmtree('/var/tmp')\""
+expected = "deny"
+
+[[case]]
+description = "python rmtree cannot delete the private var tmp root alias"
+command = "python3 -c \"import shutil; shutil.rmtree('/private/var/tmp')\""
+expected = "deny"
+
+[[case]]
+description = "python rmtree rejects a root suffix made only of dots and separators"
+command = "python3 -c \"import shutil; shutil.rmtree('/private/tmp//.//./')\""
+expected = "deny"
+
+[[case]]
+description = "python rmtree rejects normalized components within the root alias"
+command = "python3 -I -c \"import shutil; shutil.rmtree('/private/./var//tmp/.')\""
+expected = "deny"
+
+[[case]]
+description = "python rmtree rejects parent traversal back to the temp root"
+command = "python3 -c \"import shutil; shutil.rmtree('/tmp/build/..')\""
+expected = "deny"
+
+[[case]]
+description = "python rmtree rejects traversal from tmp into etc"
+command = "python3 -c \"import shutil; shutil.rmtree('/tmp/../etc')\""
+expected = "deny"
+
+[[case]]
+description = "python rmtree rejects traversal from a private temp alias into etc"
+command = "python3 -c \"import shutil as sh; sh.rmtree('/private/var/tmp/../../../etc')\""
+expected = "deny"
+
+[[case]]
+description = "python rmtree preserves the no-parent-traversal cleanup policy"
+command = "python3 -c \"import shutil; shutil.rmtree('/tmp/build/../cache')\""
+expected = "deny"
+
+[[case]]
+description = "python rmtree cannot normalize traversal back into a temp exemption"
+command = "python3 -c \"import shutil; shutil.rmtree('/tmp/../tmp/build')\""
+expected = "deny"
+
+[[case]]
+description = "python rmtree requires a complete temp root component"
+command = "python3 -c \"import shutil; shutil.rmtree('/tmp-backup/build')\""
+expected = "deny"
+
+[[case]]
+description = "python stdin heredoc cannot delete the tmp root"
+command = "python3 - <<'PY'\nimport shutil\nshutil.rmtree('/tmp')\nPY"
+expected = "deny"
+
+[[case]]
+description = "python heredoc module alias cannot delete var tmp with trailing slash"
+command = "python3 <<'PY'\nimport shutil as sh\nsh.rmtree('/var/tmp/')\nPY"
+expected = "deny"
+
+[[case]]
+description = "python stdin heredoc cannot delete a dot-normalized private tmp root"
+command = "python3 - <<'PY'\nimport shutil\nshutil.rmtree('/private/tmp/.')\nPY"
+expected = "deny"
+
+[[case]]
+description = "isolated Python stdin heredoc cannot delete private var tmp"
+command = "python3 -I - <<'PY'\nimport shutil\nshutil.rmtree('/private/var/tmp')\nPY"
+expected = "deny"
+
+# Imported functions must receive the same path policy as shutil.rmtree.
+# These fixtures assert only completed verdicts, independent of attribution.
+[[case]]
+description = "directly imported python rmtree cannot delete the tmp root"
+command = "python3 -c \"from shutil import rmtree; rmtree('/tmp')\""
+expected = "deny"
+
+[[case]]
+description = "renamed python rmtree cannot delete the var tmp root"
+command = "python3 -c \"from shutil import rmtree as wipe; wipe('/var/tmp')\""
+expected = "deny"
+
+[[case]]
+description = "renamed python rmtree rejects a normalized private temporary root"
+command = "python3 -c \"from shutil import rmtree as wipe; wipe('/private/./var//tmp/.')\""
+expected = "deny"
+
+[[case]]
+description = "python rmtree in a grouped import still protects the temporary root"
+command = "python3 -c \"from shutil import copytree, rmtree as wipe; wipe('/private/tmp')\""
+expected = "deny"
+
+[[case]]
+description = "multiline parenthesized python import protects the temporary root in a heredoc"
+command = "python3 - <<'PY'\nfrom shutil import (\n    copytree,\n    rmtree as wipe,\n)\nwipe('/tmp/.')\nPY"
+expected = "deny"
+
+[[case]]
+description = "renamed python rmtree rejects traversal into a sensitive directory"
+command = "python3 -c \"from shutil import rmtree as wipe; wipe('/tmp/../etc')\""
+expected = "deny"
+
+[[case]]
+description = "renamed python rmtree rejects parent traversal that stays in tmp"
+command = "python3 -c \"from shutil import rmtree as wipe; wipe('/tmp/build/../cache')\""
+expected = "deny"
+
+[[case]]
+description = "renamed python rmtree protects a non-temporary directory"
+command = "python3 -c \"from shutil import rmtree as wipe; wipe('/home/user/Documents')\""
+expected = "deny"
+
+[[case]]
+description = "renamed python rmtree checks its keyword target"
+command = "python3 -c \"from shutil import rmtree as wipe; wipe(path='/tmp')\""
+expected = "deny"
+
+[[case]]
+description = "renamed python rmtree cannot borrow a temporary path prefix"
+command = "python3 -c \"from shutil import rmtree as wipe; wipe('/tmp/build' + '/..')\""
+expected = "deny"
+
+[[case]]
+description = "python function-local rmtree import protects the temporary root"
+command = "python3 - <<'PY'\ndef cleanup():\n    from shutil import rmtree as wipe\n    wipe('/tmp')\ncleanup()\nPY"
+expected = "deny"
+
+[[case]]
+description = "conditional python reassignment cannot hide a possible destructive binding"
+command = "python3 - <<'PY'\nimport os\nfrom shutil import rmtree as wipe\nif os.getenv('DRY_RUN'):\n    wipe = print\nwipe('/tmp')\nPY"
+expected = "deny"
+
 # ============================================================================
 # Bash inline execution (-c flag) - DESTRUCTIVE ONLY
 # ============================================================================
