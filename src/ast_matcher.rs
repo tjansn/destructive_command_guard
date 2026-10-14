@@ -1107,6 +1107,25 @@ fn interpreter_literal_shell_commands_inner(
             if interpreter_literal_has_owned_sink(&node, &owned_call_starts) {
                 continue;
             }
+            if node.range().len() > MAX_INTERPRETER_LITERAL_PAYLOAD_BYTES {
+                return Err(interpreter_literal_limit_error(
+                    language,
+                    "literal byte limit",
+                ));
+            }
+            // #560: ordinary decoded strings do not generate shell work. They
+            // must not consume the bounded set of substitution candidates just
+            // because another value in the program triggered this analysis.
+            // Decode before granting this exemption: language escapes can hide
+            // substitution markers. Unknown/interpolated values still count.
+            // Source, AST-node, and per-literal byte limits remain independent.
+            let command = static_interpreter_literal(&node, language, 0);
+            if command
+                .as_ref()
+                .is_some_and(|value| !value.contains('`') && !value.contains("$("))
+            {
+                continue;
+            }
             candidates += 1;
             if candidates > MAX_INTERPRETER_LITERAL_CANDIDATES {
                 return Err(interpreter_literal_limit_error(
@@ -1114,28 +1133,20 @@ fn interpreter_literal_shell_commands_inner(
                     "literal count limit",
                 ));
             }
-            if node.range().len() > MAX_INTERPRETER_LITERAL_PAYLOAD_BYTES {
-                return Err(interpreter_literal_limit_error(
-                    language,
-                    "literal byte limit",
-                ));
-            }
-            if let Some(command) = static_interpreter_literal(&node, language, 0) {
-                if command.contains('`') || command.contains("$(") {
-                    payload_bytes = payload_bytes.saturating_add(command.len());
-                    if payload_bytes > MAX_INTERPRETER_LITERAL_PAYLOAD_BYTES {
-                        return Err(interpreter_literal_limit_error(
-                            language,
-                            "aggregate literal byte limit",
-                        ));
-                    }
-                    let range = node.range();
-                    commands.push(ReconstructedCommand {
-                        command,
-                        start: range.start,
-                        end: range.end,
-                    });
+            if let Some(command) = command {
+                payload_bytes = payload_bytes.saturating_add(command.len());
+                if payload_bytes > MAX_INTERPRETER_LITERAL_PAYLOAD_BYTES {
+                    return Err(interpreter_literal_limit_error(
+                        language,
+                        "aggregate literal byte limit",
+                    ));
                 }
+                let range = node.range();
+                commands.push(ReconstructedCommand {
+                    command,
+                    start: range.start,
+                    end: range.end,
+                });
                 // An adjacent Python literal sequence is one value. Do not
                 // evaluate its individual fragments again as different scripts.
                 continue;
@@ -2649,5 +2660,156 @@ mod tests {
             DEFAULT_MATCHER.find_matches(&oversized, ScriptLanguage::Python),
             Err(MatchError::ParseError { .. })
         ));
+    }
+
+    mod interpreter_literal_budget_regressions_560 {
+        use super::*;
+
+        const LANGUAGES: [ScriptLanguage; 2] =
+            [ScriptLanguage::Python, ScriptLanguage::JavaScript];
+
+        fn append_assignment(source: &mut String, language: ScriptLanguage, literal: &str) {
+            let index = source.len();
+            let statement = match language {
+                ScriptLanguage::Python => format!("value_{index} = {literal}\n"),
+                ScriptLanguage::JavaScript => format!("const value_{index} = {literal};\n"),
+                _ => panic!("unsupported test language"),
+            };
+            source.push_str(&statement);
+        }
+
+        fn assignments(language: ScriptLanguage, count: usize, literal: &str) -> String {
+            let mut source = String::new();
+            for _ in 0..count {
+                append_assignment(&mut source, language, literal);
+            }
+            source
+        }
+
+        // The fork reports exhausted bounds as AnalysisLimit, distinct from a
+        // source that does not parse (see interpreter_literal_limit_error).
+        fn expect_analysis_limit(source: &str, language: ScriptLanguage, expected: &str) {
+            let Err(MatchError::AnalysisLimit { detail, .. }) =
+                interpreter_literal_shell_commands_inner(source, language, false)
+            else {
+                panic!("expected interpreter literal analysis limit: {expected}");
+            };
+            assert!(detail.contains(expected), "{detail}");
+        }
+
+        #[test]
+        fn ordinary_strings_do_not_spend_the_shell_candidate_budget() {
+            for language in LANGUAGES {
+                let mut source = assignments(
+                    language,
+                    MAX_INTERPRETER_LITERAL_CANDIDATES + 1,
+                    "'documentation'",
+                );
+                // An escape triggers literal inspection but decodes to plain data.
+                append_assignment(&mut source, language, r"'\n'");
+                let commands =
+                    interpreter_literal_shell_commands_inner(&source, language, false).unwrap();
+                assert!(commands.is_empty());
+            }
+        }
+
+        #[test]
+        fn substitutions_survive_many_irrelevant_literals() {
+            for language in LANGUAGES {
+                let mut source = assignments(
+                    language,
+                    MAX_INTERPRETER_LITERAL_CANDIDATES + 1,
+                    "'documentation'",
+                );
+                append_assignment(&mut source, language, "'echo $(git reset --hard)'");
+                let commands =
+                    interpreter_literal_shell_commands_inner(&source, language, false).unwrap();
+                assert_eq!(commands.len(), 1);
+                assert_eq!(commands[0].command, "echo $(git reset --hard)");
+                assert_eq!(
+                    source.get(commands[0].start..commands[0].end),
+                    Some("'echo $(git reset --hard)'")
+                );
+            }
+        }
+
+        #[test]
+        fn encoded_markers_cannot_borrow_the_plain_string_exemption() {
+            for (language, literal) in [
+                (ScriptLanguage::Python, r"'\x24\x28git reset --hard)'"),
+                (ScriptLanguage::JavaScript, r"'\u0024\u0028git reset --hard)'"),
+            ] {
+                let mut source = assignments(
+                    language,
+                    MAX_INTERPRETER_LITERAL_CANDIDATES + 1,
+                    "'documentation'",
+                );
+                append_assignment(&mut source, language, literal);
+                let commands =
+                    interpreter_literal_shell_commands_inner(&source, language, false).unwrap();
+                assert_eq!(commands.len(), 1);
+                assert_eq!(commands[0].command, "$(git reset --hard)");
+                assert_eq!(source.get(commands[0].start..commands[0].end), Some(literal));
+            }
+        }
+
+        #[test]
+        fn the_substitution_candidate_limit_is_unchanged() {
+            for language in LANGUAGES {
+                let source = assignments(
+                    language,
+                    MAX_INTERPRETER_LITERAL_CANDIDATES,
+                    "'echo $(git status)'",
+                );
+                let commands =
+                    interpreter_literal_shell_commands_inner(&source, language, false).unwrap();
+                assert_eq!(commands.len(), MAX_INTERPRETER_LITERAL_CANDIDATES);
+                let overflow = assignments(
+                    language,
+                    MAX_INTERPRETER_LITERAL_CANDIDATES + 1,
+                    "'echo $(git status)'",
+                );
+                expect_analysis_limit(&overflow, language, "literal count limit");
+            }
+        }
+
+        #[test]
+        fn unknown_interpolated_values_still_spend_the_candidate_budget() {
+            for (language, literal) in [
+                (ScriptLanguage::Python, "f'prefix{unknown}'"),
+                (ScriptLanguage::JavaScript, "`prefix${unknown}`"),
+            ] {
+                let source = assignments(language, MAX_INTERPRETER_LITERAL_CANDIDATES + 1, literal);
+                expect_analysis_limit(&source, language, "literal count limit");
+            }
+        }
+
+        #[test]
+        fn plain_literals_keep_the_per_literal_byte_limit() {
+            let literal = format!("'{}'", "x".repeat(MAX_INTERPRETER_LITERAL_PAYLOAD_BYTES));
+            for language in LANGUAGES {
+                let source = assignments(language, 1, &literal);
+                expect_analysis_limit(&source, language, "literal byte limit");
+            }
+        }
+
+        #[test]
+        fn recovered_eval_dependencies_remain_executable_without_substitution_markers() {
+            for (language, source) in [
+                (
+                    ScriptLanguage::Python,
+                    "import os\ncommand = 'git reset --hard'\nexec('os.system(command)')\n",
+                ),
+                (
+                    ScriptLanguage::JavaScript,
+                    "const cp = require('node:child_process');\nconst command = 'git reset --hard';\neval('cp.execSync(command)');\n",
+                ),
+            ] {
+                let commands =
+                    interpreter_literal_shell_commands_inner(source, language, false).unwrap();
+                assert_eq!(commands.len(), 1);
+                assert_eq!(commands[0].command, "git reset --hard");
+            }
+        }
     }
 }
