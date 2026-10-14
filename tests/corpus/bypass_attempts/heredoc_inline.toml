@@ -79,6 +79,38 @@ description = "node -e with child_process rm (destructive)"
 command = "node -e \"require('child_process').execSync('rm -rf /')\""
 expected = "deny"
 
+# The long spellings run the same payload. Each was allowed while only the
+# short flags reached inline-script extraction.
+[[case]]
+description = "node --eval with fs.rmSync (long flag)"
+command = "node --eval 'require(\"fs\").rmSync(\"/home/user\", {recursive: true})'"
+expected = "deny"
+
+[[case]]
+description = "node --print with fs.rmSync (long flag)"
+command = "node --print \"require('fs').rmSync('/home/user', {recursive: true})\""
+expected = "deny"
+
+[[case]]
+description = "node --eval= with fs.rmSync (joined long flag)"
+command = "node --eval='require(\"fs\").rmSync(\"/home/user\", {recursive: true})'"
+expected = "deny"
+
+[[case]]
+description = "node --eval with fs.rmSync after a test-runner flag"
+command = "node --eval 'require(\"fs\").rmSync(\"src\", {recursive: true})' --test case.test.cjs"
+expected = "deny"
+
+[[case]]
+description = "bun --eval with fs.rmSync (long flag)"
+command = "bun --eval \"require('fs').rmSync('/home/user', {recursive: true})\""
+expected = "deny"
+
+[[case]]
+description = "php --run with unlink (long flag)"
+command = "php --run \"unlink('/home/user/.ssh/id_rsa');\""
+expected = "deny"
+
 # ============================================================================
 # Ruby inline execution (-e flag) - DESTRUCTIVE ONLY
 # ============================================================================
