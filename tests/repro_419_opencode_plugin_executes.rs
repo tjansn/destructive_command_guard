@@ -141,8 +141,8 @@ check("v1 exposes tool.execute.before", typeof v1 === "function", typeof v1);
 if (typeof v1 === "function") {
   check("v1 denies destructive", (await threw(() => v1({ tool: "bash" }, { args: { command: DESTRUCTIVE } }))) !== null);
   check("v1 allows safe", (await threw(() => v1({ tool: "bash" }, { args: { command: SAFE } }))) === null);
-  check("v1 ignores non-bash", (await threw(() => v1({ tool: "read" }, { args: { command: DESTRUCTIVE } }))) === null);
-  check("v1 tolerates missing args", (await threw(() => v1({ tool: "bash" }, {}))) === null);
+  check("v1 ignores non-command tools", (await threw(() => v1({ tool: "read" }, { args: { path: "/tmp/x" } }))) === null);\n  check("v1 guards command-bearing renamed tools", (await threw(() => v1({ tool: "future-shell" }, { args: { command: DESTRUCTIVE } }))) !== null);
+  check("v1 blocks malformed shell payload", (await threw(() => v1({ tool: "bash" }, {}))) !== null);
 }
 
 // v2: default export registers one hook, command in event.input.
@@ -152,23 +152,23 @@ check("v2 registered one hook", registered.length === 1, `got ${registered.lengt
 check("v2 hook is execute.before", registered[0]?.[0] === "execute.before", String(registered[0]?.[0]));
 const v2 = registered[0]?.[1];
 if (typeof v2 === "function") {
-  check("v2 denies destructive", (await threw(() => v2({ tool: "bash", input: { command: DESTRUCTIVE } }))) !== null);
-  check("v2 allows safe", (await threw(() => v2({ tool: "bash", input: { command: SAFE } }))) === null);
-  check("v2 ignores non-bash", (await threw(() => v2({ tool: "read", input: { command: DESTRUCTIVE } }))) === null);
-  check("v2 tolerates missing input", (await threw(() => v2({ tool: "bash" }))) === null);
+  check("v2 shell denies destructive (#547)", (await threw(() => v2({ tool: "shell", input: { command: DESTRUCTIVE } }))) !== null);
+  check("v2 shell allows safe", (await threw(() => v2({ tool: "shell", input: { command: SAFE } }))) === null);
+  check("v2 ignores non-command tools", (await threw(() => v2({ tool: "read", input: { path: "/tmp/x" } }))) === null);\n  check("v2 guards command-bearing renamed tools", (await threw(() => v2({ tool: "future-shell", input: { command: DESTRUCTIVE } }))) !== null);
+  check("v2 blocks malformed shell payload", (await threw(() => v2({ tool: "shell" }))) !== null);
   check("v2 tolerates undefined event", (await threw(() => v2(undefined))) === null);
 }
 
 // dcg's escape hatch exits before reading its input, so it never answers; the
 // plugin honours it instead of reading the silence as a crash.
 process.env.DCG_BYPASS = "1";
-check("v2 honours DCG_BYPASS", (await threw(() => v2({ tool: "bash", input: { command: DESTRUCTIVE } }))) === null);
+check("v2 honours DCG_BYPASS", (await threw(() => v2({ tool: "shell", input: { command: DESTRUCTIVE } }))) === null);
 delete process.env.DCG_BYPASS;
 
 // An unrunnable dcg is an infrastructure failure, not a verdict: fail OPEN, or a
 // broken install would block every command in the session.
 process.env.DCG_BIN = "/nonexistent/definitely-not-dcg";
-check("v2 fails open when dcg cannot run", (await threw(() => v2({ tool: "bash", input: { command: DESTRUCTIVE } }))) === null);
+check("v2 fails open when dcg cannot run", (await threw(() => v2({ tool: "shell", input: { command: DESTRUCTIVE } }))) === null);
 check("v1 fails open when dcg cannot run", (await threw(() => v1({ tool: "bash" }, { args: { command: DESTRUCTIVE } }))) === null);
 
 // A dcg that RAN but gave no verdict is not an allow. Each fake below stands in
@@ -179,7 +179,7 @@ if (fakesDir) {
   for (const fake of noVerdictFakes) {
     process.env.DCG_BIN = `${fakesDir}/${fake}`;
     const v1err = await threw(() => v1({ tool: "bash" }, { args: { command: SAFE } }));
-    const v2err = await threw(() => v2({ tool: "bash", input: { command: SAFE } }));
+    const v2err = await threw(() => v2({ tool: "shell", input: { command: SAFE } }));
     check(`v1 blocks when dcg gives no verdict (${fake})`, v1err !== null);
     check(`v2 blocks when dcg gives no verdict (${fake})`, v2err !== null);
     check(`the block says why (${fake})`, String(v2err?.message ?? "").includes("dcg gave no verdict"), String(v2err?.message));
@@ -187,17 +187,17 @@ if (fakesDir) {
 
   // A deny written before the process died is still the answer, with its reason.
   process.env.DCG_BIN = `${fakesDir}/deny-then-exit-nonzero`;
-  const denied = await threw(() => v2({ tool: "bash", input: { command: SAFE } }));
+  const denied = await threw(() => v2({ tool: "shell", input: { command: SAFE } }));
   check("a deny survives a non-zero exit", String(denied?.message ?? "") === "fake deny reason", String(denied?.message));
 
   // The operator can opt back into fail-open for crashes.
   process.env.DCG_BRIDGE_CRASH_DECISION = " Allow ";
   for (const fake of noVerdictFakes) {
     process.env.DCG_BIN = `${fakesDir}/${fake}`;
-    check(`DCG_BRIDGE_CRASH_DECISION=allow lets a crash through (${fake})`, (await threw(() => v2({ tool: "bash", input: { command: SAFE } }))) === null);
+    check(`DCG_BRIDGE_CRASH_DECISION=allow lets a crash through (${fake})`, (await threw(() => v2({ tool: "shell", input: { command: SAFE } }))) === null);
   }
   process.env.DCG_BIN = `${fakesDir}/deny-then-exit-nonzero`;
-  check("the crash opt-out never overrides a deny", (await threw(() => v2({ tool: "bash", input: { command: SAFE } }))) !== null);
+  check("the crash opt-out never overrides a deny", (await threw(() => v2({ tool: "shell", input: { command: SAFE } }))) !== null);
   delete process.env.DCG_BRIDGE_CRASH_DECISION;
 }
 
