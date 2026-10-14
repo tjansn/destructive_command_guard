@@ -1126,10 +1126,19 @@ mod tests {
 
     #[test]
     fn trigger_list_is_narrow_and_explicit() {
-        assert_eq!(TRIAL_RULES, &[("heredoc.script_files", "unverified")]);
+        // tar-options-unresolved joined deliberately (fork issue #1): runtime
+        // option values with no visible helper. Identified helpers never do.
+        assert_eq!(
+            TRIAL_RULES,
+            &[
+                ("heredoc.script_files", "unverified"),
+                ("core.filesystem", "tar-options-unresolved"),
+            ]
+        );
         for rule in [
             "core.git:reset-hard",
             "core.filesystem:rm-rf-general",
+            "core.filesystem:tar-exec-unverified",
             "heredoc.shell:launcher-unverified",
             "heredoc.python:shutil_rmtree",
         ] {
