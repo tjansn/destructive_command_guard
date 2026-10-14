@@ -9564,16 +9564,30 @@ fn literal_file_data_consumers(command: &str, outside: &str) -> Vec<ProvenFileDa
     }
     // Match the existing AST timeout's only-raise convention. Keep the cheap
     // trigger and byte cap outside the worker, and include input ownership and
-    // thread startup in the same deadline. One process-wide slot applies in
-    // tests too; a busy or expired optional proof simply supplies no waiver.
-    static BUSY: AtomicBool = AtomicBool::new(false);
+    // thread startup in the same deadline. One slot per hook process; a busy or
+    // expired optional proof simply supplies no waiver. Each test thread stands
+    // in for its own hook process: `cargo test` runs every test in one process,
+    // where a sibling's proof made this one's waiver depend on scheduling.
+    #[cfg(not(test))]
+    let busy = {
+        static BUSY: AtomicBool = AtomicBool::new(false);
+        &BUSY
+    };
+    #[cfg(test)]
+    let busy = TEST_FILE_DATA_PROOF_SLOT.with(|slot| *slot);
     let budget = crate::ast_matcher::protected_scan_budget();
     let started = Instant::now();
     let command = command.to_owned();
     let outside = outside.to_owned();
-    run_file_data_proof(&BUSY, started, budget, move || {
+    run_file_data_proof(busy, started, budget, move || {
         literal_file_data_consumers_inner(&command, &outside, started, budget)
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FILE_DATA_PROOF_SLOT: &'static AtomicBool =
+        Box::leak(Box::new(AtomicBool::new(false)));
 }
 
 fn literal_file_data_consumers_inner(
@@ -13335,8 +13349,8 @@ mod tests {
 
     #[test]
     fn expired_and_busy_transfer_proofs_supply_no_exemption_543() {
-        // Exercise the same runner with an isolated slot; public helpers
-        // always use the process-wide slot, including in test builds.
+        // Exercise the same runner with an isolated slot; public helpers use
+        // the per-process slot (per test thread in test builds).
         static BUSY: AtomicBool = AtomicBool::new(false);
         assert!(
             run_file_data_proof(&BUSY, Instant::now(), Duration::ZERO, || {
