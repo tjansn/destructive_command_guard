@@ -972,7 +972,7 @@ fn relative_and_empty_literal_path_entries_cannot_reach_bound_review() {
 
 #[cfg(unix)]
 #[test]
-fn disabled_trials_use_one_time_review_without_opening_the_approval_store() {
+fn disabled_trials_with_an_unreadable_approval_store_use_one_time_review() {
     use std::os::unix::fs::PermissionsExt;
     let fixture = Fixture::new();
     let policy = std::fs::read_to_string(&fixture.config).unwrap();
@@ -981,8 +981,10 @@ fn disabled_trials_use_one_time_review_without_opening_the_approval_store() {
         format!("{policy}\n[trial]\nenabled = false\n"),
     )
     .unwrap();
-    // Unreadable approval data must not affect the disabled-trial path. The
-    // oversized review text guarantees no native dialog opens in this test.
+    // Remembered script approvals are consulted even with trials disabled, but
+    // unreadable approval data neither allows nor remembers anything: review
+    // stays one-time and the store is left as it was. The oversized review text
+    // guarantees no native dialog opens in this test.
     fixture.write(
         "home/.config/dcg/verified_trials.json",
         "invalid fixture store",
@@ -1024,12 +1026,6 @@ fn disabled_trials_use_one_time_review_without_opening_the_approval_store() {
         std::fs::read_to_string(fixture.root.join("home/.config/dcg/verified_trials.json"))
             .unwrap(),
         "invalid fixture store"
-    );
-    assert!(
-        !fixture
-            .root
-            .join("home/.config/dcg/verified_trials.lock")
-            .exists()
     );
 }
 

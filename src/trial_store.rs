@@ -77,17 +77,48 @@ pub struct LearnedFilesystem {
     pub summary: String,
 }
 
-/// Separate counts keep CLI reports clear about the two approval kinds.
+/// What a Touch ID script approval binds.
+///
+/// One command in one project directory, the content of every script static
+/// inspection resolved for it, the executables it resolves to and the inherited
+/// preload variables. Other project files are deliberately not part of it
+/// (Tom, 2026-10-14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptVersion {
+    pub digest: String,
+    pub project_root: PathBuf,
+    pub cwd: PathBuf,
+    pub command: String,
+    pub scripts: Vec<PathBuf>,
+    pub executables: Vec<PathBuf>,
+}
+
+/// A Touch ID approval that stays valid until one of its scripts changes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovedScripts {
+    pub kind: String,
+    pub fingerprint: String,
+    pub project_root: PathBuf,
+    pub cwd: PathBuf,
+    pub command: String,
+    pub scripts: Vec<PathBuf>,
+    pub created_at: String,
+    pub source: String,
+    pub summary: String,
+}
+
+/// Separate counts keep CLI reports clear about the approval kinds.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PrunedVersions {
     pub verified_trials: usize,
     pub learned_filesystem: usize,
+    pub approved_scripts: usize,
 }
 
 impl PrunedVersions {
     #[must_use]
     pub const fn total(self) -> usize {
-        self.verified_trials + self.learned_filesystem
+        self.verified_trials + self.learned_filesystem + self.approved_scripts
     }
 }
 
@@ -107,6 +138,8 @@ struct StoreData {
     #[serde(default)]
     learned_filesystem: Vec<LearnedFilesystem>,
     #[serde(default)]
+    approved_scripts: Vec<ApprovedScripts>,
+    #[serde(default)]
     file_hashes: BTreeMap<String, CachedHash>,
     #[serde(default)]
     summaries: Vec<(String, String)>,
@@ -118,6 +151,7 @@ impl Default for StoreData {
             schema_version: SCHEMA_VERSION,
             verified_trials: Vec::new(),
             learned_filesystem: Vec::new(),
+            approved_scripts: Vec::new(),
             file_hashes: BTreeMap::new(),
             summaries: Vec::new(),
         }
@@ -461,14 +495,151 @@ impl TrialStore {
         })
     }
 
+    /// Bind `command` in `cwd` to the scripts static inspection resolved for
+    /// it. Every script must exist as a regular file: an input that is missing
+    /// at review time cannot pass its approval to a file created later.
+    pub fn script_version(
+        &self,
+        command: &str,
+        cwd: &Path,
+        scripts: &[PathBuf],
+    ) -> io::Result<ScriptVersion> {
+        let cwd = cwd.canonicalize()?;
+        let project_root = project_root(&cwd)?;
+        let mut paths = BTreeSet::new();
+        for script in scripts {
+            let path = cwd.join(script).canonicalize()?;
+            if !fs::metadata(&path)?.is_file() {
+                return Err(io::Error::other("reviewed script is not a regular file"));
+            }
+            paths.insert(path);
+        }
+        if paths.is_empty() {
+            return Err(io::Error::other("no reviewed script to bind"));
+        }
+        let (executables, _) = resolved_executables(command, &cwd, &self.environment)?;
+        let mut hasher = Sha256::new();
+        hash_field(&mut hasher, b"dcg-approved-scripts-v1");
+        hash_field(&mut hasher, path_text(&project_root)?.as_bytes());
+        hash_field(
+            &mut hasher,
+            path_text(cwd.strip_prefix(&project_root).map_err(io::Error::other)?)?.as_bytes(),
+        );
+        hash_field(&mut hasher, command.as_bytes());
+        for path in &paths {
+            hash_field(&mut hasher, b"script");
+            hash_field(&mut hasher, path_text(path)?.as_bytes());
+            hash_field(&mut hasher, script_digest(path)?.as_bytes());
+            hash_permissions(&mut hasher, path)?;
+        }
+        for path in &executables {
+            hash_field(&mut hasher, b"executable");
+            hash_field(&mut hasher, path_text(path)?.as_bytes());
+            // A program inside the project is one of its scripts too.
+            if path.starts_with(&project_root) {
+                hash_field(&mut hasher, script_digest(path)?.as_bytes());
+            }
+        }
+        for (name, value) in &self.environment {
+            if name
+                .to_str()
+                .is_none_or(crate::invocation::preload_variable)
+            {
+                hash_field(&mut hasher, name.as_encoded_bytes());
+                hash_field(&mut hasher, value.as_encoded_bytes());
+            }
+        }
+        Ok(ScriptVersion {
+            digest: hex_digest(&hasher.finalize()),
+            project_root,
+            cwd,
+            command: command.to_owned(),
+            scripts: paths.into_iter().collect(),
+            executables: executables.into_iter().collect(),
+        })
+    }
+
+    pub fn lookup_scripts(&self, current: &ScriptVersion) -> io::Result<Option<ApprovedScripts>> {
+        self.with_data(|data| {
+            Ok((
+                data.approved_scripts
+                    .iter()
+                    .find(|entry| {
+                        valid_scripts_entry(entry)
+                            && entry.fingerprint == current.digest
+                            && entry.project_root == current.project_root
+                            && entry.cwd == current.cwd
+                            && entry.command == current.command
+                            && entry.scripts == current.scripts
+                    })
+                    .cloned(),
+                false,
+            ))
+        })
+    }
+
+    /// Only desktop review may create a script approval. The scripts are
+    /// fingerprinted again at the write boundary; a change since the review
+    /// rejects the approval instead of remembering unreviewed content.
+    pub fn approve_scripts(
+        &self,
+        version: &ScriptVersion,
+        summary: &str,
+    ) -> io::Result<ApprovedScripts> {
+        let current = self.script_version(&version.command, &version.cwd, &version.scripts)?;
+        if current != *version {
+            return Err(io::Error::other("scripts changed during review"));
+        }
+        let entry = ApprovedScripts {
+            kind: "approved_scripts".to_owned(),
+            fingerprint: version.digest.clone(),
+            project_root: version.project_root.clone(),
+            cwd: version.cwd.clone(),
+            command: version.command.clone(),
+            scripts: version.scripts.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            source: "user-review".to_owned(),
+            summary: bounded_summary(summary),
+        };
+        if !valid_scripts_entry(&entry) {
+            return Err(io::Error::other("invalid script approval"));
+        }
+        self.with_data(|data| {
+            data.approved_scripts
+                .retain(|old| old.fingerprint != entry.fingerprint);
+            data.approved_scripts.push(entry.clone());
+            Ok((entry, true))
+        })
+    }
+
+    pub fn list_scripts(&self) -> io::Result<Vec<ApprovedScripts>> {
+        self.with_data(|data| {
+            Ok((
+                data.approved_scripts
+                    .iter()
+                    .filter(|entry| valid_scripts_entry(entry))
+                    .cloned()
+                    .collect(),
+                false,
+            ))
+        })
+    }
+
     pub fn remove(&self, id: &str) -> io::Result<bool> {
         let id = id.strip_prefix("sha256:").unwrap_or(id);
         self.with_data(|data| {
-            let before = data.verified_trials.len() + data.learned_filesystem.len();
+            let count = |data: &StoreData| {
+                data.verified_trials.len()
+                    + data.learned_filesystem.len()
+                    + data.approved_scripts.len()
+            };
+            let before = count(data);
             data.verified_trials.retain(|entry| entry.fingerprint != id);
             data.learned_filesystem
                 .retain(|entry| entry.fingerprint != id);
-            let removed = data.verified_trials.len() + data.learned_filesystem.len() != before;
+            data.approved_scripts
+                .retain(|entry| entry.fingerprint != id);
+            let removed = count(data) != before;
             Ok((removed, removed))
         })
     }
@@ -522,12 +693,23 @@ impl TrialStore {
                 stale_learned.insert(entry.fingerprint);
             }
         }
+        let mut stale_scripts = BTreeSet::new();
+        for entry in self.list_scripts()? {
+            if project.is_some_and(|project| project != entry.project_root) {
+                continue;
+            }
+            let current = self.script_version(&entry.command, &entry.cwd, &entry.scripts);
+            if !current.is_ok_and(|value| value.digest == entry.fingerprint) {
+                stale_scripts.insert(entry.fingerprint);
+            }
+        }
         self.with_data(|data| {
             if dry_run {
                 return Ok((
                     PrunedVersions {
                         verified_trials: stale.len(),
                         learned_filesystem: stale_learned.len(),
+                        approved_scripts: stale_scripts.len(),
                     },
                     false,
                 ));
@@ -538,9 +720,13 @@ impl TrialStore {
             let learned_before = data.learned_filesystem.len();
             data.learned_filesystem
                 .retain(|entry| !stale_learned.contains(&entry.fingerprint));
+            let scripts_before = data.approved_scripts.len();
+            data.approved_scripts
+                .retain(|entry| !stale_scripts.contains(&entry.fingerprint));
             let removed = PrunedVersions {
                 verified_trials: before - data.verified_trials.len(),
                 learned_filesystem: learned_before - data.learned_filesystem.len(),
+                approved_scripts: scripts_before - data.approved_scripts.len(),
             };
             Ok((removed, removed.total() > 0))
         })
@@ -702,6 +888,26 @@ fn valid_learned_entry(entry: &LearnedFilesystem) -> bool {
         && entry.rule_id.starts_with("core.filesystem:")
         && !entry.operands.is_empty()
         && entry.operands.iter().all(|path| path.is_absolute())
+}
+
+fn valid_scripts_entry(entry: &ApprovedScripts) -> bool {
+    entry.kind == "approved_scripts"
+        && entry.source == "user-review"
+        && entry.fingerprint.len() == 64
+        && entry
+            .fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        && entry.project_root.is_absolute()
+        && entry.cwd.starts_with(&entry.project_root)
+        && !entry.command.is_empty()
+        && !entry.scripts.is_empty()
+        && entry.scripts.iter().all(|path| path.is_absolute())
+}
+
+/// Reviewed scripts are hashed in full; an oversized one cannot be bound.
+fn script_digest(path: &Path) -> io::Result<String> {
+    cached_hash_bounded(path, &mut BTreeMap::new(), MAX_RUNTIME_BYTES).map(|(digest, _)| digest)
 }
 
 fn bounded_summary(value: &str) -> String {
@@ -1838,6 +2044,10 @@ mod tests {
         store.approve(&trial, "trial", "observed").unwrap();
         let learned = learned_fingerprint(&project);
         store.approve_learned(&learned, "approved").unwrap();
+        let scripts = store
+            .script_version("sh run.sh", &project, &[project.join("run.sh")])
+            .unwrap();
+        store.approve_scripts(&scripts, "approved").unwrap();
         assert_eq!(store.prune().unwrap(), 0);
         fs::remove_file(project.join("run.sh")).unwrap();
         let path = temp.path().join("trusted/verified_trials.json");
@@ -1849,6 +2059,7 @@ mod tests {
             PrunedVersions {
                 verified_trials: 1,
                 learned_filesystem: 1,
+                approved_scripts: 1,
             }
         );
         assert_eq!(fs::read(path).unwrap(), before);
@@ -1858,9 +2069,116 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert_eq!(store.prune_at(Some(&trial.project_root), false).unwrap(), 2);
+        assert_eq!(store.prune_at(Some(&trial.project_root), false).unwrap(), 3);
         assert!(store.list().unwrap().is_empty());
         assert!(store.list_learned().unwrap().is_empty());
+        assert!(store.list_scripts().unwrap().is_empty());
+    }
+
+    /// Tom's rule (2026-10-14): a Touch ID approval holds until one of the
+    /// reviewed scripts changes; other project files do not invalidate it.
+    #[cfg(unix)]
+    #[test]
+    fn script_approval_survives_other_edits_and_ends_when_a_script_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temp, project, store) = fixture();
+        fs::write(project.join("helper.sh"), "echo helper\n").unwrap();
+        fs::write(project.join("notes.txt"), "draft").unwrap();
+        let scripts = [project.join("run.sh"), project.join("helper.sh")];
+        let version = || store.script_version("sh run.sh", &project, &scripts);
+        let approved = version().unwrap();
+        assert!(store.lookup_scripts(&approved).unwrap().is_none());
+        let entry = store.approve_scripts(&approved, "Touch ID").unwrap();
+        assert_eq!(entry.source, "user-review");
+        assert_eq!(store.list_scripts().unwrap(), vec![entry.clone()]);
+
+        // Unrelated project edits, new files and a reordered input list keep it.
+        fs::write(project.join("notes.txt"), "rewritten").unwrap();
+        fs::write(project.join("new.txt"), "added").unwrap();
+        assert_eq!(
+            store.lookup_scripts(&version().unwrap()).unwrap(),
+            Some(entry.clone())
+        );
+        let reordered = store
+            .script_version(
+                "sh run.sh",
+                &project,
+                &[scripts[1].clone(), scripts[0].clone()],
+            )
+            .unwrap();
+        assert_eq!(reordered, approved);
+
+        // Another command, another directory or one script fewer is not covered.
+        let other = store
+            .script_version("sh run.sh --force", &project, &scripts)
+            .unwrap();
+        assert!(store.lookup_scripts(&other).unwrap().is_none());
+        fs::create_dir(project.join("sub")).unwrap();
+        let elsewhere = store
+            .script_version("sh run.sh", &project.join("sub"), &scripts)
+            .unwrap();
+        assert!(store.lookup_scripts(&elsewhere).unwrap().is_none());
+        let fewer = store
+            .script_version("sh run.sh", &project, &scripts[..1])
+            .unwrap();
+        assert!(store.lookup_scripts(&fewer).unwrap().is_none());
+
+        // Content and permission changes of any reviewed script end it.
+        fs::write(project.join("helper.sh"), "rm -rf build\n").unwrap();
+        assert!(store.lookup_scripts(&version().unwrap()).unwrap().is_none());
+        fs::write(project.join("helper.sh"), "echo helper\n").unwrap();
+        assert!(store.lookup_scripts(&version().unwrap()).unwrap().is_some());
+        fs::set_permissions(project.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(store.lookup_scripts(&version().unwrap()).unwrap().is_none());
+
+        // A missing input cannot be bound, so it cannot inherit an approval.
+        assert!(
+            store
+                .script_version("sh run.sh", &project, &[project.join("absent.sh")])
+                .is_err()
+        );
+        assert!(store.script_version("sh run.sh", &project, &[]).is_err());
+        assert!(store.remove(&entry.fingerprint).unwrap());
+        assert!(store.list_scripts().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn script_approval_binds_preload_variables_and_rejects_changes_during_review() {
+        let (_temp, project, store) = fixture();
+        let scripts = [project.join("run.sh")];
+        let approved = store
+            .script_version("sh run.sh", &project, &scripts)
+            .unwrap();
+        let preloaded = store
+            .clone()
+            .with_environment(
+                crate::trial::agent_environment()
+                    .into_iter()
+                    .chain([("NODE_OPTIONS".into(), "--require ./hook.js".into())])
+                    .collect(),
+            )
+            .script_version("sh run.sh", &project, &scripts)
+            .unwrap();
+        assert_ne!(preloaded.digest, approved.digest);
+        let ordinary = store
+            .clone()
+            .with_environment(
+                crate::trial::agent_environment()
+                    .into_iter()
+                    .chain([("EDITOR".into(), "vim".into())])
+                    .collect(),
+            )
+            .script_version("sh run.sh", &project, &scripts)
+            .unwrap();
+        assert_eq!(ordinary.digest, approved.digest);
+        fs::write(
+            project.join("run.sh"),
+            "echo changed while the dialog was open\n",
+        )
+        .unwrap();
+        assert!(store.approve_scripts(&approved, "Touch ID").is_err());
+        assert!(store.list_scripts().unwrap().is_empty());
     }
 
     #[cfg(unix)]

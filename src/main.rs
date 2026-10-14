@@ -2381,14 +2381,16 @@ fn main() {
         && additional_commands.is_empty()
         && hook_input.tool_calls.is_none()
         && heredoc_settings.scan_script_files;
-    let trial_eligible = config.trial.enabled
-        && additional_commands.is_empty()
+    // Remembered script approvals apply to every hook for the project, also one
+    // without sandbox trials or the desktop dialog that could create them.
+    let approvals_eligible = additional_commands.is_empty()
         && hook_input.tool_calls.is_none()
         && heredoc_settings.scan_script_files;
+    let trial_eligible = config.trial.enabled && approvals_eligible;
     let effect_eligible = additional_commands.is_empty()
         && hook_input.tool_calls.is_none()
         && matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown);
-    let review_capture = (desktop_review_eligible || trial_eligible)
+    let review_capture = (desktop_review_eligible || approvals_eligible)
         .then(destructive_command_guard::desktop_review::ReviewCapture::start);
     let mut decisive: Option<ResolvedCommandOutcome> = None;
     let mut primary_allow_row: Option<Box<CommandEntry>> = None;
@@ -2463,7 +2465,7 @@ fn main() {
         "hook request resolved"
     );
     let exit_code = if let Some(mut outcome) = decisive {
-        let trial_handled = (trial_eligible || desktop_review_eligible)
+        let trial_handled = (approvals_eligible || desktop_review_eligible)
             && attempt_sandbox_trial(
                 &eval_context,
                 &mut outcome,
@@ -2771,8 +2773,14 @@ fn attempt_sandbox_trial(
         deadline: &deadline,
         ..*ctx
     };
+    // Without trials or the dialog this hook can only reuse remembered script
+    // approvals; everything else must stay exactly as the evaluation reported.
+    let lookup_only = !ctx.config.trial.enabled && !desktop;
     let residual = resolve_hook_command(&residual_ctx, &command, dialect, None);
     if !matches!(residual, ResolvedCommandOutcome::Allow(_)) {
+        if lookup_only {
+            return false;
+        }
         // A warning/log result must never replace the unresolved denial and
         // accidentally release the command before a trial has verified it.
         // Definite blocking rules retain their own identity and review path.
@@ -2805,6 +2813,57 @@ fn attempt_sandbox_trial(
         .unwrap_or_default();
     let resolve = || -> Result<bool, String> {
         let store = TrialStore::user().map_err(|e| format!("Trial store unavailable: {e}"))?;
+        // A Touch ID approval is remembered until one of the reviewed scripts
+        // changes (Tom, 2026-10-14). Edits elsewhere in the project, sandbox
+        // reproducibility and the trial setting do not invalidate it; the
+        // residual evaluation above still runs first on every request.
+        let scripts = store.script_version(&command, cwd, &sources).ok();
+        let approval = scripts
+            .as_ref()
+            .map_or(Ok(None), |version| store.lookup_scripts(version));
+        let scripts = match approval {
+            Ok(Some(entry)) => {
+                emit_stderr!(
+                    "dcg: approved by Touch ID on {} (scripts unchanged).",
+                    entry.created_at
+                );
+                return Ok(true);
+            }
+            Ok(None) => scripts,
+            // An unreadable store neither allows nor remembers: review stays
+            // one-time, exactly as before script approvals existed.
+            Err(_) => None,
+        };
+        if lookup_only {
+            return Ok(false);
+        }
+        let remember = |version: &destructive_command_guard::trial_store::ScriptVersion,
+                        details: &str,
+                        explanation: &str|
+         -> Result<bool, String> {
+            if !desktop
+                || !desktop_review::request_trial(
+                    &command,
+                    cwd,
+                    details,
+                    agent,
+                    desktop_review::ApprovalScope::ApprovedScripts,
+                    &version.executables,
+                    evidence.as_ref(),
+                )
+            {
+                return Err(format!(
+                    "{explanation}\n[dcg:review-unavailable-or-cancelled] Desktop review unavailable, declined or expired."
+                ));
+            }
+            // The consented scope is "remember": a failed write keeps the
+            // request blocked instead of silently becoming a one-time approval.
+            store
+                .approve_scripts(version, details)
+                .map_err(|e| format!("Approval not remembered; request blocked: {e}"))?;
+            emit_stderr!("dcg: approved by Touch ID until the reviewed scripts change.");
+            Ok(true)
+        };
         let fingerprint = || {
             if ctx.config.trial.enabled {
                 store.fingerprint(&command, cwd, &shell, &sources)
@@ -2812,10 +2871,39 @@ fn attempt_sandbox_trial(
                 store.fingerprint_for_review(&command, cwd, &shell, &sources)
             }
         };
-        let before = fingerprint()
-            .map_err(|e| format!("Die Prüfung ist unvollständig. Cannot bind an exact trial version; desktop approval unavailable: {e}"))?;
+        let before = match fingerprint() {
+            Ok(before) => before,
+            Err(_) if scripts.is_some() => {
+                return remember(
+                    scripts.as_ref().expect("checked above"),
+                    "Die Projektversion lässt sich nicht vollständig binden. Bitte prüfe den genauen Aufruf und die angezeigten Skripte.",
+                    "The project version cannot be bound for a sandbox trial. This command requires desktop review; an approval is remembered until the reviewed scripts change.",
+                );
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Die Prüfung ist unvollständig. Cannot bind an exact trial version; desktop approval unavailable: {e}"
+                ));
+            }
+        };
         let scope =
             desktop_review::ApprovalScope::trial(ctx.config.trial.enabled, before.reproducible);
+        if scope == desktop_review::ApprovalScope::OneTime
+            && let Some(version) = &scripts
+        {
+            let (german, explanation) = if ctx.config.trial.enabled {
+                (
+                    "Laufzeiteingaben oder Umgebung können in der Sandbox nicht vollständig nachgebildet werden. Bitte prüfe den genauen Aufruf und die angezeigten Skripte.",
+                    "Runtime inputs or environment are not reproduced by the sandbox. This command requires desktop review; an approval is remembered until the reviewed scripts change.",
+                )
+            } else {
+                (
+                    "Sandbox-Tests sind deaktiviert. Bitte prüfe den genauen Aufruf und die angezeigten Skripte.",
+                    "Sandbox trials are disabled. This command requires desktop review; an approval is remembered until the reviewed scripts change.",
+                )
+            };
+            return remember(version, german, explanation);
+        }
         if scope == desktop_review::ApprovalScope::OneTime {
             let (explanation, german) = if ctx.config.trial.enabled {
                 (
@@ -2835,7 +2923,7 @@ fn attempt_sandbox_trial(
                     german,
                     agent,
                     scope,
-                    &before,
+                    &before.resolved_executables,
                     evidence.as_ref(),
                 )
             {
@@ -2898,6 +2986,9 @@ fn attempt_sandbox_trial(
             trial::Verdict::Safe => "trial",
             trial::Verdict::Unsafe => return Err(summary),
             trial::Verdict::Inconclusive => {
+                if let Some(version) = &scripts {
+                    return remember(version, &report.review_details(), &summary);
+                }
                 if !desktop
                     || !desktop_review::request_trial(
                         &command,
@@ -2905,7 +2996,7 @@ fn attempt_sandbox_trial(
                         &report.review_details(),
                         agent,
                         scope,
-                        &before,
+                        &before.resolved_executables,
                         evidence.as_ref(),
                     )
                 {

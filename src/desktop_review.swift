@@ -94,7 +94,7 @@ struct ReviewDescription: Decodable {
     var valid: Bool {
         let required = [agent, project, cwd, title, effect, command, text, scope_text]
         let fields = required + targets + executables + [host ?? "", repository ?? "", warning ?? ""]
-        return ["one_time", "exact_version", "learned_filesystem", "confined"].contains(scope) &&
+        return ["one_time", "exact_version", "learned_filesystem", "approved_scripts", "confined"].contains(scope) &&
             required.allSatisfy { !$0.isEmpty } && cwd.hasPrefix("/") &&
             agent.utf8.count <= 128 && project.utf8.count <= 512 &&
             (host?.utf8.count ?? 0) <= 128 && title.utf8.count <= 128 &&

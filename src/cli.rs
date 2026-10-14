@@ -20548,6 +20548,17 @@ fn selected_learned_entries(
     Ok(entries)
 }
 
+fn selected_script_entries(
+    project_only: bool,
+) -> std::io::Result<Vec<crate::trial_store::ApprovedScripts>> {
+    let mut entries = crate::trial_store::TrialStore::user()?.list_scripts()?;
+    if project_only {
+        let root = crate::trial_store::project_root(&std::env::current_dir()?)?;
+        entries.retain(|entry| entry.project_root == root);
+    }
+    Ok(entries)
+}
+
 /// List allowlist entries.
 fn allowlist_list(
     project_only: bool,
@@ -20559,6 +20570,7 @@ fn allowlist_list(
     let inspected = inspect_allowlist_layers(project_only, user_only);
     let trial_entries = selected_trial_entries(project_only)?;
     let learned_entries = selected_learned_entries(project_only)?;
+    let script_entries = selected_script_entries(project_only)?;
     let mut all_entries: Vec<(AllowlistLayer, std::path::PathBuf, AllowEntry, bool)> = Vec::new();
 
     for inspection in &inspected {
@@ -20593,7 +20605,11 @@ fn allowlist_list(
                 println!();
             }
 
-            if all_entries.is_empty() && trial_entries.is_empty() && learned_entries.is_empty() {
+            if all_entries.is_empty()
+                && trial_entries.is_empty()
+                && learned_entries.is_empty()
+                && script_entries.is_empty()
+            {
                 println!("{}", "No allowlist entries found.".yellow());
                 return Ok(());
             }
@@ -20668,6 +20684,19 @@ fn allowlist_list(
                 println!("    Summary: {}", entry.summary);
                 println!();
             }
+            for entry in &script_entries {
+                println!(
+                    "  approved_scripts:{} [user, until a script changes]",
+                    entry.fingerprint
+                );
+                println!("    Command: {}", entry.command);
+                println!("    Directory: {}", entry.cwd.display());
+                for script in &entry.scripts {
+                    println!("    Script: {}", script.display());
+                }
+                println!("    Approved by {} on {}", entry.source, entry.created_at);
+                println!();
+            }
         }
         AllowlistOutputFormat::Json => {
             let mut json_entries: Vec<serde_json::Value> = all_entries
@@ -20716,6 +20745,14 @@ fn allowlist_list(
                 });
                 json_entries.push(json);
             }
+            for entry in &script_entries {
+                let mut json = serde_json::to_value(entry)?;
+                json["layer"] = serde_json::json!("user");
+                json["selector"] = serde_json::json!({
+                    "type": "approved_scripts", "value": entry.fingerprint,
+                });
+                json_entries.push(json);
+            }
 
             println!("{}", serde_json::to_string_pretty(&json_entries)?);
         }
@@ -20755,6 +20792,18 @@ fn allowlist_remove(
             );
         }
         println!("Removed learned filesystem approval {fingerprint}");
+        return Ok(());
+    }
+    if let Some(fingerprint) = rule_id.strip_prefix("approved_scripts:") {
+        let selected = selected_script_entries(layer == AllowlistLayer::Project)?;
+        if !selected
+            .iter()
+            .any(|entry| entry.fingerprint == fingerprint)
+            || !crate::trial_store::TrialStore::user()?.remove(fingerprint)?
+        {
+            return Err(format!("Script approval '{fingerprint}' was not found").into());
+        }
+        println!("Removed script approval {fingerprint}");
         return Ok(());
     }
 
@@ -20946,6 +20995,12 @@ fn allowlist_prune(
                     versions_pruned.learned_filesystem
                 );
             }
+            if versions_pruned.approved_scripts > 0 {
+                println!(
+                    "{action} {} script approvals whose scripts changed",
+                    versions_pruned.approved_scripts
+                );
+            }
             if !pruned.is_empty() {
                 println!(
                     "{} {} expired allowlist entr{}",
@@ -21009,6 +21064,7 @@ fn allowlist_prune(
                 "pruned": entries.len() + versions_pruned.total(),
                 "verified_trials_pruned": versions_pruned.verified_trials,
                 "learned_filesystem_pruned": versions_pruned.learned_filesystem,
+                "approved_scripts_pruned": versions_pruned.approved_scripts,
                 "entries": entries,
             });
             println!("{}", serde_json::to_string_pretty(&output)?);

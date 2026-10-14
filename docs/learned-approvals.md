@@ -21,6 +21,8 @@ scope supplies both the displayed sentence and the decision to store an approval
 - `one_time`: this invocation only; no reusable entry.
 - `exact_version`: exact command and project inputs; changes require review again.
 - `learned_filesystem`: command, rule and unchanged filesystem operands.
+- `approved_scripts`: command in this project until a reviewed script changes
+  (see [Approved scripts](#approved-scripts)).
 - `confined`: one execution under continuing confinement; no stored approval.
 
 Learning storage failure cannot silently convert a consented learned entry into a
@@ -47,6 +49,38 @@ On 2026-10-12 the native acceptance entry compiled, but the installed guard deni
 launching the temporary helper because its `/tmp` path contains a symlink. It was not
 rerouted or bypassed. Therefore the automated controller behavior is verified, while
 live focus recovery with Orca remains an operator acceptance step before installation.
+
+## Approved scripts
+
+When script-file inspection cannot fully verify a command
+(`heredoc.script_files:unverified`) and you approve it with Touch ID, dcg remembers
+the approval as `approved_scripts` (dialog title **Skripte prüfen und merken**).
+The approval binds:
+
+- the exact command text and its canonical working directory in the project;
+- the full content and permissions of every script file inspection resolved for
+  it: the scripts shown in the dialog plus every literal input path;
+- the executables the command resolves to, including the content of executables
+  inside the project;
+- the values of inherited preload variables (`NODE_OPTIONS`, `BASH_ENV`, `DYLD_*`,
+  `LD_*`, `PYTHONPATH`, …).
+
+Edits to other project files do not ask again, and neither sandbox
+reproducibility nor `[trial] enabled` affects it. Every hook for the project
+reuses it, including one without `--desktop-review`. Changing any bound script,
+its permissions, the command or the directory asks again. An input that is missing
+at review time cannot be remembered, so a file created later never inherits the
+approval. Definite destructive findings are evaluated first on every request and
+are never covered.
+
+Limit: only files dcg resolved are bound. Code a script loads dynamically (for
+example `import(process.env.MODULE)`) is not part of the approval and can change
+without a new review.
+
+`dcg allowlist list` shows `approved_scripts:<fingerprint>` entries;
+`dcg allowlist remove approved_scripts:<fingerprint>` revokes one, and
+`dcg allowlist prune` removes approvals whose scripts changed or disappeared.
+Sandbox-observed (`trial`) entries remain exact-version entries.
 
 ## Filesystem evidence and remembered approvals
 

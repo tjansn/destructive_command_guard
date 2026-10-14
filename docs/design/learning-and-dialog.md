@@ -232,3 +232,25 @@ workspace, under continuing confinement, and the agent gets that real result.
   (pi-os no longer writes outside temp; commit 1f894f5 on pi-os branch feat/file-commands moved its fx cache).
 
 Order: A, B, C, D, E. Same branch, separate commits, one REPORT; then Tom installs once.
+
+## Part F: script approvals are remembered until a reviewed script changes (Tom decided 2026-10-14)
+
+Observed: Touch ID approvals of unverified scripts were almost never reusable. The
+`exact_version` scope requires a reproducible sandbox environment, which a real agent
+session (extra environment variables, `~/.zshenv`) never is, so every review fell
+back to `one_time`; and an exact version binds the whole non-ignored project, so any
+edit asked again.
+
+Decision (Tom, choosing between "until the script changes", "permanently in this
+project" and "permanently everywhere"): an approval holds until one of the reviewed
+scripts changes. Implementation: `ApprovalScope::ApprovedScripts` and
+`TrialStore::{script_version, approve_scripts, lookup_scripts}`. The key binds the
+exact command, the canonical cwd in the project, the content and permissions of every
+resolved script/input path, the resolved executables (with content when inside the
+project) and inherited preload variables. It deliberately excludes other project
+files and sandbox reproducibility. The relaxed residual evaluation runs before every
+lookup, so definite findings are never covered; missing inputs cannot be remembered;
+a write failure keeps the consented request blocked. Lookups apply in every hook for
+the project, including hooks without trials or `--desktop-review`; only a hook with
+the dialog can create one. Sandbox-observed (`trial`) approvals keep exact-version
+semantics. Accepted limit: code loaded dynamically by a script is not bound.

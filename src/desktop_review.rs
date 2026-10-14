@@ -118,6 +118,8 @@ pub enum ApprovalScope {
     OneTime,
     ExactVersion,
     LearnedFilesystem,
+    /// Remembered until one of the reviewed scripts changes.
+    ApprovedScripts,
     Confined,
 }
 
@@ -140,6 +142,9 @@ impl ApprovalScope {
             }
             Self::LearnedFilesystem => {
                 "Touch ID merkt sich diesen Aufruf, diese Regel und die unveränderten Dateisystemobjekte. Änderungen erfordern erneut eine Prüfung."
+            }
+            Self::ApprovedScripts => {
+                "Touch ID merkt sich diesen Befehl in diesem Projekt, solange die geprüften Skripte unverändert sind. Ändert sich eines davon, wird erneut gefragt."
             }
             Self::Confined => {
                 "Der Befehl läuft einmal unter fortlaufender Sandbox-Begrenzung. Es wird keine Freigabe gespeichert."
@@ -383,7 +388,7 @@ pub fn request_trial(
     summary: &str,
     agent: &str,
     scope: ApprovalScope,
-    fingerprint: &crate::trial_store::Fingerprint,
+    executables: &[PathBuf],
     evidence: Option<&ReviewSnapshot>,
 ) -> bool {
     let Some(_lock) = review_lock() else {
@@ -392,15 +397,9 @@ pub fn request_trial(
     let Some(before) = directory_identity(cwd) else {
         return false;
     };
-    let Some(description) = trial_description(
-        command,
-        cwd,
-        summary,
-        agent,
-        scope,
-        &fingerprint.resolved_executables,
-        evidence,
-    ) else {
+    let Some(description) =
+        trial_description(command, cwd, summary, agent, scope, executables, evidence)
+    else {
         return false;
     };
     native_dialog(&description, &format!("{:032x}", rand::random::<u128>()))
@@ -453,10 +452,10 @@ fn trial_description(
         project: visible_inline(&cwd.file_name().unwrap_or_default().to_string_lossy()),
         repository: repository_root(cwd).map(|p| visible_inline(&p.display().to_string())),
         cwd: visible(&cwd.display().to_string()),
-        title: if scope == ApprovalScope::OneTime {
-            "Genauen Aufruf einmalig prüfen"
-        } else {
-            "Unvollständigen Sandbox-Test prüfen"
+        title: match scope {
+            ApprovalScope::OneTime => "Genauen Aufruf einmalig prüfen",
+            ApprovalScope::ApprovedScripts => "Skripte prüfen und merken",
+            _ => "Unvollständigen Sandbox-Test prüfen",
         }
         .to_owned(),
         effect: "Der echte Befehl darf nach Freigabe außerhalb der Sandbox laufen.".to_owned(),
@@ -899,12 +898,14 @@ mod tests {
             ApprovalScope::ExactVersion,
             ApprovalScope::LearnedFilesystem,
             ApprovalScope::Confined,
+            ApprovalScope::ApprovedScripts,
         ]
         .map(ApprovalScope::sentence);
         assert!(sentences[0].contains("keine wiederverwendbare Ausnahme"));
         assert!(sentences[1].contains("exakte Befehls- und Projektversion"));
         assert!(sentences[2].contains("Dateisystemobjekte"));
         assert!(sentences[3].contains("keine Freigabe gespeichert"));
+        assert!(sentences[4].contains("geprüften Skripte unverändert"));
         assert!(
             sentences
                 .iter()
@@ -919,6 +920,8 @@ mod tests {
         for (scope, wire) in [
             (ApprovalScope::OneTime, "one_time"),
             (ApprovalScope::ExactVersion, "exact_version"),
+            // The native dialog accepts only scopes it knows; keep both sides in step.
+            (ApprovalScope::ApprovedScripts, "approved_scripts"),
         ] {
             let mut description = trial_description(
                 &command,
@@ -933,6 +936,7 @@ mod tests {
             description.set_scope(scope);
             let json = serde_json::to_value(&description).unwrap();
             assert_eq!(json["scope"], wire);
+            assert!(include_str!("desktop_review.swift").contains(&format!("\"{wire}\"")));
             assert_eq!(json["scope_text"], scope.sentence());
             assert_eq!(json["command"], command);
             assert_eq!(json["executables"][0], "/usr/bin/node");

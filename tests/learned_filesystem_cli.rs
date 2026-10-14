@@ -285,3 +285,52 @@ fn hook_recursive_ancestor_of_managed_configuration_is_never_learned() {
         assert_eq!(fs::read_to_string(&settings).unwrap(), "protected contents");
     }
 }
+
+/// A Touch ID script approval holds until a reviewed script changes, through
+/// every hook for the project, including one without trials or the dialog.
+#[test]
+fn approved_scripts_hold_until_a_reviewed_script_changes() {
+    let fixture = Fixture::new();
+    let script = fixture.project.join("run.sh");
+    // The dynamic source keeps static inspection inconclusive.
+    fs::write(&script, "printf 'step\\n'\n. \"./lib/${STEP}.sh\"\n").unwrap();
+    fs::write(fixture.project.join("notes.txt"), "draft").unwrap();
+    let command = "/bin/sh ./run.sh";
+    let denied = |output: &std::process::Output| {
+        String::from_utf8_lossy(&output.stdout).contains("\"deny\"")
+    };
+    let unapproved = fixture.hook(command);
+    assert!(denied(&unapproved), "{unapproved:?}");
+
+    // What the desktop review records after Touch ID, bound to the same
+    // inherited environment as the spawned hook.
+    let version = fixture
+        .store
+        .script_version(command, &fixture.project, std::slice::from_ref(&script))
+        .unwrap();
+    let entry = fixture.store.approve_scripts(&version, "Touch ID").unwrap();
+    for _ in 0..2 {
+        let approved = fixture.hook(command);
+        assert!(approved.stdout.is_empty(), "{approved:?}");
+        assert!(
+            String::from_utf8_lossy(&approved.stderr).contains("scripts unchanged"),
+            "{approved:?}"
+        );
+        // Unrelated project edits do not ask again.
+        fs::write(fixture.project.join("notes.txt"), "rewritten").unwrap();
+    }
+    let listed = fixture.list("--user");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["selector"]["type"], "approved_scripts");
+    assert_eq!(listed[0]["selector"]["value"], entry.fingerprint);
+    assert_eq!(listed[0]["command"], command);
+    assert_eq!(listed[0]["scripts"][0], script.to_str().unwrap());
+
+    // Editing the approved script requires review again.
+    fs::write(&script, "printf 'changed\\n'\n. \"./lib/${STEP}.sh\"\n").unwrap();
+    let changed = fixture.hook(command);
+    assert!(denied(&changed), "{changed:?}");
+    assert!(!String::from_utf8_lossy(&changed.stderr).contains("scripts unchanged"));
+    fixture.cli(&["allowlist", "prune", "--user"]);
+    assert!(fixture.store.list_scripts().unwrap().is_empty());
+}

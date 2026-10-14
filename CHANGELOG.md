@@ -44,6 +44,11 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   `--print` (also `--eval=…`) and `php --run`. Only the short flags reached
   embedded-code analysis, so `node --eval '<recursive rmSync>'` ran past rules
   that deny the `-e` spelling.
+- Remember Touch ID approvals of unverified scripts until one of the reviewed
+  scripts changes (`approved_scripts`). Edits to other project files no longer ask
+  again, approvals are no longer lost to sandbox reproducibility, and every hook
+  for the project reuses them. Manage them with `dcg allowlist list|remove|prune`.
+  See [approved scripts](docs/learned-approvals.md#approved-scripts).
 
 ## [v0.15.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.3) -- 2026-10-08 [Release]
 
