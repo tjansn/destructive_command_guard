@@ -541,7 +541,7 @@ fn desktop_review_keeps_safe_unverified_and_multi_entry_protocols_closed() {
             false,
             false,
             "deny",
-            "Die Prüfung ist unvollständig",
+            "[dcg:review-not-started] Keine Desktop-Freigabe möglich: Projektstand, Arbeitsordner und ausführbare Dateien lassen sich für diesen Aufruf nicht genau binden",
         ),
         (
             "git reset --hard HEAD",
@@ -1803,6 +1803,96 @@ fn large_reviewable_scripts_reach_the_dialog_and_fail_closed_without_helper() {
         assert!(!reason.contains(misleading), "{misleading}: {reason}");
     }
     assert!(!fixture.root.join("home/.config/dcg/trials").exists());
+}
+
+/// A directory change before a pipe leaves the working directory of the later
+/// stages unbound, so neither a trial nor a dialog can bind this version. A
+/// hook with --desktop-review used to call that "desktop approval
+/// unavailable" and advise --desktop-review; it now says no dialog can start
+/// and why. A hook without the dialog keeps naming the missing flag.
+#[test]
+fn unbindable_versions_report_why_review_cannot_start() {
+    let hook = |fixture: &Fixture, desktop_review: bool| {
+        for blocker in [
+            "home/Library/Application Support/dcg/desktop-review",
+            "home/.config/dcg/desktop-review",
+        ] {
+            fixture.write(blocker, "");
+        }
+        fixture.write(
+            "tests/app.test.mjs",
+            "import { spawn } from 'node:child_process';\n\
+             spawn(process.execPath, ['server' + '.mjs'], { env: { ...process.env, PORT: '40000' } });\n",
+        );
+        fixture.write("server.mjs", "console.log('fixture');\n");
+        let candidate = format!(
+            "cd '{}' && node --test tests/app.test.mjs | cat",
+            fixture.root.display()
+        );
+        let input = json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": candidate},
+            "cwd": fixture.root,
+            "dcg_explicit_verdict": true,
+        });
+        let mut command = fixture.command();
+        if desktop_review {
+            command.arg("--desktop-review");
+        }
+        let mut child = command
+            .args(["--no-color", "--agent", "pi"])
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        for attempt in ["Warte auf", "Touch-ID-Dialog"] {
+            assert!(!stderr.contains(attempt), "{candidate}: {stderr}");
+        }
+        let verdict: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{candidate}: {error}: {stderr}"));
+        let denial = &verdict["hookSpecificOutput"];
+        assert_eq!(denial["permissionDecision"], "deny", "{verdict}");
+        assert_eq!(
+            denial["ruleId"], "heredoc.script_files:unverified",
+            "{verdict}"
+        );
+        let reason = denial["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for misleading in [
+            "desktop approval unavailable",
+            "Enable sandbox trials and use a hook",
+            "and retry ",
+            "allow-once",
+        ] {
+            assert!(!reason.contains(misleading), "{misleading}: {reason}");
+        }
+        reason
+    };
+
+    let reason = hook(&version_review_fixture(), true);
+    assert!(reason.contains("[dcg:review-not-started]"), "{reason}");
+    assert!(reason.contains("nicht genau binden"), "{reason}");
+    assert!(reason.contains("working directory"), "{reason}");
+    assert!(reason.contains("Nächster Schritt"), "{reason}");
+    assert!(reason.contains("no approval was recorded"), "{reason}");
+    assert!(!reason.contains("--desktop-review fehlt"), "{reason}");
+
+    // Trials stay enabled here, so the sandbox path reaches the same binding.
+    let reason = hook(&Fixture::new(), false);
+    assert!(
+        reason.contains("Cannot bind an exact project version for a sandbox trial"),
+        "{reason}"
+    );
+    assert!(reason.contains("--desktop-review fehlt"), "{reason}");
+    assert!(!reason.contains("[dcg:review-"), "{reason}");
 }
 
 #[test]

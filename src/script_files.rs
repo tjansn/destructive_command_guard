@@ -361,12 +361,16 @@ fn unverified(reason: &str) -> EvaluationResult {
             );
             return result;
         }
+        // State prerequisites, not advice: a hook that already has the
+        // dialog must not be told to enable it (fork issue #2). The hook
+        // appends the concrete reason no trial or review approved it.
         info.explanation = Some(
-            "Static inspection could not establish the executable sources. A sandbox trial \
-             or desktop review must verify this exact project, command and source version. \
-             Enable sandbox trials and use a hook invoked with --desktop-review for \
-             inconclusive results; `dcg trial run -- '<command>'` provides a manual sandbox \
-             check. Command-only exceptions do not resolve this inspection boundary."
+            "Static inspection could not establish the executable sources. Only a sandbox \
+             trial or desktop review of this exact project, command and source version can \
+             resolve this inspection boundary. Both need a version dcg can bind; trials must \
+             be enabled, and desktop review runs only in a hook invoked with --desktop-review. \
+             `dcg trial run -- '<command>'` provides a manual sandbox check. Command-only \
+             exceptions do not resolve this inspection boundary."
                 .to_owned(),
         );
     }

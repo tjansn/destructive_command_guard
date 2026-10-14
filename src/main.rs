@@ -2896,9 +2896,18 @@ fn attempt_sandbox_trial(
                     "The project version cannot be bound for a sandbox trial. This command requires desktop review; an approval is remembered until the reviewed scripts change.",
                 );
             }
+            // Without the dialog the hook caller already appends why no review
+            // started. With it, no dialog can bind this version either, so say
+            // that instead of advising the --desktop-review the hook already
+            // has (fork issue #2).
+            Err(e) if !desktop => {
+                return Err(format!(
+                    "Die Prüfung ist unvollständig. Cannot bind an exact project version for a sandbox trial: {e}"
+                ));
+            }
             Err(e) => {
                 return Err(format!(
-                    "Die Prüfung ist unvollständig. Cannot bind an exact trial version; desktop approval unavailable: {e}"
+                    "[dcg:review-not-started] Keine Desktop-Freigabe möglich: Projektstand, Arbeitsordner und ausführbare Dateien lassen sich für diesen Aufruf nicht genau binden ({e}), eine Freigabe könnte nicht an den geprüften Stand gebunden werden. Nächster Schritt: diese Ursache beheben (fehlende Dateien prüfen, Programme wörtlich angeben, einen Verzeichniswechsel nur als führendes `cd <Pfad> &&` ohne Pipe im Aufruf) oder den Befehl vom Nutzer selbst ausführen lassen."
                 ));
             }
         };
