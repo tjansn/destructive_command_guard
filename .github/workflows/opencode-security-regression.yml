@@ -1,13 +1,16 @@
-name: OpenCode 547 candidate validation (not production)
+name: OpenCode 547 reviewed security correction
 
-# This workflow validates a candidate patch in a disposable checkout.
-# It does NOT fix the adapter on main, publish source, or update any ref.
-# A successful run is evidence about the patched checkout, not production.
 on:
+  issue_comment:
+    types: [created]
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: dcg-547-reviewed-security-correction
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,14 +18,23 @@ env:
   CARGO_BUILD_JOBS: 2
 
 jobs:
-  validate-candidate:
+  land-reviewed-fix:
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.repository == 'Dicklesworthstone/destructive_command_guard' &&
+      github.event.issue.number == 547 &&
+      github.event.comment.user.login == github.repository_owner &&
+      github.event.comment.body == 'dcg-547-apply-reviewed-patch:8f6114b9235ca56e8901a90fa0443dba5272526e'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
         with:
-          persist-credentials: false
-      - name: Apply the reviewed candidate to exactly the inspected source
+          ref: main
+          fetch-depth: 0
+      - name: Apply the reviewed patch to exactly the inspected source blobs
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -40,14 +52,36 @@ jobs:
         run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt,clippy
       - name: Require JavaScript rather than silently skipping the regression
         run: node --version
-      - name: Exercise the candidate's installed adapter with compiled DCG
+      - name: Exercise the installed adapter with compiled DCG
         id: adapter
         run: cargo test --locked --test repro_419_opencode_plugin_executes -- --nocapture
-      - name: Check all Rust targets
-        run: cargo check --locked --all-targets
       - name: Check formatting
         run: cargo fmt --check
+      - name: Commit the validated source correction directly to main
+        run: |
+          set -euo pipefail
+          git diff --check
+          test "$(git diff --name-only)" = $'src/cli.rs\ntests/repro_419_opencode_plugin_executes.rs'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- src/cli.rs tests/repro_419_opencode_plugin_executes.rs
+          git commit -m 'fix(opencode): intercept v2 shell execution and compatible command tools (#547)' -m 'Share the command guard across v1 and v2; reject incompatible shell payloads and hook APIs visibly. Preserve the canonical DCG protocol, bypass, and crash/verdict policy. Exercise v2 via shell and assert the before-hook vetoes execution. Select the advertised shell/bash tool in the live-host fixture.' -m 'Validation: cargo test --locked --test repro_419_opencode_plugin_executes -- --nocapture; cargo fmt --check; git diff --check. No live-host or full-suite result is claimed by this commit.'
+          for attempt in 1 2 3; do
+            git fetch origin main
+            test "$(git rev-parse origin/main:src/cli.rs)" = 5647a4de7b546742af7fb23ed70ff165afc4fff5
+            test "$(git rev-parse origin/main:tests/repro_419_opencode_plugin_executes.rs)" = cc46c451c4c648860cb629f0108c1218a99936c3
+            git rebase origin/main
+            if git push origin HEAD:main; then
+              echo "DCG547_PRODUCTION_COMMIT=$(git rev-parse HEAD)"
+              exit 0
+            fi
+          done
+          echo 'main kept moving; no force push attempted' >&2
+          exit 1
+      - name: Check all Rust targets
+        run: cargo check --locked --all-targets
       - name: Check Clippy
+        if: ${{ !cancelled() && steps.adapter.outcome == 'success' }}
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Attempt live OpenCode v1 verification
         if: ${{ !cancelled() && steps.adapter.outcome == 'success' }}
