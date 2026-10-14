@@ -1,0 +1,113 @@
+name: OpenCode security regression
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - src/cli.rs
+      - tests/repro_419_opencode_plugin_executes.rs
+      - .github/workflows/opencode-security-regression.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_BUILD_JOBS: 2
+
+jobs:
+  prepare-reviewed-fix:
+    # Bootstrap #547 in a full checkout. This job publishes content-addressed
+    # source blobs only; it never updates main or any other repository ref.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Apply the reviewed patch to exactly the inspected source blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD:src/cli.rs)" = 5647a4de7b546742af7fb23ed70ff165afc4fff5
+          test "$(git rev-parse HEAD:tests/repro_419_opencode_plugin_executes.rs)" = cc46c451c4c648860cb629f0108c1218a99936c3
+          gh api repos/Dicklesworthstone/destructive_command_guard/git/blobs/8f6114b9235ca56e8901a90fa0443dba5272526e --jq .content | base64 --decode > "$RUNNER_TEMP/dcg547.patch"
+          test "$(git hash-object "$RUNNER_TEMP/dcg547.patch")" = 8f6114b9235ca56e8901a90fa0443dba5272526e
+          git apply --check --whitespace=error "$RUNNER_TEMP/dcg547.patch"
+          git apply --whitespace=error "$RUNNER_TEMP/dcg547.patch"
+          git diff --check
+          test "$(git diff --name-only)" = $'src/cli.rs\ntests/repro_419_opencode_plugin_executes.rs'
+          git diff --stat
+      - name: Publish corrected source blobs for an explicit main commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, urllib.request
+          repo = 'Dicklesworthstone/destructive_command_guard'
+          print('DCG547_BASE=' + subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip())
+          for path in ('src/cli.rs', 'tests/repro_419_opencode_plugin_executes.rs'):
+              expected = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              body = json.dumps({'content': pathlib.Path(path).read_text(), 'encoding': 'utf-8'}).encode()
+              request = urllib.request.Request('https://api.github.com/repos/' + repo + '/git/blobs', data=body, method='POST', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json', 'X-GitHub-Api-Version': '2022-11-28'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  blob = json.load(response)
+              assert blob['sha'] == expected, (path, expected, blob['sha'])
+              print('DCG547_BLOB ' + path + ' ' + blob['sha'])
+          PY
+
+  validate-reviewed-fix:
+    needs: prepare-reviewed-fix
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Apply the same content-addressed patch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD:src/cli.rs)" = 5647a4de7b546742af7fb23ed70ff165afc4fff5
+          test "$(git rev-parse HEAD:tests/repro_419_opencode_plugin_executes.rs)" = cc46c451c4c648860cb629f0108c1218a99936c3
+          gh api repos/Dicklesworthstone/destructive_command_guard/git/blobs/8f6114b9235ca56e8901a90fa0443dba5272526e --jq .content | base64 --decode > "$RUNNER_TEMP/dcg547.patch"
+          test "$(git hash-object "$RUNNER_TEMP/dcg547.patch")" = 8f6114b9235ca56e8901a90fa0443dba5272526e
+          git apply --check --whitespace=error "$RUNNER_TEMP/dcg547.patch"
+          git apply --whitespace=error "$RUNNER_TEMP/dcg547.patch"
+          git diff --check
+      - name: Install the repository's pinned Rust toolchain
+        run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt,clippy
+      - name: Require the JavaScript runtime, rather than skipping the regression
+        run: node --version
+      - name: Exercise the installed adapter with compiled DCG
+        id: adapter
+        run: cargo test --locked --test repro_419_opencode_plugin_executes -- --nocapture
+      - name: Check all Rust targets
+        run: cargo check --locked --all-targets
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Check Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Attempt live OpenCode v1 verification
+        if: ${{ !cancelled() && steps.adapter.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 6
+        run: |
+          npm install --prefix "$RUNNER_TEMP/opencode-v1" opencode-ai@1.18.33
+          export DCG_TEST_OPENCODE_BIN="$RUNNER_TEMP/opencode-v1/node_modules/.bin/opencode"
+          "$DCG_TEST_OPENCODE_BIN" --version
+          timeout 180s cargo test --locked --test repro_419_opencode_plugin_executes real_opencode_blocks_through_the_plugin_516 -- --ignored --exact --nocapture
+      - name: Attempt live OpenCode v2 verification
+        if: ${{ !cancelled() && steps.adapter.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 6
+        run: |
+          npm install --prefix "$RUNNER_TEMP/opencode-v2" @opencode/cli@2.0.26
+          export DCG_TEST_OPENCODE_BIN="$RUNNER_TEMP/opencode-v2/node_modules/.bin/opencode"
+          "$DCG_TEST_OPENCODE_BIN" --version
+          timeout 180s cargo test --locked --test repro_419_opencode_plugin_executes real_opencode_blocks_through_the_plugin_516 -- --ignored --exact --nocapture
