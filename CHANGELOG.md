@@ -50,6 +50,18 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   for the project reuses them. Manage them with `dcg allowlist list|remove|prune`.
   See [approved scripts](docs/learned-approvals.md#approved-scripts).
 
+### 0.15.3+tom.19
+
+- **Upstream permission hardening (cherry-picked from `6009005f`'s history).**
+  `setfacl` mutations are evaluated in order, protected path aliases and
+  BSD ACL targets survive GNU-style safe decisions, and alias and
+  setuid/setgid denials hold when an argument list cannot be resolved
+  (upstream `e272047a`, `340aee28`, `627a4272`, `deae3ee5`, `a0896d5a`).
+  Upstream's #561 Git Bash `cmd //c` fix was already in the fork; the
+  re-applied copy is reverted. The #558 IFS and #560 interpreter-heredoc
+  series stay held back: upstream `6009005f` still fails 28 tests, including
+  the three regressions in upstream #565.
+
 ### 0.15.3+tom.18
 
 - **The Touch ID dialog is readable over any window.** Its clear Liquid Glass
