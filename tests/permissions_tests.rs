@@ -405,10 +405,7 @@ fn setfacl_rule_grants_do_not_exempt_other_permission_effects() {
 
     let chmod_grant = Fixture::new(&["chmod-recursive-root"]);
     chmod_grant.allowed("chmod -R 000 /tmp/../etc");
-    for command in [
-        "setfacl -Rb /etc",
-        "chmod -R 000 /etc; setfacl -Rb /etc",
-    ] {
+    for command in ["setfacl -Rb /etc", "chmod -R 000 /etc; setfacl -Rb /etc"] {
         chmod_grant.denied(command, "setfacl-all");
     }
 
@@ -496,24 +493,15 @@ fn unresolved_tails_do_not_drop_recursive_alias_or_bundle_checks() {
         "true && chmod -R 000 /tmp/../etc \"$EXTRA\"",
         "chmod-recursive-root",
     );
-    fixture.denied(
-        "'setfacl' -bR /tmp/../etc \"$EXTRA\"",
-        "setfacl-all",
-    );
+    fixture.denied("'setfacl' -bR /tmp/../etc \"$EXTRA\"", "setfacl-all");
 }
 
 #[test]
 fn independent_special_bit_grants_remain_separate_in_the_fallback() {
     let recursive_grant = Fixture::new(&["chmod-recursive-root"]);
-    recursive_grant.denied(
-        "chmod -R 6755 /tmp/../etc \"$EXTRA\"",
-        "chmod-setuid",
-    );
+    recursive_grant.denied("chmod -R 6755 /tmp/../etc \"$EXTRA\"", "chmod-setuid");
     let recursive_uid_grant = Fixture::new(&["chmod-recursive-root", "chmod-setuid"]);
-    recursive_uid_grant.denied(
-        "chmod -R 6755 /tmp/../etc \"$EXTRA\"",
-        "chmod-setgid",
-    );
+    recursive_uid_grant.denied("chmod -R 6755 /tmp/../etc \"$EXTRA\"", "chmod-setgid");
 
     let uid_grant = Fixture::new(&["chmod-setuid"]);
     let gid_grant = Fixture::new(&["chmod-setgid"]);
