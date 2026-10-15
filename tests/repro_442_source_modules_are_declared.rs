@@ -72,17 +72,28 @@ fn path_included_modules(source: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Files pulled in by `#[path]` from modules that are themselves declared.
+/// Files pulled in by `#[path]` from modules that are themselves compiled:
+/// declared ones, and transitively the files they include
+/// (`ast_matcher.rs` → `ast_source_analysis.rs` → `ast_pattern_engine.rs`).
 ///
-/// Reading only DECLARED parents is what keeps this from weakening the guard.
-/// An orphaned file is never compiled, so a `#[path]` written inside one pulls
-/// nothing in — and if it were counted, one orphan could vouch for another.
+/// Starting only from DECLARED parents is what keeps this from weakening the
+/// guard. An orphaned file is never compiled, so a `#[path]` written inside
+/// one pulls nothing in — and if it were counted, one orphan could vouch for
+/// another.
 fn path_includes_of_declared(src: &Path, declared: &BTreeSet<&str>) -> BTreeSet<String> {
-    declared
-        .iter()
-        .filter_map(|parent| std::fs::read_to_string(src.join(format!("{parent}.rs"))).ok())
-        .flat_map(|text| path_included_modules(&text))
-        .collect()
+    let mut included = BTreeSet::new();
+    let mut parents: Vec<String> = declared.iter().map(|name| (*name).to_owned()).collect();
+    while let Some(parent) = parents.pop() {
+        let Ok(text) = std::fs::read_to_string(src.join(format!("{parent}.rs"))) else {
+            continue;
+        };
+        for child in path_included_modules(&text) {
+            if !declared.contains(child.as_str()) && included.insert(child.clone()) {
+                parents.push(child);
+            }
+        }
+    }
+    included
 }
 
 /// Stems of `*.rs` files directly under `dir`, excluding the crate roots, that
@@ -227,6 +238,32 @@ mod detection_is_not_vacuous {
         assert!(
             !included.contains("smuggled"),
             "an orphan is never compiled, so its #[path] cannot vouch for anything"
+        );
+    }
+
+    #[test]
+    fn a_path_include_chain_counts_only_from_a_declared_module() {
+        let directory = tempfile::tempdir().expect("create a temporary source directory");
+        let source = directory.path();
+        for (file, include) in [
+            ("parent.rs", "middle"),
+            ("middle.rs", "engine"),
+            ("orphan.rs", "smuggled"),
+            ("smuggled.rs", "deeper"),
+        ] {
+            std::fs::write(
+                source.join(file),
+                format!("#[path = \"{include}.rs\"]\nmod {include};\n"),
+            )
+            .expect("write a source file");
+        }
+
+        let included = path_includes_of_declared(source, &BTreeSet::from(["parent"]));
+
+        assert_eq!(
+            included,
+            BTreeSet::from(["engine".to_owned(), "middle".to_owned()]),
+            "a compiled #[path] file's own include is compiled; an orphan's chain is not"
         );
     }
 
