@@ -638,6 +638,39 @@ pub fn scan_executing_sink_matches(code: &str, language: ScriptLanguage) -> Vec<
         });
     }
 
+    if matches!(
+        language,
+        ScriptLanguage::JavaScript | ScriptLanguage::TypeScript
+    ) {
+        let lang_id = if language == ScriptLanguage::JavaScript {
+            "javascript"
+        } else {
+            "typescript"
+        };
+        for call in js_runtime_spawn_calls(code, language) {
+            let hit = match &call.form {
+                RuntimeSpawnForm::Argv(argv) => detect_destructive_in_args(argv, language),
+                RuntimeSpawnForm::ShellLine(line) => detect_shell_payload(line),
+            };
+            let Some(hit) = hit.filter(|hit| hit.severity.blocks_by_default()) else {
+                continue;
+            };
+            out.push(PatternMatch {
+                rule_id: format!("heredoc.{lang_id}.exec_sink.{}", hit.rule_suffix),
+                reason: format!("{} via {} exec sink", hit.reason, call.sink),
+                matched_text_preview: truncate_preview(
+                    code.get(call.start..call.end).unwrap_or(""),
+                    60,
+                ),
+                start: call.start,
+                end: call.end,
+                line_number: newline_positions.partition_point(|&idx| idx < call.start) + 1,
+                severity: hit.severity,
+                suggestion: hit.suggestion.map(str::to_string),
+            });
+        }
+    }
+
     out
 }
 
@@ -836,6 +869,43 @@ pub fn exec_sink_reconstructed_commands(
             });
         }
     }
+    if matches!(
+        language,
+        ScriptLanguage::JavaScript | ScriptLanguage::TypeScript
+    ) {
+        // Deno and Bun spawns, left to the rm/git backstop on any hit as above.
+        // Their argv runs without a shell, so even a lone operand is a program.
+        for call in js_runtime_spawn_calls(code, language) {
+            let command = match call.form {
+                RuntimeSpawnForm::Argv(argv) => {
+                    if detect_destructive_in_args(&argv, language).is_some() {
+                        continue;
+                    }
+                    let operands = exec_argv_operands(&argv, language);
+                    if operands.unverified || operands.values.is_empty() {
+                        continue;
+                    }
+                    operands
+                        .values
+                        .iter()
+                        .map(|operand| quote_exec_operand(operand))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                }
+                RuntimeSpawnForm::ShellLine(line) => {
+                    if line.trim().is_empty() || detect_shell_payload(&line).is_some() {
+                        continue;
+                    }
+                    line
+                }
+            };
+            out.push(ReconstructedCommand {
+                command,
+                start: call.start,
+                end: call.end,
+            });
+        }
+    }
     out
 }
 
@@ -936,6 +1006,311 @@ static JS_REQUIRE_CHILD_PROCESS_RECEIVER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"require\s*\(\s*["'](?:node:)?child_process["']\s*\)\s*\.$"#)
         .expect("js require child_process receiver regex compiles")
 });
+
+/// One Deno or Bun process-spawn call in JavaScript/TypeScript source.
+struct RuntimeSpawnCall {
+    /// How the call is named in a denial reason.
+    sink: &'static str,
+    /// Byte span of the whole call in the scanned source.
+    start: usize,
+    end: usize,
+    form: RuntimeSpawnForm,
+}
+
+enum RuntimeSpawnForm {
+    /// The call's argv rewritten as `run([…])`, the one-list call shape
+    /// [`exec_argv_operands`] and [`detect_destructive_in_args`] read. Argv the
+    /// source does not spell out literally is a `...` spread there, so it
+    /// stays unverified exactly like `spawnSync("git", flags)`.
+    Argv(String),
+    /// A shell template's command line, each `${…}` replaced by one quoted
+    /// runtime value.
+    ShellLine(String),
+}
+
+/// Deno's and Bun's process APIs (see [`JS_RUNTIME_SPAWN_CALL`]), each read
+/// as the argv or command line it runs.
+///
+/// Neither runtime puts a shell between an argv call and its program, so the
+/// argv forms are read like Node's `spawnSync(program, args)`. Bun's `$` tag
+/// runs its template through Bun Shell, as zx's and execa's `$` run theirs
+/// through a shell, so it is read like `execSync(line)`. A bare `$` template
+/// counts only when the source imports one of those modules and the `$` stands
+/// where a tagged template can, which keeps `` `${n}$` `` and `` `cost: $` ``
+/// inside an ordinary template from being read as one. An alias under another
+/// name (`const c = Deno.Command; new c(…)`) is not followed, as with
+/// `child_process`.
+fn js_runtime_spawn_calls(code: &str, language: ScriptLanguage) -> Vec<RuntimeSpawnCall> {
+    let mut calls = Vec::new();
+    let mut shell_module = None;
+    for caps in JS_RUNTIME_SPAWN_CALL.captures_iter(code) {
+        let Some(whole) = caps.get(0) else { continue };
+        let start = whole.start();
+        if caps.name("shell").is_some() {
+            let bun = whole.as_str().starts_with("Bun.");
+            let shell_tag = bun
+                || *shell_module.get_or_insert_with(|| JS_SHELL_TAG_MODULE.is_match(code))
+                    && js_tagged_template_position(code, start);
+            if !shell_tag {
+                continue;
+            }
+            let Some((line, end)) = js_shell_template_line(code, whole.end() - 1, 0) else {
+                continue;
+            };
+            calls.push(RuntimeSpawnCall {
+                sink: if bun { "Bun.$``" } else { "$``" },
+                start,
+                end,
+                form: RuntimeSpawnForm::ShellLine(line),
+            });
+            continue;
+        }
+
+        let region = exec_sink_arg_region(code, start);
+        let Some(arguments) = region
+            .find('(')
+            .and_then(|open| region.get(open + 1..))
+            .and_then(|inner| inner.strip_suffix(')'))
+            .and_then(|inner| split_exec_operands(inner, b",", language))
+        else {
+            continue;
+        };
+        let first = skip_exec_trivia(arguments[0], language).trim_end();
+        let (sink, argv) = if caps.name("command").is_some() {
+            // `new Deno.Command(program, {args: [...]})`.
+            if first.is_empty() {
+                continue;
+            }
+            let options = arguments
+                .get(1)
+                .map(|options| skip_exec_trivia(options, language).trim_end())
+                .filter(|options| !options.is_empty());
+            let args = options.map_or(ObjectProperty::Absent, |options| {
+                js_object_property(options, "args", language)
+            });
+            (
+                "Deno.Command()",
+                js_runtime_argv(Some(first), args, language),
+            )
+        } else if first.starts_with('[') {
+            // `Bun.spawn([program, ...args], options)`.
+            let sink = if whole.as_str().contains("Sync") {
+                "Bun.spawnSync()"
+            } else {
+                "Bun.spawn()"
+            };
+            (sink, format!("run({first})"))
+        } else {
+            // `Deno.run({cmd: [...]})` and `Bun.spawn({cmd: [...]})`.
+            let sink = if caps.name("run").is_some() {
+                "Deno.run()"
+            } else if whole.as_str().contains("Sync") {
+                "Bun.spawnSync()"
+            } else {
+                "Bun.spawn()"
+            };
+            match js_object_property(first, "cmd", language) {
+                // Without `cmd` this is not a spawn either API would accept.
+                ObjectProperty::Absent => continue,
+                cmd => (sink, js_runtime_argv(None, cmd, language)),
+            }
+        };
+        calls.push(RuntimeSpawnCall {
+            sink,
+            start,
+            end: start + region.len(),
+            form: RuntimeSpawnForm::Argv(argv),
+        });
+    }
+    calls
+}
+
+/// `run([program, ...list])` from a spawn's program expression and the
+/// property that holds its argv list.
+fn js_runtime_argv(
+    program: Option<&str>,
+    list: ObjectProperty<'_>,
+    language: ScriptLanguage,
+) -> String {
+    const UNVERIFIED: &str = "...dcg_runtime_argv";
+    let elements = match list {
+        ObjectProperty::Absent => "",
+        // One balanced list literal. `args: flags` and `args: ["-C",
+        // dir].concat(more)` supply an unknown number of words.
+        ObjectProperty::Value(list) => list
+            .strip_prefix('[')
+            .and_then(|list| list.strip_suffix(']'))
+            .filter(|inner| split_exec_operands(inner, b",", language).is_some())
+            .unwrap_or(UNVERIFIED),
+        ObjectProperty::Unknown => UNVERIFIED,
+    };
+    let parts: Vec<&str> = program
+        .into_iter()
+        .chain(
+            Some(elements)
+                .filter(|elements| !skip_exec_trivia(elements, language).trim_end().is_empty()),
+        )
+        .collect();
+    format!("run([{}])", parts.join(", "))
+}
+
+/// What a JavaScript object literal says about one of its keys.
+#[derive(Clone, Copy)]
+enum ObjectProperty<'a> {
+    /// The literal certainly has no such key.
+    Absent,
+    /// The expression the key is set to.
+    Value(&'a str),
+    /// Not a literal object, or a spread, computed key, shorthand, method or
+    /// getter that can supply the key at run time.
+    Unknown,
+}
+
+/// The value of `key` in the JavaScript object literal `object`.
+fn js_object_property<'a>(
+    object: &'a str,
+    key: &str,
+    language: ScriptLanguage,
+) -> ObjectProperty<'a> {
+    let Some(properties) = object
+        .strip_prefix('{')
+        .and_then(|object| object.strip_suffix('}'))
+        .and_then(|inner| split_exec_operands(inner, b",", language))
+    else {
+        return ObjectProperty::Unknown;
+    };
+    let mut value = ObjectProperty::Absent;
+    for property in properties {
+        let property = skip_exec_trivia(property, language).trim_end();
+        if property.is_empty() {
+            continue;
+        }
+        if property.starts_with("...") || property.starts_with('[') {
+            return ObjectProperty::Unknown;
+        }
+        let Some(name_end) =
+            split_exec_operands(property, b":", language).map(|parts| parts[0].len())
+        else {
+            return ObjectProperty::Unknown;
+        };
+        let name = property[..name_end].trim();
+        let name = name
+            .strip_prefix(['"', '\''])
+            .and_then(|name| name.strip_suffix(['"', '\'']))
+            .unwrap_or(name);
+        if name_end == property.len() {
+            // Shorthand `{args}`, a method or a getter: not a literal value.
+            if name
+                .split(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '$')))
+                .any(|word| word == key)
+            {
+                return ObjectProperty::Unknown;
+            }
+            continue;
+        }
+        if name == key {
+            value = ObjectProperty::Value(
+                skip_exec_trivia(&property[name_end + 1..], language).trim_end(),
+            );
+        }
+    }
+    value
+}
+
+/// A module whose `$` export runs its template as a shell command line.
+static JS_SHELL_TAG_MODULE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"["'](?:bun|zx|zx/globals|execa)["']"#)
+        .expect("js shell tag module regex compiles")
+});
+
+/// Whether `$` at `dollar` stands where a tag can start an expression, rather
+/// than inside an identifier, after a member access, or after a value inside
+/// an ordinary template (`` `${n}$` ``). A line break before it also starts
+/// one, since semicolon-free source ends the previous statement there.
+fn js_tagged_template_position(code: &str, dollar: usize) -> bool {
+    let before = code[..dollar].trim_end();
+    if code[before.len()..dollar].contains('\n') {
+        return true;
+    }
+    let Some(last) = before.chars().next_back() else {
+        return true;
+    };
+    if last.is_alphanumeric() || matches!(last, '_' | '$') {
+        let word = before
+            .rsplit(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '$')))
+            .next()
+            .unwrap_or_default();
+        return matches!(word, "await" | "return" | "yield" | "void");
+    }
+    matches!(
+        last,
+        '(' | '[' | '{' | ',' | ';' | '=' | ':' | '?' | '!' | '&' | '|' | '>'
+    )
+}
+
+/// The command line of the template literal whose opening backtick is at
+/// `open`, each `${…}` replaced by one quoted runtime value, and the offset
+/// just past the closing backtick. `None` when it does not close.
+fn js_shell_template_line(code: &str, open: usize, depth: usize) -> Option<(String, usize)> {
+    if depth == MAX_EXEC_ARGV_DEPTH {
+        return None;
+    }
+    let bytes = code.as_bytes();
+    let mut line = String::new();
+    let mut i = open + 1;
+    let mut literal_start = i;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'`' => {
+                line.push_str(&code[literal_start..i]);
+                return Some((line, i + 1));
+            }
+            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                line.push_str(&code[literal_start..i]);
+                line.push('"');
+                line.push_str(RUNTIME_VALUE);
+                line.push('"');
+                i = js_substitution_end(code, i + 2, depth)?;
+                literal_start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// The offset just past the `}` that closes a template substitution whose
+/// expression starts at `from`.
+fn js_substitution_end(code: &str, from: usize, depth: usize) -> Option<usize> {
+    let bytes = code.as_bytes();
+    let mut braces = 1_usize;
+    let mut i = from;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'\'' | b'"') => {
+                i += 1;
+                while bytes.get(i).is_some_and(|&b| b != quote) {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'`' => {
+                i = js_shell_template_line(code, i, depth + 1)?.1;
+                continue;
+            }
+            b'{' => braces += 1,
+            b'}' => {
+                braces -= 1;
+                if braces == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
 
 /// High-signal filesystem sink fallback for cases where the full AST pass is
 /// unavailable or too close to the hook deadline.
@@ -1471,6 +1846,20 @@ static JS_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
         r#"(?m)\b(?P<sink>execFileSync|execFile|execSync|exec|spawnSync|spawn|fork)\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
     )
     .expect("js exec sink literal regex compiles")
+});
+
+/// Deno's and Bun's own process APIs, whose argv never takes the shape the
+/// `child_process` names above are matched in: `new Deno.Command("git", {args:
+/// ["reset", "--hard"]})`, Deno 1's `Deno.run({cmd: [...]})`, `Bun.spawn([...])`
+/// and `Bun.spawnSync({cmd: [...]})` (also imported bare from "bun"), and the
+/// `` Bun.$`…` `` / `` $`…` `` shell template. Every one of them was allowed
+/// with a `git reset --hard` or `rm -rf /etc` argv while the `child_process`
+/// twin denied. See [`js_runtime_spawn_calls`].
+static JS_RUNTIME_SPAWN_CALL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?P<command>\bDeno\.Command\s*\()|(?P<run>\bDeno\.run\s*\()|(?P<spawn>(?:\bBun\.)?\bspawn(?:Sync)?\s*\(\s*[\[{])|(?P<shell>(?:\bBun\.)?\$\s*`)",
+    )
+    .expect("js runtime spawn call regex compiles")
 });
 
 /// Only a veto for a structurally verified Python directory producer.
@@ -9415,6 +9804,180 @@ mod tests {
             assert!(
                 detect_destructive_in_args(source, ScriptLanguage::Python).is_none(),
                 "a wholly opaque executable retains the existing posture: {source}"
+            );
+        }
+    }
+
+    /// Deno's and Bun's own process APIs are exec sinks like `child_process`.
+    /// `new Deno.Command("git", {args: ["reset", "--hard"]})` and
+    /// `` Bun.$`git reset --hard` `` were allowed while
+    /// `spawnSync("git", ["reset", "--hard"])` denied.
+    #[test]
+    fn deno_and_bun_process_apis_are_exec_sinks() {
+        use ScriptLanguage::{JavaScript, TypeScript};
+        for (language, source) in [
+            (
+                TypeScript,
+                r#"new Deno.Command("git", {args: ["reset", "--hard"]}).outputSync()"#,
+            ),
+            (
+                TypeScript,
+                r#"new Deno.Command("sh", {args: ["-c", "git reset --hard"]}).spawn()"#,
+            ),
+            (
+                TypeScript,
+                r#"await new Deno.Command('git', { stdout: "piped", 'args': ['reset', '--hard'], }).output()"#,
+            ),
+            (TypeScript, r#"Deno.run({cmd: ["git", "reset", "--hard"]})"#),
+            (JavaScript, r#"Bun.spawnSync(["git", "reset", "--hard"])"#),
+            (
+                JavaScript,
+                r#"Bun.spawn(["git", "reset", "--hard"], {stdout: "inherit"})"#,
+            ),
+            (
+                JavaScript,
+                r#"Bun.spawn({cmd: ["git", "reset", "--hard"], cwd: "."})"#,
+            ),
+            (
+                JavaScript,
+                r#"import { spawnSync } from "bun"; spawnSync(["git", "reset", "--hard"])"#,
+            ),
+            (JavaScript, "await Bun.$`git reset --hard`"),
+            (
+                TypeScript,
+                "import { $ } from \"bun\";\nawait $`git reset --hard`.quiet()",
+            ),
+            (
+                JavaScript,
+                "import { $ } from 'zx'\nconst out = 1\n$`git reset --hard`",
+            ),
+        ] {
+            let matches = scan_executing_sink_matches(source, language);
+            assert!(
+                matches
+                    .iter()
+                    .any(|m| m.rule_id.ends_with(".exec_sink.git_reset_hard")),
+                "{language:?}: {source}: {matches:?}"
+            );
+        }
+
+        for (language, source) in [
+            (
+                TypeScript,
+                r#"await new Deno.Command("rm", {args: ["-rf", "/etc"]}).output()"#,
+            ),
+            (JavaScript, r#"Bun.spawnSync(["rm", "-rf", "/etc"])"#),
+            (JavaScript, "await Bun.$`rm -rf /etc`"),
+            // An interpolated value is one unknown word, which can leave /tmp.
+            (JavaScript, "await Bun.$`rm -rf /tmp/${name}`"),
+        ] {
+            assert!(
+                scan_executing_sink_matches(source, language)
+                    .iter()
+                    .any(|m| m.severity.blocks_by_default()),
+                "{language:?}: {source}"
+            );
+        }
+
+        // Argv the source does not spell out cannot borrow a fixed-argv
+        // proof, as with `spawnSync("git", flags)`.
+        for source in [
+            r#"new Deno.Command("git", {args: flags})"#,
+            r#"new Deno.Command("git", options)"#,
+            r#"new Deno.Command("git", {...options})"#,
+            r#"new Deno.Command("git", {args})"#,
+            r#"new Deno.Command("git", {get args() { return flags; }})"#,
+            r#"new Deno.Command("git", {args: ["-C", dir].concat(more)})"#,
+            r#"new Deno.Command("git", {args: ["-C", ...dirs, "status"]})"#,
+            r#"Bun.spawnSync(["git", ...flags])"#,
+        ] {
+            let matches = scan_executing_sink_matches(source, TypeScript);
+            assert!(
+                matches
+                    .iter()
+                    .any(|m| m.rule_id == "heredoc.typescript.exec_sink.argv_unverified"),
+                "{source}: {matches:?}"
+            );
+            assert!(
+                exec_sink_reconstructed_commands(source, TypeScript).is_empty(),
+                "{source}"
+            );
+        }
+
+        // Verbs only the packs know reach them as the command line they run.
+        for (language, source, command) in [
+            (
+                TypeScript,
+                r#"new Deno.Command("dd", {args: ["if=/dev/zero", "of=/dev/sda"]}).outputSync()"#,
+                "dd 'if=/dev/zero' 'of=/dev/sda'",
+            ),
+            (
+                TypeScript,
+                r#"Deno.run({cmd: ["wipefs", "-a", "/dev/sda"]})"#,
+                "wipefs -a /dev/sda",
+            ),
+            (
+                JavaScript,
+                r#"Bun.spawnSync(["wipefs", "-a", "/dev/sda"])"#,
+                "wipefs -a /dev/sda",
+            ),
+            (
+                TypeScript,
+                r#"new Deno.Command("reboot").outputSync()"#,
+                "reboot",
+            ),
+            (
+                JavaScript,
+                "await Bun.$`wipefs -a /dev/sda`",
+                "wipefs -a /dev/sda",
+            ),
+            (
+                JavaScript,
+                "await Bun.$`echo ${`nested ${x}`} done`",
+                "echo \"${dcg_runtime_value}\" done",
+            ),
+        ] {
+            let commands = exec_sink_reconstructed_commands(source, language);
+            assert_eq!(commands.len(), 1, "{language:?}: {source}");
+            assert_eq!(commands[0].command, command, "{language:?}: {source}");
+            let span = &source[commands[0].start..commands[0].end];
+            assert!(
+                (span.starts_with("Deno.") || span.starts_with("Bun."))
+                    && span.ends_with([')', '`']),
+                "the span covers the call: {span}"
+            );
+        }
+
+        for (language, source) in [
+            (
+                TypeScript,
+                r#"new Deno.Command("git", {args: ["status"]}).outputSync()"#,
+            ),
+            (TypeScript, r#"Deno.run({cmd: ["ls", "-la"]})"#),
+            (JavaScript, r#"Bun.spawnSync(["git", "status"])"#),
+            (JavaScript, "await Bun.$`ls -la`"),
+            (
+                TypeScript,
+                r#"new Deno.Command("rm", {args: ["-rf", "/tmp/build"]}).outputSync()"#,
+            ),
+            (
+                TypeScript,
+                r#"console.log("Deno.Command git reset --hard")"#,
+            ),
+            // An ordinary template is not a shell template, with or without
+            // a shell module in scope, and without one a `$` tag is someone
+            // else's.
+            (
+                JavaScript,
+                "import { $ } from \"bun\";\nconsole.log(`total: ${n}$`); const s = `git reset --hard`;",
+            ),
+            (JavaScript, "const s = $`git reset --hard`;"),
+            (JavaScript, "Bun.$`git reset --hard"),
+            (JavaScript, r#"program.command("reset").option("--hard")"#),
+        ] {
+            assert!(
+                scan_executing_sink_matches(source, language).is_empty(),
+                "{language:?}: {source}"
             );
         }
     }

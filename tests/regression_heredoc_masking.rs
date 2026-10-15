@@ -297,6 +297,70 @@ EOF";
         }
     }
 
+    /// Deno's and Bun's own process APIs ran any argv unexamined, while the
+    /// same argv through `child_process` denied.
+    #[test]
+    fn deno_and_bun_process_apis_are_judged_through_real_hook() {
+        for (command, expected_rule) in [
+            (
+                r#"deno eval 'new Deno.Command("git", {args: ["reset", "--hard"]}).outputSync()'"#,
+                "heredoc.typescript:exec_sink.git_reset_hard",
+            ),
+            (
+                r#"deno eval 'new Deno.Command("sh", {args: ["-c", "git reset --hard"]}).spawn()'"#,
+                "heredoc.typescript:exec_sink.git_reset_hard",
+            ),
+            (
+                r#"deno eval 'Deno.run({cmd: ["git", "reset", "--hard"]})'"#,
+                "heredoc.typescript:exec_sink.git_reset_hard",
+            ),
+            (
+                r#"deno eval 'new Deno.Command("dd", {args: ["if=/dev/zero", "of=/dev/sda"]}).outputSync()'"#,
+                "system.disk:dd-device",
+            ),
+            // Bun runs TypeScript, so its programs are read as TypeScript.
+            (
+                r#"bun -e 'Bun.spawnSync(["git", "reset", "--hard"])'"#,
+                "heredoc.typescript:exec_sink.git_reset_hard",
+            ),
+            (
+                r#"bun -e 'Bun.spawn({cmd: ["git", "reset", "--hard"]})'"#,
+                "heredoc.typescript:exec_sink.git_reset_hard",
+            ),
+            (
+                r"bun -e 'await Bun.$`git reset --hard`'",
+                "heredoc.typescript:exec_sink.git_reset_hard",
+            ),
+            (
+                r#"bun -e 'import { $ } from "bun"; await $`git reset --hard`'"#,
+                "heredoc.typescript:exec_sink.git_reset_hard",
+            ),
+        ] {
+            let (decision, rule) = hook_decision(command);
+            assert_eq!(decision, "deny", "must deny {command:?}: {rule}");
+            assert_eq!(rule, expected_rule, "{command:?}");
+        }
+        let (decision, rule) = hook_decision(
+            r#"deno eval 'await new Deno.Command("rm", {args: ["-rf", "/etc"]}).output()'"#,
+        );
+        assert_eq!(decision, "deny", "{rule}");
+        assert!(
+            rule.starts_with("heredoc.typescript:exec_sink."),
+            "rm -rf /etc through Deno.Command: {rule}"
+        );
+
+        for command in [
+            r#"deno eval 'new Deno.Command("git", {args: ["status"]}).outputSync()'"#,
+            r#"deno eval 'new Deno.Command("rm", {args: ["-rf", "/tmp/build"]}).outputSync()'"#,
+            r#"deno eval 'console.log("Deno.Command git reset --hard")'"#,
+            r#"bun -e 'Bun.spawnSync(["git", "status"])'"#,
+            r"bun -e 'await Bun.$`ls -la`'",
+        ] {
+            let (decision, rule) = hook_decision(command);
+            assert_eq!(decision, "allow", "{command:?}: {rule}");
+        }
+    }
+
     #[test]
     fn issue_519_written_javascript_arrow_is_not_a_shell_redirect() {
         for command in [
