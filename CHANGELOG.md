@@ -50,6 +50,21 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   for the project reuses them. Manage them with `dcg allowlist list|remove|prune`.
   See [approved scripts](docs/learned-approvals.md#approved-scripts).
 
+### 0.15.3+tom.21
+
+- **Security: Python temp-directory cleanup was exempted by name (port of
+  upstream #549).** `shutil.rmtree(mkdtemp())` passed for a local
+  `def mkdtemp(): return '/tmp'`, a rebound or monkeypatched factory, a
+  replaced `os.path` helper and similar look-alikes: 80 of the 112 deny cases
+  in upstream's fixture were allowed. Upstream's producer-provenance check
+  (`869dcb3e`, `99308253`, `96fcaced`, `6009005f`, without the held-back
+  #558/#560 work) now revalidates every grant; `src/ast_matcher.rs` moved
+  unchanged to `src/ast_source_analysis.rs` behind upstream's wrapper.
+- Python's implicit string concatenation (`'/tmp/' 'build'`) is read as one
+  literal temp descendant instead of an unknown value. With tom.20, all 344
+  fixture commands get the expected verdict through the CLI and the hook,
+  which upstream `6009005f` does not.
+
 ### 0.15.3+tom.20
 
 - **Security: inline programs with glued quoting were not analysed (also in
