@@ -2650,6 +2650,9 @@ fn python_delete_targets_scratch<D: ast_grep_core::Doc>(call: &ast_grep_core::No
     };
     // A transparent grouping is still the same target; tuples are not.
     for _ in 0..MAX_EXEC_ARGV_DEPTH {
+        if target.kind() == "concatenated_string" {
+            return is_temp_scratch_path(&python_adjacent_literals(&target));
+        }
         if target.kind() != "parenthesized_expression" {
             let text = target.text();
             return is_temp_scratch_path(&concatenated_operand(&text, ScriptLanguage::Python, 0))
@@ -2669,6 +2672,30 @@ fn python_delete_targets_scratch<D: ast_grep_core::Doc>(call: &ast_grep_core::No
         };
     }
     false
+}
+
+/// Python joins adjacent string literals at compile time: `'/tmp/' 'build'`
+/// is the literal `'/tmp/build'`, which `concatenated_operand` (operators
+/// only) read as an unknown value. A part that is not a plain literal (an
+/// f-string can run code) leaves the whole value unknown.
+fn python_adjacent_literals<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+) -> Cow<'static, str> {
+    let mut value = String::new();
+    for part in node
+        .children()
+        .filter(|child| child.is_named() && child.kind() != "comment")
+    {
+        let text = part.text();
+        let literal = (part.kind() == "string")
+            .then(|| exec_literal_operand(&text, ScriptLanguage::Python))
+            .flatten();
+        let Some(literal) = literal else {
+            return Cow::Borrowed(RUNTIME_VALUE);
+        };
+        value.push_str(&literal);
+    }
+    Cow::Owned(value)
 }
 
 /// Preserve cleanup of a freshly produced directory without treating any
@@ -6497,6 +6524,32 @@ mod tests {
 
     /// #549: only a real child of an approved temp root gets the exemption.
     /// These are verdict checks on source text; none of the paths is accessed.
+    #[test]
+    fn python_adjacent_literal_targets_are_one_literal_issue_549() {
+        let ast_matcher = AstMatcher::new();
+        for (target, blocks) in [
+            ("'/tmp/' 'mkdtemp-cache'", false),
+            ("('/tmp/' 'build')", false),
+            ("'/tmp' '/build' '/cache'", false),
+            ("'/tmp/' ''", true),
+            ("'/tmp/' '..'", true),
+            ("'/tmp/build' '/../..'", true),
+            ("'/ho' 'me/user'", true),
+            ("'/tmp/' f'{name}'", true),
+            ("'/tmp/' r'build'", true),
+        ] {
+            let code = format!("import shutil\nshutil.rmtree({target})");
+            let matches = ast_matcher
+                .find_matches(&code, ScriptLanguage::Python)
+                .unwrap();
+            assert_eq!(
+                matches.iter().any(|m| m.severity.blocks_by_default()),
+                blocks,
+                "wrong deletion verdict: {code:?}"
+            );
+        }
+    }
+
     #[test]
     fn python_temp_cleanup_requires_a_descendant_issue_549() {
         let ast_matcher = AstMatcher::new();
