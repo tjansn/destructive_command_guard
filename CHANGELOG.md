@@ -50,6 +50,19 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   for the project reuses them. Manage them with `dcg allowlist list|remove|prune`.
   See [approved scripts](docs/learned-approvals.md#approved-scripts).
 
+### 0.15.3+tom.22
+
+- **Security: Deno's and Bun's process APIs were not exec sinks (also in
+  upstream `91510568`, noted in upstream #570).** `new Deno.Command("git",
+  {args: ["reset", "--hard"]})`, `Deno.run({cmd: [...]})`, `Bun.spawn` /
+  `Bun.spawnSync` and `` Bun.$`…` `` ran any argv unexamined, `rm -rf /etc`
+  included, while the same argv through `child_process` was denied. They are
+  now read as the argv or command line they run and judged like Node's
+  `spawnSync` and `execSync`. That covers rm/git payloads, argv the source
+  does not spell out literally, and pack verbs such as `dd` and `wipefs`.
+  A renamed alias (`const c = Deno.Command`) is not followed, as with
+  `child_process`.
+
 ### 0.15.3+tom.21
 
 - **Security: Python temp-directory cleanup was exempted by name (port of
@@ -68,7 +81,7 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 ### 0.15.3+tom.20
 
 - **Security: inline programs with glued quoting were not analysed (also in
-  upstream `6009005f`).** `'\''` writes a single quote inside a single-quoted
+  upstream `6009005f`, reported as upstream #570).** `'\''` writes a single quote inside a single-quoted
   argument, and the `-c`/`-e` extraction stopped at that first closing quote.
   `bash -c 'echo '\''x'\''; git reset --hard'` therefore analysed only
   `echo ` and was allowed; so were Python, Node, Ruby and Perl programs in
