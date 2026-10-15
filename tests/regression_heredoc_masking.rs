@@ -217,6 +217,86 @@ EOF";
         }
     }
 
+    /// `'\''` is how a single quote is written inside a single-quoted
+    /// argument. The inline-script patterns stopped at that first closing
+    /// quote, analysed only the text before it, and every launcher's `-c`/`-e`
+    /// program in this spelling was allowed whatever it ran.
+    #[test]
+    fn glued_inline_payloads_are_analysed_whole_through_real_hook() {
+        for (command, expected_rule) in [
+            (
+                r"bash -c 'echo '\''x'\''; git reset --hard'",
+                "core.git:reset-hard",
+            ),
+            (
+                r"sh -c 'printf '\''%s'\'' x; git reset --hard'",
+                "core.git:reset-hard",
+            ),
+            (
+                r"python3 -c 'import os; os.system('\''git reset --hard'\'')'",
+                "heredoc.python:os_system.git_reset_hard",
+            ),
+            (
+                r#"python3 -c "import os; os.system(\"git "'reset --hard'"\")""#,
+                "heredoc.python:os_system.git_reset_hard",
+            ),
+            (
+                r"node -e 'require('\''child_process'\'').execSync('\''git reset --hard'\'')'",
+                "heredoc.javascript:require_execsync.git_reset_hard",
+            ),
+            (
+                r"ruby -e 'system('\''git reset --hard'\'')'",
+                "heredoc.ruby:system.git_reset_hard",
+            ),
+            (
+                r"perl -e 'system('\''git reset --hard'\'')'",
+                "heredoc.perl:system.git_reset_hard",
+            ),
+            (
+                r"python3 -c 'import shutil; shutil.rmtree('\''/tmp'\'')'",
+                "heredoc.python:shutil_rmtree",
+            ),
+            // Extractors with their own grammar sliced between the outer
+            // quotes and analysed the raw `'\''` sequences.
+            (
+                r"ssh host 'echo '\''x'\''; git reset --hard'",
+                "core.git:reset-hard",
+            ),
+            (
+                r"mise exec -c 'echo '\''x'\''; git reset --hard'",
+                "core.git:reset-hard",
+            ),
+            (
+                r"bun exec 'echo '\''x'\''; git reset --hard'",
+                "core.git:reset-hard",
+            ),
+            (
+                r#"awk 'BEGIN { system("echo '\''x'\''; git reset --hard") }'"#,
+                "core.git:reset-hard",
+            ),
+            (
+                r#"osascript -e 'do shell script "echo '\''x'\''; git reset --hard"'"#,
+                "core.git:reset-hard",
+            ),
+        ] {
+            let (decision, rule) = hook_decision(command);
+            assert_eq!(decision, "deny", "must deny {command:?}: {rule}");
+            assert_eq!(rule, expected_rule, "{command:?}");
+        }
+
+        for command in [
+            r"python3 -c 'print('\''hello'\'')'",
+            r"bash -c 'ls '\''my dir'\'' | wc -l'",
+            r"node -e 'console.log('\''git reset --hard is dangerous'\'')'",
+            r#"python3 -c "print(\"hello\")""#,
+            r"python3 -c 'import json,sys; print(json.load(sys.stdin)['\''name'\''])' < package.json",
+            r"ruby -e 'puts '\''ok'\'''; echo done",
+        ] {
+            let (decision, rule) = hook_decision(command);
+            assert_eq!(decision, "allow", "{command:?}: {rule}");
+        }
+    }
+
     #[test]
     fn issue_519_written_javascript_arrow_is_not_a_shell_redirect() {
         for command in [

@@ -2103,26 +2103,71 @@ fn extract_inline_scripts(
                 continue;
             }
 
+            let full_match = cap.get(0).unwrap();
+            // The patterns stop at the first closing quote, but a quoted
+            // payload glued to more quoting or text (`'a'\''b'`) is one argv
+            // element. Reading only `a` used to discard the rest of the
+            // program, so `bash -c 'echo '\''x'\''; git reset --hard'` was
+            // allowed. Analyse the complete, unquoted operand instead.
+            let glued = content_match.and_then(|m| glued_quoted_payload(command, m));
+            let operand = glued.and_then(|word_start| {
+                let operand = complete_inline_payload_range(command, word_start);
+                if operand.is_none() {
+                    // A launcher quoted inside another argument
+                    // (`tar -I 'sh -c "…"'`) is no shell word of its own.
+                    // Analyse the visible text as before, but never report
+                    // it as the complete program.
+                    skip_reasons.push(SkipReason::MalformedInput {
+                        reason: "could not extract the complete inline script operand".to_string(),
+                    });
+                }
+                operand
+            });
+            let (content, content_range, byte_range) = if let Some(operand) = operand {
+                let raw = &command[operand.clone()];
+                let content = match crate::normalize::decode_posix_syntax_token(raw) {
+                    Cow::Owned(decoded) => Cow::Owned(decoded),
+                    // An unresolved expansion makes the program unknowable.
+                    Cow::Borrowed(_) => {
+                        skip_reasons.push(SkipReason::MalformedInput {
+                            reason: "inline script operand has an unresolved expansion".to_string(),
+                        });
+                        Cow::Borrowed(&command[unquoted_payload_range(raw, operand.start)])
+                    }
+                };
+                // Glued empty quotes leave the pattern's slice exact.
+                let content_range = content_match
+                    .map(|m| m.range())
+                    .filter(|range| command.get(range.clone()) == Some(content.as_ref()));
+                (content, content_range, full_match.start()..operand.end)
+            } else {
+                (
+                    Cow::Borrowed(content),
+                    content_match.map(|m| m.start()..m.end()),
+                    full_match.start()..full_match.end(),
+                )
+            };
+
             // Enforce content size limit
             if content.len() > limits.max_body_bytes {
                 // Skip but don't add to skip_reasons (would be too noisy)
                 continue;
             }
 
-            let full_match = cap.get(0).unwrap();
-            let content_range = content_match.map(|m| m.start()..m.end());
-            if content_range.is_some()
-                && extracted
-                    .iter()
-                    .any(|seen| seen.content_range == content_range)
-            {
+            if extracted.iter().any(|seen| {
+                if content_range.is_some() {
+                    seen.content_range == content_range
+                } else {
+                    seen.byte_range.end == byte_range.end && seen.content == content
+                }
+            }) {
                 continue;
             }
             extracted.push(ExtractedContent {
-                content: content.to_string(),
+                content: content.into_owned(),
                 language: ScriptLanguage::from_command(cmd_name),
                 delimiter: None,
-                byte_range: full_match.start()..full_match.end(),
+                byte_range,
                 content_range,
                 quoted: true, // -c/-e content is always in quotes
                 heredoc_type: None,
@@ -2148,6 +2193,60 @@ fn extract_inline_scripts(
             limit: limits.max_heredocs,
         });
     }
+}
+
+/// The opening-quote offset of a quoted inline payload that the inline-script
+/// patterns cut short: its closing quote is followed by more of the same shell
+/// word (`'a'\''b'`, `"a"'b'`), or, inside double quotes, the quote the
+/// pattern stopped at is escaped (`"print(\"x\")"`).
+///
+/// `payload` is a pattern's content group, between an opening and a closing
+/// quote. Whitespace, a control operator, a redirection or the end of the
+/// command after the closing quote ends the word.
+fn glued_quoted_payload(command: &str, payload: regex::Match<'_>) -> Option<usize> {
+    let bytes = command.as_bytes();
+    let word_start = payload.start().checked_sub(1)?;
+    let quote = *bytes.get(word_start)?;
+    if !matches!(quote, b'\'' | b'"') || bytes.get(payload.end()) != Some(&quote) {
+        return None;
+    }
+    let escaped_close = quote == b'"'
+        && payload
+            .as_str()
+            .bytes()
+            .rev()
+            .take_while(|byte| *byte == b'\\')
+            .count()
+            % 2
+            == 1;
+    let glued = !ends_shell_word(command, payload.end() + 1);
+    (escaped_close || glued).then_some(word_start)
+}
+
+/// Whether a shell word ends before byte `at`: whitespace, a control
+/// operator, a redirection or the end of the command follows.
+fn ends_shell_word(command: &str, at: usize) -> bool {
+    command.as_bytes().get(at).is_none_or(|next| {
+        next.is_ascii_whitespace() || matches!(next, b';' | b'&' | b'|' | b')' | b'<' | b'>')
+    })
+}
+
+/// The complete shell word that starts with the quoted inline payload at
+/// `word_start`, read with the shell grammar as a here-string operand is.
+/// Errors later in the command do not invalidate the word; recovery inside it
+/// does, and so does a word the grammar ended early (an unterminated quote is
+/// left outside the recovered word).
+fn complete_inline_payload_range(command: &str, word_start: usize) -> Option<Range<usize>> {
+    let ast = try_parse_shell_ast(command.get(word_start..)?).ok()?;
+    let root = ast.root();
+    let word = root
+        .dfs()
+        .find(|node| node.kind() == "command_name" && node.range().start == 0)?;
+    if word.dfs().any(|node| node.is_error() || node.is_missing()) {
+        return None;
+    }
+    let range = word_start + word.range().start..word_start + word.range().end;
+    ends_shell_word(command, range.end).then_some(range)
 }
 
 /// Whether the inline launcher whose interpreter word starts at
@@ -2692,16 +2791,16 @@ fn extract_mise_inline_scripts(
             continue;
         }
         for payload in mise_exec_inline_payloads(command, &tokens, index) {
-            let Some(content) = command.get(payload.content.clone()) else {
+            let Some((content, content_range)) = payload_program(command, payload.content) else {
                 continue;
             };
             if !push_windows_inner(
                 extracted,
                 skip_reasons,
                 limits,
-                content,
+                &content,
                 payload.full,
-                Some(payload.content),
+                content_range,
                 "mise",
             ) {
                 return;
@@ -2896,6 +2995,36 @@ fn unquoted_payload_range(text: &str, offset: usize) -> Range<usize> {
         offset + 1..offset + text.len() - 1
     } else {
         offset..offset + text.len()
+    }
+}
+
+/// The text a payload word passes to its program, and `content` again when
+/// that text is exactly the source slice.
+///
+/// `content` is a payload range from [`unquoted_payload_range`]: one layer of
+/// outer quotes removed. A word built from several quoted parts or escapes
+/// (`'a'\''b'`, `"a \"b\""`) reaches the program decoded, so the slice
+/// between its outer quotes is not the program: `ssh h 'echo '\''x'\''; git
+/// reset --hard'` analysed `echo '\''x'\''; …`, whose broken quoting hid
+/// the reset. A word with an unresolved expansion keeps the slice, which
+/// leaves the expansion visible to the analysis.
+fn payload_program(
+    command: &str,
+    content: Range<usize>,
+) -> Option<(Cow<'_, str>, Option<Range<usize>>)> {
+    let slice = command.get(content.clone())?;
+    let bytes = command.as_bytes();
+    let open = content.start.checked_sub(1).and_then(|at| bytes.get(at));
+    let word = match (open, bytes.get(content.end)) {
+        (Some(quote @ (b'\'' | b'"')), Some(close)) if quote == close => {
+            let dollar = content.start >= 2 && bytes[content.start - 2] == b'$';
+            content.start - 1 - usize::from(dollar)..content.end + 1
+        }
+        _ => content.clone(),
+    };
+    match crate::normalize::decode_posix_syntax_token(command.get(word)?) {
+        Cow::Owned(decoded) if decoded != slice => Some((Cow::Owned(decoded), None)),
+        _ => Some((Cow::Borrowed(slice), Some(content))),
     }
 }
 
@@ -3153,22 +3282,30 @@ fn push_joined_payload(
     skip_reasons: &mut Vec<SkipReason>,
     target: &str,
 ) -> bool {
-    let Some(content) = command.get(payload.content.clone()) else {
+    // A joined payload is pushed raw and, below, decoded word by word.
+    let program = if payload.joined {
+        command
+            .get(payload.content.clone())
+            .map(|raw| (Cow::Borrowed(raw), Some(payload.content.clone())))
+    } else {
+        payload_program(command, payload.content.clone())
+    };
+    let Some((content, content_range)) = program else {
         return true;
     };
     if !push_windows_inner(
         extracted,
         skip_reasons,
         limits,
-        content,
+        &content,
         payload.full.clone(),
-        Some(payload.content.clone()),
+        content_range,
         target,
     ) {
         return false;
     }
     if payload.joined
-        && let Some(joined) = joined_payload_words(content)
+        && let Some(joined) = joined_payload_words(&content)
     {
         return push_windows_inner(
             extracted,
@@ -3282,16 +3419,16 @@ fn extract_bun_exec_inline_scripts(
         let Some(payload) = subcommand_inline_payload(command, &tokens, index, "exec", &[]) else {
             continue;
         };
-        let Some(content) = command.get(payload.content.clone()) else {
+        let Some((content, content_range)) = payload_program(command, payload.content) else {
             continue;
         };
         if !push_windows_inner(
             extracted,
             skip_reasons,
             limits,
-            content,
+            &content,
             payload.full,
-            Some(payload.content),
+            content_range,
             "bun",
         ) {
             return;
@@ -3340,7 +3477,7 @@ fn extract_deno_eval_inline_scripts(
         else {
             continue;
         };
-        let Some(content) = command.get(payload.content.clone()) else {
+        let Some((content, content_range)) = payload_program(command, payload.content) else {
             continue;
         };
         if extracted.len() >= limits.max_heredocs {
@@ -3353,11 +3490,11 @@ fn extract_deno_eval_inline_scripts(
             continue;
         }
         extracted.push(ExtractedContent {
-            content: content.to_string(),
+            content: content.into_owned(),
             language: ScriptLanguage::from_command("deno"),
             delimiter: None,
             byte_range: payload.full,
-            content_range: Some(payload.content),
+            content_range,
             quoted: true,
             heredoc_type: None,
             target_command: Some("deno".to_string()),
@@ -3503,12 +3640,19 @@ fn extract_awk_inline_scripts(
                 continue;
             }
             seen.push(program.clone());
-            let Some(program_text) = command.get(program.clone()) else {
+            let Some((program_text, exact)) = payload_program(command, program.clone()) else {
                 continue;
             };
-            let payloads = awk_shell_payload_ranges(program_text, program.start);
+            // A decoded program is not a slice of the command: read its
+            // payloads from the decoded text, without source ranges.
+            let (source, offset) = if exact.is_some() {
+                (command, program.start)
+            } else {
+                (program_text.as_ref(), 0)
+            };
+            let payloads = awk_shell_payload_ranges(&program_text, offset);
             for payload in payloads.commands {
-                let Some(content) = command.get(payload.clone()) else {
+                let Some(content) = source.get(payload.clone()) else {
                     continue;
                 };
                 if !push_windows_inner(
@@ -3517,7 +3661,7 @@ fn extract_awk_inline_scripts(
                     limits,
                     content,
                     program.clone(),
-                    Some(payload),
+                    exact.as_ref().map(|_| payload),
                     "awk",
                 ) {
                     return;
@@ -3548,7 +3692,7 @@ fn extract_awk_inline_scripts(
                     limits,
                     &script,
                     program.clone(),
-                    Some(printed.range),
+                    exact.as_ref().map(|_| printed.range),
                     "awk",
                 ) {
                     return;
@@ -4519,11 +4663,17 @@ fn extract_osascript_inline_scripts(
             continue;
         }
         for program in osascript_program_ranges(command, &tokens, index) {
-            let Some(program_text) = command.get(program.clone()) else {
+            let Some((program_text, exact)) = payload_program(command, program.clone()) else {
                 continue;
             };
-            for payload in osascript_shell_payload_ranges(program_text, program.start) {
-                let Some(content) = command.get(payload.clone()) else {
+            // As for awk: a decoded program carries no source ranges.
+            let (source, offset) = if exact.is_some() {
+                (command, program.start)
+            } else {
+                (program_text.as_ref(), 0)
+            };
+            for payload in osascript_shell_payload_ranges(&program_text, offset) {
+                let Some(content) = source.get(payload.clone()) else {
                     continue;
                 };
                 if !push_windows_inner(
@@ -4532,7 +4682,7 @@ fn extract_osascript_inline_scripts(
                     limits,
                     content,
                     program.clone(),
-                    Some(payload),
+                    exact.as_ref().map(|_| payload),
                     "osascript",
                 ) {
                     return;
@@ -15692,6 +15842,89 @@ mod tests {
                 assert!(contents[0].quoted);
             } else {
                 panic!("Expected Extracted result");
+            }
+        }
+
+        /// A quoted payload glued to more quoting is one argv element. The
+        /// patterns stop at the first closing quote, so `'a'\''b'` reached
+        /// analysis as `a` and the rest of the program was never read:
+        /// `bash -c 'echo '\''x'\''; git reset --hard'` was allowed, and so
+        /// was every interpreter's `-c`/`-e` program in that spelling.
+        #[test]
+        fn glued_inline_payloads_are_extracted_whole() {
+            for (command, payload, language) in [
+                (
+                    r"bash -c 'echo '\''x'\''; git reset --hard'",
+                    "echo 'x'; git reset --hard",
+                    ScriptLanguage::Bash,
+                ),
+                (
+                    r"python3 -c 'import os; os.system('\''git reset --hard'\'')'",
+                    "import os; os.system('git reset --hard')",
+                    ScriptLanguage::Python,
+                ),
+                (
+                    r#"python3 -c "import os; os.system(\"git "'reset --hard'"\")""#,
+                    r#"import os; os.system("git reset --hard")"#,
+                    ScriptLanguage::Python,
+                ),
+                // The pattern stops at an escaped quote inside double quotes.
+                (
+                    r#"python3 -c "print(\" hi\")""#,
+                    r#"print(" hi")"#,
+                    ScriptLanguage::Python,
+                ),
+                (
+                    r"ruby -e 'puts '\''ok'\'''; echo done",
+                    "puts 'ok'",
+                    ScriptLanguage::Ruby,
+                ),
+            ] {
+                let ExtractionResult::Extracted(contents) =
+                    extract_content(command, &ExtractionLimits::default())
+                else {
+                    panic!("a glued payload must be extracted completely: {command:?}");
+                };
+                assert_eq!(contents.len(), 1, "{command:?}: {contents:?}");
+                assert_eq!(contents[0].content, payload, "{command:?}");
+                assert_eq!(contents[0].language, language, "{command:?}");
+                assert_eq!(
+                    contents[0].content_range, None,
+                    "decoded text does not slice the raw command: {command:?}"
+                );
+                assert!(
+                    command[contents[0].byte_range.clone()].ends_with(['\'', '"']),
+                    "the source span covers the whole operand: {command:?}"
+                );
+            }
+
+            // Plain quoting keeps its exact source range.
+            let ExtractionResult::Extracted(contents) = extract_content(
+                "python3 -c 'print(1)' '\\''x'\\''",
+                &ExtractionLimits::default(),
+            ) else {
+                panic!("an isolated payload is extracted");
+            };
+            assert_eq!(contents[0].content, "print(1)");
+            assert!(contents[0].content_range.is_some());
+
+            // An expansion glued to the payload makes the program unknown:
+            // never report it as completely extracted.
+            for command in [
+                r#"python3 -c 'import os; os.system("'"$CMD"'")'"#,
+                r"bash -c 'echo '\''unfinished",
+            ] {
+                let skipped = match extract_content(command, &ExtractionLimits::default()) {
+                    ExtractionResult::Partial { skipped, .. }
+                    | ExtractionResult::Skipped(skipped) => skipped,
+                    other => panic!("{command:?} must not look complete: {other:?}"),
+                };
+                assert!(
+                    skipped
+                        .iter()
+                        .any(|reason| matches!(reason, SkipReason::MalformedInput { .. })),
+                    "{command:?}: {skipped:?}"
+                );
             }
         }
 
