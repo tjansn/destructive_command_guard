@@ -50,6 +50,21 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   for the project reuses them. Manage them with `dcg allowlist list|remove|prune`.
   See [approved scripts](docs/learned-approvals.md#approved-scripts).
 
+### 0.15.3+tom.20
+
+- **Security: inline programs with glued quoting were not analysed (also in
+  upstream `6009005f`).** `'\''` writes a single quote inside a single-quoted
+  argument, and the `-c`/`-e` extraction stopped at that first closing quote.
+  `bash -c 'echo '\''x'\''; git reset --hard'` therefore analysed only
+  `echo ` and was allowed; so were Python, Node, Ruby and Perl programs in
+  that spelling, behind any wrapper (`sudo`, `env`, `timeout`, `xargs`,
+  `find -exec`, `bash -lc`), an escaped `\"` inside a double-quoted
+  program, and the ssh, `mise exec -c`, `bun exec`, awk `system()` and
+  osascript `do shell script` payloads. The complete shell word is now read
+  with the Bash grammar and decoded as the shell builds the argument; a
+  word that cannot be read completely keeps the previous text and is
+  marked incomplete, so the fallback scan still runs.
+
 ### 0.15.3+tom.19
 
 - **Upstream permission hardening (cherry-picked from `6009005f`'s history).**
