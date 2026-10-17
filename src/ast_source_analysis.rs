@@ -299,7 +299,12 @@ impl DocumentationProof {
 }
 
 const MAX_INTERPRETER_LITERAL_SOURCE_BYTES: usize = 256 * 1024;
-const MAX_INTERPRETER_LITERAL_NODES: usize = 4096;
+// Script-file inspection feeds whole files here, and an ordinary test file
+// passes 4096 nodes in a few hundred lines, so a fixed 4096 cap turned every
+// such run into analysis-limit. Tying the node cap to the byte cap keeps the
+// walk proportional to the source size this analysis already accepts; the
+// deadline still turns a slow walk into an indeterminate result.
+const MAX_INTERPRETER_LITERAL_NODES: usize = MAX_INTERPRETER_LITERAL_SOURCE_BYTES;
 const MAX_INTERPRETER_LITERAL_CANDIDATES: usize = 128;
 const MAX_INTERPRETER_LITERAL_PAYLOAD_BYTES: usize = 64 * 1024;
 
@@ -2351,7 +2356,17 @@ mod tests {
             "s = '`git branch -d x`'\n#{}",
             "x".repeat(MAX_INTERPRETER_LITERAL_SOURCE_BYTES)
         );
-        let many_nodes = format!("# `git branch -d x`\n{}", "pass\n".repeat(4096));
+        // Three bytes and four nodes per element: past the node cap while
+        // still under the source byte cap.
+        let many_nodes = format!(
+            "# `git branch -d x`\nx = [{}]\n",
+            "[],".repeat(MAX_INTERPRETER_LITERAL_NODES / 3 - 64)
+        );
+        assert!(many_nodes.len() <= MAX_INTERPRETER_LITERAL_SOURCE_BYTES);
+        assert!(matches!(
+            interpreter_literal_shell_commands_inner(&many_nodes, ScriptLanguage::Python, false),
+            Err(MatchError::AnalysisLimit { ref detail, .. }) if detail.contains("AST node limit")
+        ));
         let many_literals =
             "consume('`git branch -d x`')\n".repeat(MAX_INTERPRETER_LITERAL_CANDIDATES + 1);
         let large_literal = format!(
@@ -2411,6 +2426,41 @@ mod tests {
             .expect("no substitution candidate needs no worker")
             .is_empty()
         );
+    }
+
+    #[test]
+    fn interpreter_literal_shell_commands_finish_ordinary_script_files() {
+        // Script-file inspection passes whole files here. A few hundred lines
+        // used to exceed the fixed 4096-node cap and deny every such run.
+        for (language, line, benign, hidden) in [
+            (
+                ScriptLanguage::Python,
+                "total = compute(1, 2)\n",
+                "print('done\\n')\n",
+                "s = 'echo `git branch -D main`'\nrun(s)\n",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const total = compute(1, 2);\n",
+                "console.log('done\\n');\n",
+                "const s = 'echo `git branch -D main`';\nrun(s);\n",
+            ),
+        ] {
+            let padding = line.repeat(600);
+            let benign = format!("{padding}{benign}");
+            assert!(benign.len() < MAX_INTERPRETER_LITERAL_SOURCE_BYTES);
+            assert!(
+                interpreter_literal_shell_commands_inner(&benign, language, false)
+                    .expect("an ordinary-sized file must finish literal analysis")
+                    .is_empty(),
+                "{benign}"
+            );
+            let hidden = format!("{padding}{hidden}");
+            let commands = interpreter_literal_shell_commands_inner(&hidden, language, false)
+                .expect("a literal after the old node cap must still be analysed");
+            assert_eq!(commands.len(), 1);
+            assert!(commands[0].command.contains("git branch -D main"));
+        }
     }
 
     #[test]

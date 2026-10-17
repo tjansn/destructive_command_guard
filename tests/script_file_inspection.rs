@@ -410,6 +410,32 @@ fn python_and_javascript_files_use_existing_ast_rules() {
 }
 
 #[test]
+fn ordinary_sized_interpreter_files_finish_literal_analysis() {
+    // Six hundred lines passed the literal check's old fixed 4096-node cap,
+    // so every such test or tool run was denied as analysis-limit.
+    let fixture = Fixture::new();
+    let python = "total = compute(1, 2)\n".repeat(600);
+    let javascript = "const total = compute(1, 2);\n".repeat(600);
+    fixture.write("large.py", format!("{python}print('done\\n')\n"));
+    fixture.write(
+        "large.mjs",
+        format!("{javascript}console.log('done\\n');\n"),
+    );
+    fixture.allowed("python3 large.py");
+    fixture.allowed("node large.mjs");
+    fixture.write(
+        "hidden.py",
+        format!("{python}s = 'echo `git branch -D main`'\nrun(s)\n"),
+    );
+    fixture.write(
+        "hidden.mjs",
+        format!("{javascript}const s = 'echo `git branch -D main`';\nrun(s);\n"),
+    );
+    fixture.destructive("python3 hidden.py", "hidden.py");
+    fixture.destructive("node hidden.mjs", "hidden.mjs");
+}
+
+#[test]
 fn missing_dynamic_and_non_utf8_sources_fail_closed() {
     let fixture = Fixture::new();
     fixture.write("invalid.py", [0xff, 0xfe]);
