@@ -50,6 +50,20 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   for the project reuses them. Manage them with `dcg allowlist list|remove|prune`.
   See [approved scripts](docs/learned-approvals.md#approved-scripts).
 
+### 0.15.3+tom.23
+
+- **Script-file inspection no longer denies ordinary-sized Python and
+  JavaScript files as `analysis-limit` (regression since tom.14).** Every
+  inspected file passes through the #544 literal-command check, whose node
+  cap was a fixed 4096, which a file of a few hundred lines exceeds. Runs such
+  as `npm test`, `node --test …` and `python3 tool.py` were therefore denied,
+  and no allowlist entry could cover that outcome. The cap now follows the
+  check's 256 KiB source cap. Exceeding it, or the hook deadline, still
+  denies. A literal command after the old cap (`echo \`git branch -D main\``
+  on line 601) is now found and denied instead of being reported as a limit.
+  The bundled tsx loader that pi-os tests import still exceeds the separate
+  protected-write traversal limit.
+
 ### 0.15.3+tom.22
 
 - **Security: Deno's and Bun's process APIs were not exec sinks (also in
