@@ -50,6 +50,21 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   for the project reuses them. Manage them with `dcg allowlist list|remove|prune`.
   See [approved scripts](docs/learned-approvals.md#approved-scripts).
 
+### 0.15.3+tom.24
+
+- **Security: a project grant for `heredoc.script_files:unverified` hid the
+  rest of a script (every fork release since at least tom.11).** When a script
+  changed directory after its shebang and then ran a relative helper,
+  inspection of that file stopped at the unverified helper. The caller's grant
+  then dropped that marker, so `rm -rf "$HOME/Documents"`, `git reset --hard`
+  or a dynamic `eval` further down the same script was never evaluated. The
+  sandbox-trial, desktop-review and confined-run checks apply the same grant
+  internally. A warn-mode finding in a helper likewise ended inspection of
+  its caller, without any grant. The rest of such a source is now evaluated,
+  and a denial the grant cannot lift wins. Project scripts with a dynamic
+  `eval`, `rm`, `mv` or redirect that the grant appeared to cover are denied
+  again.
+
 ### 0.15.3+tom.23
 
 - **Script-file inspection no longer denies ordinary-sized Python and
