@@ -14397,7 +14397,48 @@ fn evaluate_command_in_single_dialect_view(
             },
         )
     {
-        return result;
+        // A warning still allows, and inside a file an unverified-file marker
+        // can be dropped by the caller's project grant (a `cd` after the
+        // shebang leaves this level without one). Neither says anything about
+        // the rest of this source: returning it skipped `rm -rf ~` after the
+        // helper in the same script. Evaluate the remainder without file
+        // inspection at this level and let a denial the grant cannot lift
+        // win. A top-level marker stays decisive: the hook re-evaluates
+        // grants itself, and the marker keeps ineffective command-only
+        // exceptions from being offered.
+        let liftable = result.decision == EvaluationDecision::Allow
+            || (nested_command_depth > 0
+                && result
+                    .pattern_info
+                    .as_ref()
+                    .is_some_and(crate::trial::eligible));
+        if !liftable {
+            return result;
+        }
+        let mut remainder_settings = heredoc_settings.clone();
+        remainder_settings.scan_script_files = false;
+        let remainder = evaluate_command_in_single_dialect_view(
+            allow_once_command,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            &remainder_settings,
+            None,
+            project_path,
+            deadline,
+            shell_dialect,
+            nested_command_depth,
+            inherited_automated_stdin,
+        );
+        let remainder_decides = remainder.decision != EvaluationDecision::Allow
+            && (result.decision == EvaluationDecision::Allow
+                || !remainder
+                    .pattern_info
+                    .as_ref()
+                    .is_some_and(crate::trial::eligible));
+        return if remainder_decides { remainder } else { result };
     }
 
     // A standalone PowerShell string or script-block literal is an expression

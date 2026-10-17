@@ -1166,6 +1166,78 @@ fn definite_findings_cannot_be_hidden_by_a_finite_rewrite() {
 }
 
 #[test]
+fn a_granted_unverified_helper_cannot_hide_the_rest_of_its_script() {
+    let fixture = Fixture::new();
+    let root = fixture.root.display().to_string();
+    fixture.write(
+        "home/.config/dcg/allowlist.toml",
+        format!(
+            "[[allow]]\nrule = \"heredoc.script_files:unverified\"\nreason = \"project grant\"\n\
+             paths = [\"{root}\", \"{root}/**\"]\n"
+        ),
+    );
+    fixture.write("tools/ok.sh", "echo ok\n");
+    let hook = |candidate: &str| {
+        let input =
+            json!({"tool_name":"Bash","tool_input":{"command":candidate},"cwd":fixture.root});
+        let mut child = fixture
+            .command()
+            .args(["--agent", "claude-code"])
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        serde_json::from_slice::<Value>(&output.stdout).unwrap_or(Value::Null)
+    };
+    // A `cd` after the shebang leaves the helper's directory unknown, so the
+    // helper stays unverified. The grant may lift only that marker.
+    for (name, tail) in [
+        ("home.sh", "rm -rf \"$HOME/Documents\"\n"),
+        ("reset.sh", "git reset --hard\n"),
+    ] {
+        fixture.write(
+            name,
+            format!("#!/bin/sh\ncd {root}/tools\nsh ok.sh\n{tail}"),
+        );
+        let output = hook(&format!("sh {name}"));
+        let decision = &output["hookSpecificOutput"];
+        assert_eq!(decision["permissionDecision"], "deny", "{name}: {output}");
+        assert_ne!(
+            decision["ruleId"], "heredoc.script_files:unverified",
+            "{name}: {output}"
+        );
+    }
+    fixture.write(
+        "benign.sh",
+        format!("#!/bin/sh\ncd {root}/tools\nsh ok.sh\necho done\n"),
+    );
+    assert_eq!(hook("sh benign.sh"), Value::Null);
+}
+
+#[test]
+fn a_warned_helper_cannot_hide_the_rest_of_its_script() {
+    let fixture = Fixture::new();
+    let policy = std::fs::read_to_string(&fixture.config).expect("read policy");
+    std::fs::write(
+        &fixture.config,
+        format!("{policy}[policy.rules]\n\"core.git:stash-drop\" = \"warn\"\n"),
+    )
+    .expect("write policy");
+    fixture.write("tools/drop.sh", "git stash drop\n");
+    let (_, result) = fixture.run("sh tools/drop.sh");
+    assert_eq!(result["decision"], "warn", "{result}");
+    fixture.write("qa.sh", "sh tools/drop.sh\nrm -rf \"$HOME/Documents\"\n");
+    fixture.destructive("sh qa.sh", "qa.sh");
+    let result = fixture.denied("sh tools/drop.sh; rm -rf \"$HOME/Documents\"");
+    assert_ne!(result["rule_id"], "core.git:stash-drop", "{result}");
+}
+
+#[test]
 fn finite_node_imports_resolve_relative_to_the_importing_file() {
     let fixture = Fixture::new();
     // A safe cwd namesake must not replace the source next to the importer.
